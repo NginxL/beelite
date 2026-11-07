@@ -159,7 +159,37 @@ export interface OpResult {
   warnings?: string[];
 }
 
+export type ClientUpdateStatus =
+  | 'unsupported'
+  | 'idle'
+  | 'checking'
+  | 'up-to-date'
+  | 'available'
+  | 'downloading'
+  | 'extracting'
+  | 'waiting'
+  | 'installing'
+  | 'error';
+
+/** 客户端（蜂简自身）更新状态，由主进程维护 */
+export interface ClientUpdateState {
+  status: ClientUpdateStatus;
+  currentVersion: string;
+  availableVersion: string | null;
+  /** 下载或解压进度，0–100；未知时为 null */
+  percent: number | null;
+  message: string | null;
+  canCheck: boolean;
+  canUpdate: boolean;
+  canCancel: boolean;
+}
+
 export interface BeeLiteApi {
+  clientState(): Promise<ClientUpdateState>;
+  clientCheck(): Promise<ClientUpdateState>;
+  clientUpdate(): Promise<ClientUpdateState>;
+  clientCancel(): Promise<ClientUpdateState>;
+  onClientState(cb: (s: ClientUpdateState) => void): () => void;
   getConfig(): Promise<AppConfig>;
   search(q: SearchQuery): Promise<SearchResult>;
   detail(modId: string, flavorId: number): Promise<ModDetail>;

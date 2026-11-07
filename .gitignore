@@ -3,5 +3,9 @@ dist/
 build-test/
 release/
 .smoke/
+native/vendor/
+native/build/
 .DS_Store
 *.log
+*.key
+*private*key*

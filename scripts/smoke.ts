@@ -1,10 +1,11 @@
-// 实网 smoke：真实搜索 / 详情 / 下载小型免费插件 → 临时模拟游戏目录中安装 → 扫描 → 重装 → 卸载 → 恢复。
+// 实网 smoke：真实搜索 / 详情 / 下载免费插件（RegionIcons、Questie、Plater）→ 临时模拟游戏目录中安装 → 扫描 → 重装 → 卸载 → 恢复。
 // 只在 SMOKE_PARENT（默认 <项目>/.smoke）下新建本次专用子目录 beelite-smoke-XXXXXX，绝不接触真实游戏目录；
 // 结束后只删除这个新建的子目录（SMOKE_KEEP=1 时保留）。
 // 运行：npm run smoke
 import assert from 'node:assert/strict';
 import { mkdir, readFile, readdir, writeFile } from 'node:fs/promises';
 import path from 'node:path';
+import zlib from 'node:zlib';
 import { AddonManager } from '../src/core/manager';
 import { NewBeeBoxProvider } from '../src/core/provider';
 import { cleanupRunDir, createRunDir } from './smoke-dir';
@@ -13,6 +14,8 @@ const FOREVER = 9;
 const RETAIL = 2;
 const SMALL = '31927'; // Open Maps: Region Icons，约 216 KB
 const QUESTIE = '20'; // Questie，约 2.2 MB，包内含反斜杠路径与重复条目
+const PLATER = '26'; // Plater，约 5.6 MB，包内透明 TGA 压缩比超过 1000（0.1.0 曾误判）
+const PLATER_TGA = ['Plater', 'images', 'transparent.tga'];
 
 const projectRoot = path.join(__dirname, '..', '..');
 const smokeParent = path.resolve(process.env.SMOKE_PARENT ?? path.join(projectRoot, '.smoke'));
@@ -70,8 +73,8 @@ async function main() {
   assert.equal(await readdir(path.join(root, 'Interface')).then((n) => n.includes('.beelite')), false);
   console.log('  未托管：ManualAddon ✓');
 
-  step(`安装 ${SMALL} 与 ${QUESTIE}（真实下载）`);
-  for (const id of [SMALL, QUESTIE]) {
+  step(`安装 ${SMALL}、${QUESTIE} 与 ${PLATER}（真实下载）`);
+  for (const id of [SMALL, QUESTIE, PLATER]) {
     let last = '';
     const r = await manager.install(root, FOREVER, id, {
       onPhase: (ph, rec, tot) => {
@@ -86,12 +89,18 @@ async function main() {
   const toc = await readFile(path.join(addons, 'RegionIcons', 'RegionIcons.toc'), 'utf8');
   assert.match(toc, /16001/);
   assert.ok((await readdir(path.join(addons, 'Questie'))).includes('addon_version.txt'), 'Questie 反斜杠条目应正确解压');
+  const tga = await readFile(path.join(addons, ...PLATER_TGA));
+  const expectedTgaLen = 18 + tga[0] + tga.readUInt16LE(12) * tga.readUInt16LE(14) * (tga[16] / 8);
+  assert.equal(tga.length, expectedTgaLen, 'Plater 透明贴图长度应与 TGA 头一致');
+  const tgaCrc = (zlib.crc32(tga) >>> 0).toString(16).padStart(8, '0');
+  console.log(`  Plater 透明贴图：${tga.length} 字节，CRC32 ${tgaCrc} ✓`);
 
   step('扫描已安装');
   const st1 = await manager.localState({ flavorId: FOREVER, root, addonsPath: addons }, FOREVER);
   console.log(`  已托管：${st1.managed.map((m) => `${m.name}(${m.version}) [${m.folders.map((f) => f.name).join(',')}]`).join(' | ')}`);
   console.log(`  未托管：${st1.unmanaged.map((u) => u.name).join(',')}`);
-  assert.equal(st1.managed.length, 2);
+  assert.equal(st1.managed.length, 3);
+  assert.deepEqual(st1.managed.find((m) => m.modId === PLATER)?.folders.map((f) => f.name), ['Plater']);
   assert.deepEqual(st1.unmanaged.map((u) => u.name), ['ManualAddon']);
 
   step('检查更新与强制重装');
@@ -110,8 +119,15 @@ async function main() {
   const rr = await manager.restore(root, entry.id);
   console.log(`  ${rr.message}`);
   assert.ok((await readdir(addons)).includes('Questie'));
+  await manager.uninstallProject(root, PLATER);
+  assert.equal((await readdir(addons)).includes('Plater'), false);
+  const stP = await manager.localState({ flavorId: FOREVER, root, addonsPath: addons }, FOREVER);
+  const plEntry = stP.recovery.find((e) => e.modId === PLATER && e.kind === 'uninstall')!;
+  assert.ok(plEntry);
+  console.log(`  ${(await manager.restore(root, plEntry.id)).message}`);
+  assert.ok((await readFile(path.join(addons, ...PLATER_TGA))).equals(tga), '恢复后 Plater 贴图字节应不变');
   const st3 = await manager.localState({ flavorId: FOREVER, root, addonsPath: addons }, FOREVER);
-  assert.equal(st3.managed.length, 2);
+  assert.equal(st3.managed.length, 3);
 
   step('完整性检查');
   assert.equal(await readFile(wtfFile, 'utf8'), 'QuestieConfig = { smoke = true }\n', 'WTF 不应被修改');

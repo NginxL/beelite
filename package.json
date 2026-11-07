@@ -1,7 +1,7 @@
 {
   "name": "beelite",
   "productName": "BeeLite",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "蜂简 BeeLite：精简的魔兽世界插件搜索、安装与管理工具（macOS）",
   "private": true,
   "main": "dist/app/main/main.js",
@@ -10,10 +10,13 @@
     "clean": "node scripts/clean.mjs",
     "build": "npm run clean && tsc -p tsconfig.json && tsc -p tsconfig.web.json && node scripts/copy-static.mjs",
     "typecheck": "tsc -p tsconfig.json --noEmit && tsc -p tsconfig.web.json --noEmit && tsc -p tsconfig.test.json --noEmit",
-    "test": "tsc -p tsconfig.test.json && node --test \"build-test/test/**/*.test.js\"",
+    "test": "tsc -p tsconfig.test.json && tsc -p tsconfig.web.json && node --test \"build-test/test/**/*.test.js\" \"test/**/*.test.mjs\"",
     "smoke": "tsc -p tsconfig.test.json && node build-test/scripts/smoke.js",
     "start": "npm run build && electron .",
-    "dist": "npm run build && electron-builder --mac --arm64 --publish never"
+    "dist": "npm run build && npm run native && electron-builder --mac --arm64 --publish never && node scripts/verify-app.mjs production release/mac-arm64/BeeLite.app",
+    "native": "node scripts/fetch-sparkle.mjs && node scripts/build-native.mjs",
+    "release:appcast": "node scripts/release-appcast.mjs",
+    "e2e:build": "node scripts/build-e2e.mjs"
   },
   "dependencies": {
     "yauzl": "3.4.0"
@@ -23,6 +26,7 @@
     "@types/yauzl": "3.4.0",
     "electron": "45.2.3",
     "electron-builder": "26.18.1",
+    "node-gyp": "13.1.0",
     "typescript": "5.9.3"
   },
   "build": {
@@ -57,12 +61,24 @@
       "icon": "build/icon.png",
       "identity": "-",
       "hardenedRuntime": false,
-      "gatekeeperAssess": false
+      "gatekeeperAssess": false,
+      "minimumSystemVersion": "13.0",
+      "extendInfo": {
+        "SUFeedURL": "https://github.com/NginxL/beelite/releases/latest/download/appcast.xml",
+        "SUPublicEDKey": "1QVzcH29FNZEGtdtqFiWCYM5a51IpLd6CsanZIcXXTI=",
+        "SUEnableAutomaticChecks": false,
+        "SUAutomaticallyUpdate": false,
+        "SUAllowsAutomaticUpdates": false,
+        "SUVerifyUpdateBeforeExtraction": true,
+        "SURequireSignedFeed": true,
+        "SUSignedFeedFailureExpirationInterval": 0
+      }
     },
     "electronLanguages": [
       "zh_CN",
       "en"
-    ]
+    ],
+    "afterPack": "scripts/after-pack.cjs"
   },
   "author": "BeeLite"
 }

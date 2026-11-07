@@ -1,5 +1,6 @@
 // 入口：导航、顶部栏（游戏版本与目录）、启动加载配置
 
+import { initClientUpdate } from './client-update.js';
 import { initDetail } from './detail.js';
 import { initDiscover, focusSearch } from './discover.js';
 import { byId, confirmDialog, h, mount, spinner } from './dom.js';
@@ -118,6 +119,8 @@ function boot(): void {
     return;
   }
   window.beelite.onTask(handleTask);
+  // 客户端更新入口不依赖插件数据源配置，先于配置加载初始化
+  initClientUpdate();
   bindUi();
   renderTopbar();
   void loadConfig();

@@ -1,11 +1,13 @@
 // IPC 处理：校验发送方与每个参数，界面只传 flavorId / 插件编号 / 目录名等标量，路径全部由主进程解析。
-import { dialog, ipcMain, type BrowserWindow, type IpcMainInvokeEvent } from 'electron';
+import { app, dialog, ipcMain, type BrowserWindow, type IpcMainInvokeEvent } from 'electron';
 import { stat } from 'node:fs/promises';
 import path from 'node:path';
-import type { AppConfig, FlavorInfo, LocalState, OpResult, ProfileInfo, SearchQuery, SortOrder, TaskEvent, TaskPhase } from '../shared/types';
+import type { AppConfig, ClientUpdateState, FlavorInfo, LocalState, OpResult, ProfileInfo, SearchQuery, SortOrder, TaskEvent, TaskPhase } from '../shared/types';
 import { errorMessage, UserError } from '../core/errors';
 import { DEFAULT_FLAVOR_ID, FLAVORS, getFlavor, interfaceFromVersion } from '../core/flavors';
 import { runUpdateAll } from '../core/batch';
+import type { ClientUpdater } from '../core/client-update';
+import { guardHandler, type MutationGate } from '../core/gate';
 import { AddonManager } from '../core/manager';
 import { isValidModuleName } from '../core/paths';
 import { inspectPickedRoot, SettingsStore } from '../core/profiles';
@@ -49,6 +51,7 @@ export interface ServiceDeps {
   getWindow: () => BrowserWindow | null;
   settings: SettingsStore;
   provider: NewBeeBoxProvider;
+  gate: MutationGate;
 }
 
 export class AppService {
@@ -56,6 +59,7 @@ export class AppService {
   private readonly names = new Map<string, string>();
   private readonly tasks = new Map<string, AbortController>();
   private taskSeq = 0;
+  private clientUpdater: ClientUpdater | null = null;
 
   constructor(private readonly deps: ServiceDeps) {
     this.manager = new AddonManager({
@@ -172,17 +176,38 @@ export class AppService {
     });
   }
 
+  attachClientUpdater(u: ClientUpdater): void {
+    this.clientUpdater = u;
+  }
+
+  pushClientState(st: ClientUpdateState): void {
+    const win = this.deps.getWindow();
+    if (win && !win.isDestroyed()) win.webContents.send('client:event', st);
+  }
+
+  private clientState(): ClientUpdateState {
+    if (this.clientUpdater) return this.clientUpdater.getState();
+    return { status: 'unsupported', currentVersion: app.getVersion(), availableVersion: null, percent: null, message: '客户端更新组件尚未就绪', canCheck: false, canUpdate: false, canCancel: false };
+  }
+
   register(): void {
     const handle = (channel: string, fn: (...args: unknown[]) => Promise<unknown>) => {
+      // 写通道在调用 fn 之前同步进入闸门，整个回调结束后才释放
+      const guarded = guardHandler(this.deps.gate, channel, fn);
       ipcMain.handle(channel, async (e: IpcMainInvokeEvent, ...args: unknown[]) => {
         this.assertSender(e);
         try {
-          return await fn(...args);
+          return await guarded(...args);
         } catch (err) {
           throw new Error(errorMessage(err));
         }
       });
     };
+    // 客户端更新：固定操作，不接收任何参数
+    handle('client:state', async () => this.clientState());
+    handle('client:check', async () => this.clientUpdater?.check() ?? this.clientState());
+    handle('client:update', async () => this.clientUpdater?.update() ?? this.clientState());
+    handle('client:cancel', async () => this.clientUpdater?.cancel() ?? this.clientState());
     handle('config:get', () => this.config());
     handle('mods:search', async (q) => {
       const r = await this.deps.provider.search(queryArg(q));

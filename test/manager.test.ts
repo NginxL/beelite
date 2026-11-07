@@ -368,6 +368,20 @@ test('flavor 隔离与免费复核：没有对应版本文件、版本不兼容�
   await cleanup(base);
 });
 
+test('更新包解压失败（无效 deflate 编码）时：原插件、manifest、回收站不变，暂存区已清理', async () => {
+  const { base, root, src } = await setup();
+  const m = makeManager(src);
+  src.set('100', F, { name: '多模块', fileId: '1', zip: zipOf(['A', 'B'], 'v1'), folders: ['A', 'B'] });
+  await m.install(root, F, '100');
+  const before = await snapshot(root);
+  const broken = makeZip([...addonEntries('A', 'v2'), { name: 'A/broken.lua', data: 'x'.repeat(64), rawBody: Buffer.from([0x07, 0, 0, 0, 0, 0]) }]);
+  src.set('100', F, { name: '多模块', fileId: '2', zip: broken, folders: ['A'] });
+  await assert.rejects(m.install(root, F, '100'), /压缩包校验失败/);
+  assert.deepEqual(await snapshot(root), before);
+  await assertClean(root);
+  await cleanup(base);
+});
+
 test('同一目录并发操作串行执行，manifest 完整', async () => {
   const { base, root, src } = await setup();
   const m = makeManager(src);

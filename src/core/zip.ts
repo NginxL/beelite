@@ -2,27 +2,29 @@
 // 压缩包内的任何内容都不会被执行。
 import { mkdir, open, stat } from 'node:fs/promises';
 import path from 'node:path';
+import { pipeline } from 'node:stream/promises';
 import zlib from 'node:zlib';
 import yauzl from 'yauzl';
 import { UserError } from './errors';
 import { writeAll } from './fsio';
 import { foldKey, isSafeSegment, isValidModuleName, resolveInside } from './paths';
 
+/**
+ * 资源硬上限。每个条目的实际输出不能超过它在中央目录声明的大小（yauzl validateEntrySizes 与下方逐块检查），
+ * 所有声明大小之和受 maxTotalBytes 限制，因此总解压量有界。这些只是资源上限，不是磁盘配额，
+ * 也不检查剩余磁盘空间；写满磁盘时解压会失败。本函数不删除目标目录，暂存区由调用方（AddonManager）清理。
+ * 不使用压缩比启发式：合法插件中常见高度重复的贴图（例如纯色 TGA），比值可超过 1000。
+ */
 export interface ZipLimits {
   maxArchiveBytes: number;
   maxTotalBytes: number;
   maxEntries: number;
-  maxRatio: number;
-  /** 小于该大小的条目不做压缩比检查 */
-  ratioMinBytes: number;
 }
 
 export const DEFAULT_LIMITS: ZipLimits = {
   maxArchiveBytes: 1024 * 1024 * 1024,
   maxTotalBytes: 4 * 1024 * 1024 * 1024,
   maxEntries: 100_000,
-  maxRatio: 1000,
-  ratioMinBytes: 1024 * 1024,
 };
 
 export interface ZipExtractResult {
@@ -127,10 +129,7 @@ export async function extractAddonZip(zipPath: string, destDir: string, limits: 
     }
 
     const size = entry.uncompressedSize;
-    if (!isDir) {
-      if (entry.compressedSize === 0 && size > 0) reject(`条目大小异常：${rel}`);
-      if (size >= limits.ratioMinBytes && size / Math.max(1, entry.compressedSize) > limits.maxRatio) reject(`压缩比异常（疑似压缩炸弹）：${rel}`);
-    }
+    if (!isDir && entry.compressedSize === 0 && size > 0) reject(`条目大小异常：${rel}`);
 
     const key = foldKey(rel);
     const prev = seen.get(key);
@@ -186,21 +185,30 @@ export async function extractAddonZip(zipPath: string, destDir: string, limits: 
       return;
     }
     await mkdir(path.dirname(target), { recursive: true, mode: 0o755 });
-    const stream = await new Promise<NodeJS.ReadableStream>((resolve, reject_) =>
-      zf.openReadStream(entry, (err, s) => (err || !s ? reject_(err ?? new Error('无法读取条目')) : resolve(s))),
-    );
+    // 先打开目标文件，再取条目数据流：数据流交付后立即被消费，中间不再有异步等待
     const fh = await open(target, 'wx', 0o644);
     let crc = 0;
     let bytes = 0;
     try {
-      for await (const chunk of stream as AsyncIterable<Buffer>) {
-        bytes += chunk.length;
-        if (bytes > d.size) reject(`条目实际大小超出声明：${d.rel}`);
-        crc = zlib.crc32(chunk, crc);
-        await writeAll(fh, chunk);
-      }
+      await new Promise<void>((resolve, reject_) => {
+        zf.openReadStream(entry, (err, rs) => {
+          if (err || !rs) return reject_(err ?? new Error('无法读取条目'));
+          // 在回调内同步启动 pipeline：它立即接管 rs 的错误（包括解压错误与字节数校验错误），失败时销毁 rs
+          pipeline(rs, async (source: AsyncIterable<Buffer>) => {
+            for await (const chunk of source) {
+              bytes += chunk.length;
+              if (bytes > d.size) reject(`条目实际大小超出声明：${d.rel}`);
+              crc = zlib.crc32(chunk, crc);
+              await writeAll(fh, chunk);
+            }
+          }).then(resolve, reject_);
+        });
+      });
       // 以落盘结果为准：文件实际大小必须与声明一致
       if ((await fh.stat()).size !== d.size) reject(`条目写入不完整：${d.rel}`);
+    } catch (err) {
+      if (err instanceof UserError) throw err;
+      reject(`${d.rel}：${err instanceof Error ? err.message : String(err)}`);
     } finally {
       await fh.close();
     }

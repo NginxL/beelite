@@ -1,10 +1,14 @@
-// 蜂简 BeeLite 主进程：窗口、本地页面协议、安全策略与启动恢复。
+// 蜂简 BeeLite 主进程：窗口、本地页面协议、安全策略、启动恢复与客户端更新。
 import { app, BrowserWindow, Menu, protocol, session, type WebContents } from 'electron';
 import { readFile } from 'node:fs/promises';
 import path from 'node:path';
+import { ClientUpdater } from '../core/client-update';
+import { createQuitGuard, MutationGate } from '../core/gate';
+import { displayName, resolveUserData } from '../core/identity';
 import { inspectPickedRoot, SettingsStore } from '../core/profiles';
 import { NewBeeBoxProvider } from '../core/provider';
 import { FLAVORS } from '../core/flavors';
+import { loadSparkleBridge } from './client-update';
 import { APP_ORIGIN, AppService } from './ipc';
 
 const WEB_ROOT = path.join(__dirname, '..', '..', 'web');
@@ -29,9 +33,15 @@ const MIME: Record<string, string> = {
   '.png': 'image/png',
 };
 
-// 开发/测试隔离：显式设置 BEELITE_USER_DATA_DIR 时使用独立的用户数据目录
+// 在修改显示名之前固定 userData：默认路径由 productName 决定（生产包为 BeeLite，测试包各自独立），
+// 显式设置 BEELITE_USER_DATA_DIR 时（仅开发/测试）使用该目录
 const isolatedUserData = process.env.BEELITE_USER_DATA_DIR;
-if (isolatedUserData) app.setPath('userData', path.resolve(isolatedUserData));
+app.setPath('userData', resolveUserData(app.getPath('userData'), isolatedUserData, (p) => path.resolve(p)));
+const APP_DISPLAY_NAME = displayName(app.getName());
+const UPDATE_CHECK_INTERVAL_MS = 24 * 60 * 60 * 1000;
+
+const gate = new MutationGate();
+let clientUpdater: ClientUpdater | null = null;
 
 protocol.registerSchemesAsPrivileged([{ scheme: 'app', privileges: { standard: true, secure: true } }]);
 
@@ -101,7 +111,16 @@ function hardenContents(contents: WebContents): void {
 function buildMenu(): void {
   Menu.setApplicationMenu(
     Menu.buildFromTemplate([
-      { label: '蜂简', submenu: [{ role: 'about', label: '关于蜂简' }, { type: 'separator' }, { role: 'hide', label: '隐藏' }, { role: 'quit', label: '退出蜂简' }] },
+      {
+        label: '蜂简',
+        submenu: [
+          { role: 'about', label: '关于蜂简' },
+          { label: '检查客户端更新…', click: () => clientUpdater?.check() },
+          { type: 'separator' },
+          { role: 'hide', label: '隐藏' },
+          { role: 'quit', label: '退出蜂简' },
+        ],
+      },
       { label: '编辑', submenu: [{ role: 'undo', label: '撤销' }, { role: 'redo', label: '重做' }, { type: 'separator' }, { role: 'cut', label: '剪切' }, { role: 'copy', label: '复制' }, { role: 'paste', label: '粘贴' }, { role: 'selectAll', label: '全选' }] },
       { label: '窗口', submenu: [{ role: 'minimize', label: '最小化' }, { role: 'reload', label: '重新载入' }, { role: 'close', label: '关闭' }] },
     ]),
@@ -130,22 +149,43 @@ async function applyTestBindings(settings: SettingsStore): Promise<void> {
 }
 
 async function start(): Promise<void> {
-  app.setName('蜂简 BeeLite');
+  app.setName(APP_DISPLAY_NAME);
   registerAppProtocol();
   hardenSession();
   app.on('web-contents-created', (_e, contents) => hardenContents(contents));
+  // 手动退出与更新安装引起的退出都先等待已受理的插件写操作结束
+  app.on('before-quit', createQuitGuard(gate, () => app.quit()));
   buildMenu();
 
   const settings = new SettingsStore(path.join(app.getPath('userData'), 'settings.json'));
-  await applyTestBindings(settings);
-  const service = new AppService({ getWindow: () => mainWindow, settings, provider: new NewBeeBoxProvider() });
+  const service = new AppService({ getWindow: () => mainWindow, settings, provider: new NewBeeBoxProvider(), gate });
   service.register();
 
-  // 启动时处理各已绑定目录中残留的未完成事务
-  const s = await settings.load();
-  for (const root of new Set(Object.values(s.bindings))) {
-    await service.manager.recover(root).catch((err) => console.warn('[BeeLite] 恢复检查失败：', err));
+  // 测试绑定与启动恢复（残留的未完成事务）也计入写操作；全部完成后才启用客户端更新
+  const release = gate.enter();
+  try {
+    await applyTestBindings(settings);
+    const s = await settings.load();
+    for (const root of new Set(Object.values(s.bindings))) {
+      await service.manager.recover(root).catch((err) => console.warn('[BeeLite] 恢复检查失败：', err));
+    }
+  } finally {
+    release();
   }
+
+  const loaded = loadSparkleBridge();
+  clientUpdater = new ClientUpdater({
+    bridge: loaded.bridge,
+    gate,
+    currentVersion: app.getVersion(),
+    unsupportedReason: loaded.reason,
+    onState: (st) => service.pushClientState(st),
+  });
+  service.attachClientUpdater(clientUpdater);
+  clientUpdater.start();
+  // 启动后与每天各探测一次（只检查，不下载）
+  setTimeout(() => clientUpdater?.check(), 5000);
+  setInterval(() => clientUpdater?.check(), UPDATE_CHECK_INTERVAL_MS).unref();
 
   createWindow();
   app.on('activate', () => {
@@ -160,7 +200,7 @@ function createWindow(): void {
     height: 780,
     minWidth: 1000,
     minHeight: 660,
-    title: '蜂简 BeeLite',
+    title: APP_DISPLAY_NAME,
     backgroundColor: '#14161a',
     show: false,
     webPreferences: {

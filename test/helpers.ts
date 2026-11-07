@@ -19,21 +19,47 @@ export interface ZipEntrySpec {
   declaredSize?: number;
   encrypted?: boolean;
   deflate?: boolean;
+  /** 直接作为 deflate 压缩体写入（method=8），用于构造无效的压缩编码；CRC/大小仍按 data 计算 */
+  rawBody?: Buffer;
+  /** 不写新的数据，中央目录条目指向第 aliasOf 个条目的本地头（多个条目共享同一份压缩数据） */
+  aliasOf?: number;
 }
 
 export function makeZip(entries: ZipEntrySpec[]): Buffer {
   const locals: Buffer[] = [];
   const centrals: Buffer[] = [];
+  const meta: { offset: number; method: number; crc: number; csize: number; size: number }[] = [];
   let offset = 0;
   for (const e of entries) {
     const nameBuf = Buffer.from(e.name, 'utf8');
+    const isDir = e.name.endsWith('/');
+    const mode = e.mode ?? (isDir ? 0o040755 : 0o100644);
+    if (e.aliasOf !== undefined) {
+      const m = meta[e.aliasOf];
+      const ch = Buffer.alloc(46);
+      ch.writeUInt32LE(0x02014b50, 0);
+      ch.writeUInt16LE((3 << 8) | 20, 4);
+      ch.writeUInt16LE(20, 6);
+      ch.writeUInt16LE(0x800, 8);
+      ch.writeUInt16LE(m.method, 10);
+      ch.writeUInt32LE(m.crc >>> 0, 16);
+      ch.writeUInt32LE(m.csize, 20);
+      ch.writeUInt32LE(m.size, 24);
+      ch.writeUInt16LE(nameBuf.length, 28);
+      ch.writeUInt32LE((mode << 16) >>> 0, 38);
+      ch.writeUInt32LE(m.offset, 42);
+      centrals.push(ch, nameBuf);
+      meta.push(m);
+      continue;
+    }
     const raw = typeof e.data === 'string' ? Buffer.from(e.data) : e.data ?? Buffer.alloc(0);
-    const method = e.deflate ? 8 : 0;
-    const packed = e.deflate ? zlib.deflateRawSync(raw) : raw;
+    const method = e.deflate || e.rawBody ? 8 : 0;
+    const packed = e.rawBody ?? (e.deflate ? zlib.deflateRawSync(raw) : raw);
     // 传统加密条目在数据前有 12 字节加密头
     const body = e.encrypted ? Buffer.concat([Buffer.alloc(12, 7), packed]) : packed;
     const crc = e.crc ?? zlib.crc32(raw);
     const size = e.declaredSize ?? raw.length;
+    meta.push({ offset, method, crc, csize: body.length, size });
     const flags = 0x800 | (e.encrypted ? 1 : 0);
     const lh = Buffer.alloc(30);
     lh.writeUInt32LE(0x04034b50, 0);
@@ -47,8 +73,6 @@ export function makeZip(entries: ZipEntrySpec[]): Buffer {
     lh.writeUInt16LE(nameBuf.length, 26);
     lh.writeUInt16LE(0, 28);
     locals.push(lh, nameBuf, body);
-    const isDir = e.name.endsWith('/');
-    const mode = e.mode ?? (isDir ? 0o040755 : 0o100644);
     const ch = Buffer.alloc(46);
     ch.writeUInt32LE(0x02014b50, 0);
     ch.writeUInt16LE((3 << 8) | 20, 4);
