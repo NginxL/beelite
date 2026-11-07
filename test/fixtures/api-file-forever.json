@@ -1,0 +1,16 @@
+{
+  "code": 1,
+  "data": {
+    "t_id": 673432,
+    "t_mod_id": 31505,
+    "t_release_type": 1,
+    "t_display_name": "0.7.5-cn",
+    "t_file_name": "0.7.5-cn",
+    "t_file_date": 1792852421758,
+    "t_file_length": 90279620,
+    "file_folders": ["OpenMap"],
+    "download_url": "https://cdn8.newbeebox.com/fixture/mod_file/31505/0.7.5-cn.zip",
+    "versions": ["1.60.1"]
+  },
+  "time": 7
+}

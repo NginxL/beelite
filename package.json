@@ -1,0 +1,68 @@
+{
+  "name": "beelite",
+  "productName": "BeeLite",
+  "version": "0.1.0",
+  "description": "蜂简 BeeLite：精简的魔兽世界插件搜索、安装与管理工具（macOS）",
+  "private": true,
+  "main": "dist/app/main/main.js",
+  "license": "UNLICENSED",
+  "scripts": {
+    "clean": "node scripts/clean.mjs",
+    "build": "npm run clean && tsc -p tsconfig.json && tsc -p tsconfig.web.json && node scripts/copy-static.mjs",
+    "typecheck": "tsc -p tsconfig.json --noEmit && tsc -p tsconfig.web.json --noEmit && tsc -p tsconfig.test.json --noEmit",
+    "test": "tsc -p tsconfig.test.json && node --test \"build-test/test/**/*.test.js\"",
+    "smoke": "tsc -p tsconfig.test.json && node build-test/scripts/smoke.js",
+    "start": "npm run build && electron .",
+    "dist": "npm run build && electron-builder --mac --arm64 --publish never"
+  },
+  "dependencies": {
+    "yauzl": "3.4.0"
+  },
+  "devDependencies": {
+    "@types/node": "22.20.5",
+    "@types/yauzl": "3.4.0",
+    "electron": "45.2.3",
+    "electron-builder": "26.18.1",
+    "typescript": "5.9.3"
+  },
+  "build": {
+    "appId": "app.beelite.addons",
+    "productName": "BeeLite",
+    "directories": {
+      "output": "release",
+      "buildResources": "build"
+    },
+    "files": [
+      "dist/app/**",
+      "dist/web/**",
+      "package.json"
+    ],
+    "asar": true,
+    "mac": {
+      "target": [
+        {
+          "target": "dir",
+          "arch": [
+            "arm64"
+          ]
+        },
+        {
+          "target": "zip",
+          "arch": [
+            "arm64"
+          ]
+        }
+      ],
+      "category": "public.app-category.utilities",
+      "icon": "build/icon.png",
+      "identity": "-",
+      "hardenedRuntime": false,
+      "gatekeeperAssess": false
+    },
+    "electronLanguages": [
+      "zh_CN",
+      "en"
+    ]
+  },
+  "author": "BeeLite"
+}

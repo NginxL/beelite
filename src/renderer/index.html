@@ -1,0 +1,51 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self' https://cdn8.newbeebox.com data:; font-src 'self'; connect-src 'none'; base-uri 'none'; form-action 'none'">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>蜂简 BeeLite</title>
+  <link rel="stylesheet" href="./styles.css">
+  <script type="module" src="./renderer/main.js"></script>
+</head>
+<body>
+  <div id="app">
+    <aside class="sidebar">
+      <div class="brand">
+        <div class="logo"><span class="logo-hex"></span><span class="logo-hex logo-hex-inner"></span></div>
+        <div class="brand-text">
+          <div class="brand-name">蜂简</div>
+          <div class="brand-sub">BeeLite</div>
+        </div>
+      </div>
+      <nav class="nav">
+        <button class="nav-item active" data-page="discover"><span class="nav-icon nav-icon-discover"></span>发现插件</button>
+        <button class="nav-item" data-page="local"><span class="nav-icon nav-icon-local"></span>我的插件<span id="update-badge" class="badge hidden">0</span></button>
+      </nav>
+      <div class="sidebar-foot">仅支持免费公开插件</div>
+    </aside>
+
+    <main class="main">
+      <header class="topbar">
+        <label class="flavor-picker">
+          <span class="topbar-label">游戏版本</span>
+          <select id="flavor-select" disabled></select>
+        </label>
+        <div class="dir-box">
+          <span class="topbar-label">游戏目录</span>
+          <span id="dir-path" class="dir-path">正在读取…</span>
+          <button id="bind-btn" class="btn btn-sm" disabled>选择目录</button>
+          <button id="unbind-btn" class="btn btn-sm btn-text hidden">解除绑定</button>
+        </div>
+      </header>
+      <div id="config-warning" class="warn-bar hidden"></div>
+      <section id="page-discover" class="page"></section>
+      <section id="page-local" class="page hidden"></section>
+    </main>
+  </div>
+  <div id="drawer-root"></div>
+  <div id="task-panel"></div>
+  <div id="toast-root"></div>
+  <div id="modal-root"></div>
+</body>
+</html>

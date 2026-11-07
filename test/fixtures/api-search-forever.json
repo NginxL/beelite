@@ -1,0 +1,91 @@
+{
+  "code": 1,
+  "data": {
+    "list": [
+      {
+        "id": "31505",
+        "name": "openmap-cn汉化高清地图 副本内地图",
+        "logo_url": "https://cdn8.newbeebox.com/fixture/mod/31505/logo.png",
+        "description": "合成测试描述：地图插件，部分功能需配合 Questie 使用。",
+        "update": 1792852421758,
+        "down_total": 534122,
+        "total_download_count": 534122,
+        "favorite_count": 2240,
+        "official": "新手盒子",
+        "file_list": [
+          {
+            "release_type": 1,
+            "file_name": "0.7.5-cn",
+            "file_display_name": "0.7.5-cn",
+            "file_date": 1792852421758,
+            "file_length": 0,
+            "file_url": "https://cdn8.newbeebox.com/fixture/mod_file/31505/0.7.5-cn.zip",
+            "file_folders": ["OpenMap"],
+            "file_version": ["1.60.1"]
+          }
+        ],
+        "user_info": { "t_username": "测试作者A" },
+        "subscribe_plan_level": 0,
+        "categories": [{ "id": 1011, "name": "地图" }],
+        "is_content_access": true
+      },
+      {
+        "id": "30738",
+        "name": "OpenMap",
+        "logo_url": "https://cdn8.newbeebox.com/fixture/mod/30738/logo.png",
+        "description": "合成测试描述：开源世界地图插件。",
+        "update": 1792770945717,
+        "down_total": 84599,
+        "total_download_count": 84599,
+        "favorite_count": 905,
+        "official": "curse",
+        "file_list": [
+          {
+            "release_type": 1,
+            "file_name": "OpenMap-v0.7.5-beta.zip",
+            "file_display_name": "v0.7.5-beta-forever",
+            "file_date": 1792770945717,
+            "file_length": 0,
+            "file_url": "https://cdn8.newbeebox.com/fixture/mod_file/30738/OpenMap-v0.7.5-beta.zip",
+            "file_folders": ["OpenMap"],
+            "file_version": ["1.60.1"]
+          }
+        ],
+        "user_info": null,
+        "subscribe_plan_level": 0,
+        "categories": [{ "id": 1011, "name": "地图" }],
+        "is_content_access": true
+      },
+      {
+        "id": "31927",
+        "name": "Open Maps: Region Icons",
+        "logo_url": "https://cdn8.newbeebox.com/fixture/mod/31927/logo.png",
+        "description": "合成测试描述：在相邻区域显示地图图标。",
+        "update": 1793833165760,
+        "down_total": 2419,
+        "total_download_count": 2419,
+        "favorite_count": 32,
+        "official": "curse",
+        "file_list": [
+          {
+            "release_type": 1,
+            "file_name": "RegionIcons_v0_1_2.zip",
+            "file_display_name": "RegionIcons v0.1.2",
+            "file_date": 1793833165760,
+            "file_length": 0,
+            "file_url": "https://cdn8.newbeebox.com/fixture/mod_file/31927/RegionIcons_v0_1_2.zip",
+            "file_folders": ["RegionIcons"],
+            "file_version": ["1.60.1"]
+          }
+        ],
+        "user_info": null,
+        "subscribe_plan_level": 0,
+        "categories": [{ "id": 1011, "name": "地图" }],
+        "is_content_access": true
+      }
+    ],
+    "total": 3,
+    "game_version_id": 9
+  },
+  "time": 7
+}

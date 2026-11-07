@@ -1,0 +1,40 @@
+{
+  "code": 1,
+  "data": {
+    "result": {
+      "id": 31505,
+      "name": "openmap-cn汉化高清地图 副本内地图",
+      "logo_url": "https://cdn8.newbeebox.com/fixture/mod/31505/logo.png",
+      "description": "## 合成测试说明：部分功能需配合 Questie 使用。\n",
+      "intro": "合成测试简介：地图插件，部分功能需配合 Questie 使用。",
+      "update": 1792852421758,
+      "down_total": 534248,
+      "total_download_count": 534248,
+      "favorite_count": 2240,
+      "official": "新手盒子",
+      "screenshot": [
+        { "url": "https://cdn8.newbeebox.com/fixture/mod/31505/screenshot-1.png" },
+        { "url": "https://cdn8.newbeebox.com/fixture/mod/31505/screenshot-2.png" }
+      ],
+      "file_list": [
+        {
+          "release_type": 1,
+          "file_name": "0.7.5-cn",
+          "file_display_name": "0.7.5-cn",
+          "file_date": 1792852421758,
+          "file_length": 0,
+          "file_url": "https://cdn8.newbeebox.com/fixture/mod_file/31505/0.7.5-cn.zip",
+          "file_folders": ["OpenMap"],
+          "file_version": ["1.60.1"]
+        }
+      ],
+      "t_author_name": "测试作者A",
+      "user_info": { "t_username": "测试作者A" },
+      "game_version_id": 9,
+      "subscribe_plan_level": 0,
+      "is_content_access": true,
+      "categories": [{ "id": 1011, "name": "地图" }]
+    }
+  },
+  "time": 47
+}
