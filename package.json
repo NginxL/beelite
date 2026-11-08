@@ -1,7 +1,7 @@
 {
   "name": "beelite",
   "productName": "BeeLite",
-  "version": "0.1.2",
+  "version": "0.1.3",
   "description": "蜂简 BeeLite：精简的魔兽世界插件搜索、安装与管理工具（macOS）",
   "private": true,
   "main": "dist/app/main/main.js",

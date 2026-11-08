@@ -100,9 +100,27 @@ export interface ConfirmOptions {
   title: string;
   message: string;
   detail?: string[];
+  /** 纯文本长说明（textContent 写入、保留换行、可滚动），例如更新说明 */
+  notes?: string;
+  /** 说明下方的附注，例如“说明过长，已截断” */
+  notesNote?: string;
   confirmText?: string;
   cancelText?: string;
   danger?: boolean;
+  /** 默认焦点；未指定时危险操作聚焦“取消”，其余聚焦“确定” */
+  focus?: 'confirm' | 'cancel';
+}
+
+const modalClosedListeners = new Set<() => void>();
+
+/** 当前是否有确认框（包括正在淡出的） */
+export function modalOpen(): boolean {
+  return byId('modal-root').childElementCount > 0;
+}
+
+/** 订阅确认框关闭（关闭动画结束、已从文档移除之后才通知） */
+export function onModalClosed(fn: () => void): void {
+  modalClosedListeners.add(fn);
 }
 
 export function confirmDialog(o: ConfirmOptions): Promise<boolean> {
@@ -114,7 +132,10 @@ export function confirmDialog(o: ConfirmOptions): Promise<boolean> {
       done = true;
       document.removeEventListener('keydown', onKey, true);
       overlay.classList.add('modal-out');
-      window.setTimeout(() => overlay.remove(), 150);
+      window.setTimeout(() => {
+        overlay.remove();
+        for (const fn of modalClosedListeners) fn();
+      }, 150);
       resolve(v);
     };
     const onKey = (e: KeyboardEvent): void => {
@@ -133,6 +154,8 @@ export function confirmDialog(o: ConfirmOptions): Promise<boolean> {
         o.detail && o.detail.length > 0
           ? h('ul', { class: 'modal-detail' }, o.detail.map((d) => h('li', { text: d })))
           : null,
+        o.notes !== undefined ? h('div', { class: 'modal-notes', text: o.notes, attrs: { tabindex: '0' } }) : null,
+        o.notesNote ? h('div', { class: 'modal-notes-note', text: o.notesNote }) : null,
         h('div', { class: 'modal-actions' },
           cancelBtn,
           okBtn,
@@ -142,6 +165,6 @@ export function confirmDialog(o: ConfirmOptions): Promise<boolean> {
     document.addEventListener('keydown', onKey, true);
     root.appendChild(overlay);
     // 危险操作默认聚焦“取消”，避免回车误删
-    (o.danger ? cancelBtn : okBtn).focus();
+    ((o.focus ?? (o.danger ? 'cancel' : 'confirm')) === 'cancel' ? cancelBtn : okBtn).focus();
   });
 }

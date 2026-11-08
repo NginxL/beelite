@@ -6,6 +6,9 @@
 // - 未授权时：NotDownloaded / Downloaded 回复 Dismiss（不下载、不安装）；Installing 回复 Skip（取消安装），
 //   不能用 Dismiss，否则应用退出时仍会安装。
 // - showReadyToInstallAndRelaunch：授权时持有回复；未授权时回复 Skip（取消本次安装，不永久跳过版本）。
+// - 授权只对用户确认的构建号有效（bl_authorized_for）：授权会话中服务器给出另一个构建时按未授权处理——
+//   未下载 / 已下载回复 Dismiss（不下载、不跳过）；Installing 阶段回复 Skip 取消安装。
+//   Sparkle 的用户发起检查会先清除跳过记录（SPUUIBasedUpdateDriver.m _clearSkippedUpdatesIfUserInitiated），用户再次点击更新时不受影响。
 #ifndef BL_POLICY_H
 #define BL_POLICY_H
 
@@ -27,6 +30,11 @@ static inline bl_action bl_update_found_action(bool authorized, bool information
   }
   if (authorized && !information_only) return BL_REPLY_INSTALL;
   return BL_REPLY_DISMISS;
+}
+
+/** 授权会话中发现的条目是否在授权范围内：必须是用户确认的同一个构建 */
+static inline bool bl_authorized_for(bool authorized, bool build_matches) {
+  return authorized && build_matches;
 }
 
 static inline bl_action bl_ready_action(bool authorized) {

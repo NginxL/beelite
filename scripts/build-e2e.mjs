@@ -17,6 +17,7 @@ const require = createRequire(import.meta.url);
 const PRODUCT = 'BeeLite E2E';
 const APP_ID = 'app.beelite.addons.e2e';
 const VERSIONS = ['0.9.1', '0.9.2'];
+const NOTES_FIXTURE = path.join(PROJECT_ROOT, 'test', 'fixtures', 'e2e-release-notes.txt');
 
 function arg(name, fallback) {
   const i = process.argv.indexOf(name);
@@ -86,12 +87,21 @@ async function main() {
   const ok = path.join(feedRoot, 'ok');
   await mkdir(ok, { recursive: true });
   await copyFile(zips[newer], path.join(ok, zipName));
-  run(process.execPath, [
+  const appcastArgs = (dir, extra = []) => [
     path.join(PROJECT_ROOT, 'scripts', 'release-appcast.mjs'),
-    '--mode', 'e2e', '--zip', path.join(ok, zipName), '--account', account,
-    '--download-url', `http://127.0.0.1:${port}/${zipName}`, '--out', ok, '--feed', feedURL, '--key', publicKey,
-  ]);
+    '--mode', 'e2e', '--zip', path.join(dir, zipName), '--account', account,
+    '--download-url', `http://127.0.0.1:${port}/${zipName}`, '--out', dir, '--feed', feedURL, '--key', publicKey,
+    ...extra,
+  ];
+  // 正常用例带纯文本更新说明（测试夹具，含需要 XML 转义与不应被当作 HTML 的字符）
+  run(process.execPath, appcastArgs(ok, ['--notes', NOTES_FIXTURE]));
   const okFeed = await readFile(path.join(ok, 'appcast.xml'), 'utf8');
+
+  // 签名有效但没有更新说明：弹窗应明确显示“未提供更新说明”
+  const noNotes = path.join(feedRoot, 'no-notes');
+  await mkdir(noNotes, { recursive: true });
+  await copyFile(zips[newer], path.join(noNotes, zipName));
+  run(process.execPath, appcastArgs(noNotes));
 
   // 篡改归档：feed 签名有效，但归档中间一个字节被改动，EdDSA 校验应失败
   const badArchive = path.join(feedRoot, 'bad-archive');
@@ -126,6 +136,7 @@ async function main() {
   console.log(`\n[e2e] 完成：${outRoot}
   旧版应用：${path.join(outRoot, `v${VERSIONS[0]}`, 'mac-arm64', `${PRODUCT}.app`)}
   新版 feed：node scripts/e2e-feed-server.mjs ${ok} --port ${port}
+  无说明用例：node scripts/e2e-feed-server.mjs ${noNotes} --port ${port}
   负向用例：${['bad-archive', 'tampered-feed', 'unsigned-feed', 'missing-archive'].map((d) => path.join(feedRoot, d)).join('\n            ')}
   测试签名账户：${account}（验收后删除：${identity.deleteTestKey}）`);
 }

@@ -5,8 +5,8 @@ import { modKey, updateProject } from './actions.js';
 import { confirmDialog, h, modIcon, mount, spinner } from './dom.js';
 import { cleanTocText, formatDateTime } from './format.js';
 import {
-  api, bindDirectory, checkUpdates, currentFlavor, flavorName, isBlocked, isBusy, isOtherFlavor,
-  on, projectHasUpdate, refreshLocal, requireTarget, runWrite, state, stillTarget, updateCount,
+  api, bindDirectory, checkUpdates, currentFlavor, currentWatchEntry, flavorName, isBlocked, isBusy, isOtherFlavor,
+  on, projectHasUpdate, refreshLocal, requireTarget, runWrite, state, stillTarget, updateCount, updateFor,
 } from './state.js';
 
 type Tab = 'managed' | 'unmanaged' | 'recovery';
@@ -60,10 +60,12 @@ function renderToolbar(): void {
   const checking = isBusy('check');
   const updatingAll = isBusy('updateAll');
 
+  const info = checkInfo();
   mount(toolbarEl,
     h('div', { class: 'page-title' },
       h('span', { text: '我的插件' }),
       state.localLoading && local ? spinner(true) : null,
+      info ? h('span', { class: info.error ? 'check-info check-info-warn' : 'check-info', text: info.text, title: info.title }) : null,
     ),
     h('div', { class: 'toolbar-actions' },
       h('button', {
@@ -84,6 +86,28 @@ function renderToolbar(): void {
       }, '刷新'),
     ),
   );
+}
+
+/** 当前目录的自动检查状态：上次检查时间、失败数量或整体错误 */
+function checkInfo(): { text: string; title: string; error: boolean } | null {
+  const e = currentWatchEntry();
+  if (!e || !state.local?.profile.root || state.local.managed.length === 0) return null;
+  const next = e.nextCheckAt ? `；下次自动检查约 ${formatDateTime(e.nextCheckAt).slice(11)}` : '';
+  const settingsError = state.watch?.settingsError ?? null;
+  if (settingsError) return { text: '无法确认更新：设置文件无法读取', title: `${settingsError}；自动检查已暂停。修复设置文件后点「检查更新」恢复检查`, error: true };
+  if (e.status === 'checking') return { text: '正在检查更新…', title: '', error: false };
+  if (e.error) return { text: '无法确认更新状态', title: `${e.error}${next}`, error: true };
+  if (e.checkedAt === null) return { text: '尚未检查更新', title: '蜂简运行期间会自动检查已托管插件的更新', error: false };
+  const at = `上次检查 ${formatDateTime(e.checkedAt)}`;
+  if (e.failed > 0) return { text: `${at} · ${e.failed} 个检查失败`, title: `失败的插件不会显示为“已是最新”${next}`, error: true };
+  return { text: at, title: `蜂简运行期间每小时自动检查一次${next}`, error: false };
+}
+
+/** 从更新提醒跳转过来时显示“已托管”标签页 */
+export function showManagedTab(): void {
+  if (tab === 'managed') return;
+  tab = 'managed';
+  if (bodyEl) renderBody();
 }
 
 export async function doUpdateAll(): Promise<void> {
@@ -166,13 +190,13 @@ function managedRow(p: ManagedProjectView): HTMLElement {
   const blocked = isBlocked();
   const busy = isBusy(modKey(p.modId));
   const hasUpdate = projectHasUpdate(p);
-  const u = state.updates.get(p.modId);
+  const u = updateFor(p);
   const missing = p.folders.filter((f) => !f.present).length;
   const otherFlavor = isOtherFlavor(p);
   const otherTitle = `该插件按「${flavorName(p.flavorId)}」版本安装，与当前游戏版本不同：可以卸载（卸载后可恢复），但不会检查更新、更新或重装。如需改用当前版本，请先卸载再安装。`;
 
   let status: HTMLElement | null = null;
-  if (hasUpdate) status = h('span', { class: 'tag tag-accent', text: `可更新到 ${u?.latestVersion ?? '新版本'}` });
+  if (hasUpdate) status = h('span', { class: 'tag tag-accent', text: `可更新到 ${u?.latestVersion ?? '新版本'}`, title: u?.stale ? (u.error ?? '') : '' });
   else if (u?.skipped) status = h('span', { class: 'tag tag-muted', text: '不检查更新', title: u.skipped });
   else if (u?.error) status = h('span', { class: 'small-error', text: u.error, title: u.error });
   else if (state.updatesChecked && u) status = h('span', { class: 'tag tag-muted', text: '已是最新' });

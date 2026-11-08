@@ -7,10 +7,13 @@ import { mkdir, realpath, rename, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { addonEntries, cleanup, FakeSource, listAddOns, makeGameRoot, makeManager, makeZip, readAddonFile, tmpDir } from './helpers';
 import { createHarness, ipcCalls, readManifestJson, snapshot } from './ipc-harness';
+import type { AddonWatchSnapshot } from '../src/shared/types';
 
 const SRC = 6; // 插件记录的来源版本
 const VIEW = 3; // 目录 A 当前绑定的版本
 const zipOf = (folder: string, v: string) => makeZip(addonEntries(folder, v));
+/** 0.1.3 起手动检查回复主进程快照：取出该目录条目中的检查结果 */
+const itemsOf = (s: AddonWatchSnapshot, flavorId: number, root: string) => s.entries.find((e) => e.flavorId === flavorId && e.root === root)?.items ?? [];
 
 async function crossSetup() {
   const base = await realpath(await tmpDir());
@@ -85,7 +88,7 @@ test('异来源插件：检查更新跳过且不查询远端，全部更新只�
     src.set('200', VIEW, { name: 'N', fileId: '2', zip: zipOf('ModN', 'n2'), versions: ['12.1.5'] });
     const b0 = await snapshot(B);
     src.calls.length = 0;
-    const items = (await h.api.checkUpdates(VIEW, A)) as { modId: string; hasUpdate: boolean; skipped?: string; error: string | null }[];
+    const items = itemsOf(await h.api.checkUpdates(VIEW, A), VIEW, A);
     const m = items.find((i) => i.modId === '100')!;
     const n = items.find((i) => i.modId === '200')!;
     assert.equal(m.hasUpdate, false);
@@ -164,7 +167,7 @@ test('正常来源：经 IPC 安装、更新、重装、卸载、恢复都作用
     assert.match(await readAddonFile(A, 'ModP', 'ModP.toc'), /p1/);
 
     src.set('300', VIEW, { name: 'P', fileId: '2', zip: zipOf('ModP', 'p2'), versions: ['12.1.5'] });
-    const items = (await h.api.checkUpdates(VIEW, A)) as { modId: string; hasUpdate: boolean }[];
+    const items = itemsOf(await h.api.checkUpdates(VIEW, A), VIEW, A);
     assert.equal(items.find((i) => i.modId === '300')?.hasUpdate, true);
     assert.match(((await h.api.update('300', VIEW, false, A)) as { message: string }).message, /已更新到/);
     assert.match(await readAddonFile(A, 'ModP', 'ModP.toc'), /p2/);

@@ -21,10 +21,12 @@ interface Stub {
   openDialogs: number;
   pick: string | null;
   exposed: BeeLiteApi | null;
+  /** 主进程推送给窗口的事件（通道与内容） */
+  sent: { channel: string; payload: unknown }[];
 }
 
-const stub: Stub = { handlers: new Map(), messageBoxResponse: 0, messageBoxes: [], openDialogs: 0, pick: null, exposed: null };
-const webContents = { send: () => undefined };
+const stub: Stub = { handlers: new Map(), messageBoxResponse: 0, messageBoxes: [], openDialogs: 0, pick: null, exposed: null, sent: [] };
+const webContents = { send: (channel: string, payload: unknown) => void stub.sent.push({ channel, payload }) };
 const senderEvent = { sender: webContents, senderFrame: { url: 'app://beelite/index.html' } };
 
 /** 所有经过 IPC 的调用（通道与参数），用来断言渲染层实际发送的目标 */
@@ -68,6 +70,7 @@ export interface Harness {
   invoke: typeof invoke;
   /** 由真实 preload 暴露给界面的接口 */
   api: BeeLiteApi;
+  service: import('../src/main/ipc').AppService;
 }
 
 export function createHarness(opts: { settingsFile: string; source: FakeSource; download?: ManagerOptions['download'] }): Harness {
@@ -77,6 +80,7 @@ export function createHarness(opts: { settingsFile: string; source: FakeSource; 
   stub.messageBoxes = [];
   stub.openDialogs = 0;
   stub.pick = null;
+  stub.sent = [];
   ipcCalls.length = 0;
   // eslint-disable-next-line @typescript-eslint/no-require-imports
   const { AppService } = require('../src/main/ipc') as typeof import('../src/main/ipc');
@@ -96,7 +100,7 @@ export function createHarness(opts: { settingsFile: string; source: FakeSource; 
   // eslint-disable-next-line @typescript-eslint/no-require-imports
   require('../src/preload/preload');
   if (!stub.exposed) throw new Error('preload 没有暴露接口');
-  return { settings, gate, stub, invoke, api: stub.exposed };
+  return { settings, gate, stub, invoke, api: stub.exposed, service };
 }
 
 /** 递归快照：目录与文件（内容哈希），用于断言某个游戏目录（含 .beelite 清单、回收站与 WTF）完全没有变化 */

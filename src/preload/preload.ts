@@ -1,20 +1,29 @@
 // 沙箱 preload：只暴露固定的窄接口，界面拿不到 ipcRenderer、Node 或任何文件路径能力。
 // 注意：sandbox 模式下 preload 只能 require('electron')，因此本文件不引用项目内其他运行时模块。
 import { contextBridge, ipcRenderer, type IpcRendererEvent } from 'electron';
-import type { BeeLiteApi, ClientUpdateState, TaskEvent } from '../shared/types';
+import type { AddonWatchSnapshot, BeeLiteApi, ClientUpdateState, TaskEvent } from '../shared/types';
 
 const invoke = (channel: string, ...args: unknown[]) => ipcRenderer.invoke(channel, ...args);
 
 const api: BeeLiteApi = {
   clientState: () => invoke('client:state'),
   clientCheck: () => invoke('client:check'),
-  clientUpdate: () => invoke('client:update'),
+  clientUpdate: (expectedBuild) => invoke('client:update', expectedBuild),
   clientCancel: () => invoke('client:cancel'),
+  clientAckNotice: (build) => invoke('client:ackNotice', build),
   onClientState: (cb) => {
     const listener = (_e: IpcRendererEvent, st: ClientUpdateState) => cb(st);
     ipcRenderer.on('client:event', listener);
     return () => {
       ipcRenderer.removeListener('client:event', listener);
+    };
+  },
+  watchState: () => invoke('addon:watchState'),
+  onAddonWatch: (cb) => {
+    const listener = (_e: IpcRendererEvent, s: AddonWatchSnapshot) => cb(s);
+    ipcRenderer.on('addon:watch', listener);
+    return () => {
+      ipcRenderer.removeListener('addon:watch', listener);
     };
   },
   getConfig: () => invoke('config:get'),

@@ -2,11 +2,12 @@
 import { app, dialog, ipcMain, type BrowserWindow, type IpcMainInvokeEvent } from 'electron';
 import { stat } from 'node:fs/promises';
 import path from 'node:path';
-import type { AppConfig, ClientUpdateState, FlavorInfo, LocalState, OpResult, ProfileInfo, SearchQuery, SortOrder, TaskEvent, TaskPhase } from '../shared/types';
+import type { AddonWatchSnapshot, AppConfig, ClientUpdateState, FlavorInfo, LocalState, OpResult, ProfileInfo, SearchQuery, SortOrder, TaskEvent, TaskPhase } from '../shared/types';
+import { AddonUpdateWatch, type WatchClock } from '../core/addon-watch';
 import { errorMessage, UserError } from '../core/errors';
 import { DEFAULT_FLAVOR_ID, FLAVORS, getFlavor, interfaceFromVersion } from '../core/flavors';
 import { runUpdateAll } from '../core/batch';
-import type { ClientUpdater } from '../core/client-update';
+import { BUILD_RE, type ClientUpdater } from '../core/client-update';
 import { guardHandler, type MutationGate } from '../core/gate';
 import { AddonManager, type ManagerOptions } from '../core/manager';
 import { isValidModuleName } from '../core/paths';
@@ -40,6 +41,11 @@ function expectedRootArg(v: unknown): string {
   if (typeof v !== 'string' || v.length === 0 || v.length > 4096 || v.includes('\0') || !path.isAbsolute(v)) throw new UserError('目标目录参数无效');
   return v;
 }
+/** 客户端新版本的构建号：只用于与当前可更新的构建比对 */
+function buildArg(v: unknown): string {
+  if (typeof v !== 'string' || !BUILD_RE.test(v)) throw new UserError('版本参数无效');
+  return v;
+}
 function queryArg(v: unknown): SearchQuery {
   if (typeof v !== 'object' || v === null) throw new UserError('搜索参数无效');
   const q = v as Record<string, unknown>;
@@ -59,10 +65,18 @@ export interface ServiceDeps {
   gate: MutationGate;
   /** 测试注入：替换插件下载实现，避免访问真实接口 */
   download?: ManagerOptions['download'];
+  /** 测试注入：插件更新自动检查的时钟 */
+  clock?: WatchClock;
 }
+
+/** 完成后要让该目录已有的检查结果按新清单重校验的写通道（flavorId 为第 2 个参数、全部更新为第 1 个；期望目录为最后一个参数） */
+const ROOT_WRITE_CHANNELS: ReadonlySet<string> = new Set(['addon:install', 'addon:update', 'addon:updateAll', 'addon:uninstall', 'addon:uninstallFolder', 'trash:restore', 'trash:purge']);
+const BINDING_CHANNELS: ReadonlySet<string> = new Set(['profile:bind', 'profile:unbind']);
 
 export class AppService {
   readonly manager: AddonManager;
+  /** 插件更新检查协调器：手动、自动与全部更新的内部重查都经由它；由 main 在启动恢复后 start() */
+  readonly watch: AddonUpdateWatch;
   private readonly names = new Map<string, string>();
   private readonly tasks = new Map<string, AbortController>();
   private taskSeq = 0;
@@ -79,6 +93,38 @@ export class AppService {
         return r.response === 0;
       },
     });
+    this.watch = new AddonUpdateWatch({
+      settings: deps.settings,
+      checker: this.manager,
+      gate: deps.gate,
+      clock: deps.clock,
+      onChange: (s) => this.pushWatch(s),
+    });
+  }
+
+  private pushWatch(s: AddonWatchSnapshot): void {
+    const win = this.deps.getWindow();
+    if (win && !win.isDestroyed()) win.webContents.send('addon:watch', s);
+  }
+
+  /**
+   * 写通道结束后（无论成败），在任何 await 之前同步作废相关结果，再异步只读同步：
+   * - 绑定 / 解绑成功：立即作废该游戏版本的全部结果、提醒与进行中的检查，再按设置重建目录列表；
+   *   用户取消选择（返回 null）或请求被拒绝时绑定没有改变，只重新同步。
+   * - 目录写操作：立即递增该目录的写入代次，再按新清单重校验已有结果。
+   */
+  private afterMutation(channel: string, args: unknown[], outcome: { failed: boolean; result?: unknown } = { failed: false }): void {
+    if (BINDING_CHANNELS.has(channel)) {
+      const changed = !outcome.failed && !(channel === 'profile:bind' && outcome.result === null);
+      if (changed && typeof args[0] === 'number') this.watch.invalidateFlavor(args[0]);
+      void this.watch.bindingsChanged().catch(() => undefined);
+      return;
+    }
+    if (!ROOT_WRITE_CHANNELS.has(channel)) return;
+    const f = channel === 'addon:updateAll' ? args[0] : args[1];
+    const root = args[args.length - 1];
+    if (typeof f !== 'number' || typeof root !== 'string') return;
+    void this.watch.afterWrite(f, root).catch(() => undefined);
   }
 
   private emit(ev: TaskEvent): void {
@@ -189,6 +235,8 @@ export class AppService {
       root,
       flavorId,
       isStillBound: async () => (await this.deps.settings.profile(flavorId)).root === root,
+      // 批次已在写入闸门内：强制新检查排在自动检查之前、不等待闸门，避免与自动检查叠加并发
+      check: (r, f) => this.watch.check(f, r, { fresh: true }),
       installOne: (p, fixedRoot) => {
         this.names.set(p.modId, p.name);
         return this.runInstall(p.modId, flavorId, false, fixedRoot);
@@ -216,18 +264,31 @@ export class AppService {
       const guarded = guardHandler(this.deps.gate, channel, fn);
       ipcMain.handle(channel, async (e: IpcMainInvokeEvent, ...args: unknown[]) => {
         this.assertSender(e);
+        const outcome: { failed: boolean; result?: unknown } = { failed: true };
         try {
-          return await guarded(...args);
+          outcome.result = await guarded(...args);
+          outcome.failed = false;
+          return outcome.result;
         } catch (err) {
           throw new Error(errorMessage(err));
+        } finally {
+          this.afterMutation(channel, args, outcome);
         }
       });
     };
-    // 客户端更新：固定操作，不接收任何参数
+    // 客户端更新：固定操作；更新与已读提醒只接收界面看到的构建号，用于比对
     handle('client:state', async () => this.clientState());
     handle('client:check', async () => this.clientUpdater?.check() ?? this.clientState());
-    handle('client:update', async () => this.clientUpdater?.update() ?? this.clientState());
+    handle('client:update', async (b) => {
+      const build = buildArg(b);
+      return this.clientUpdater?.update(build) ?? this.clientState();
+    });
     handle('client:cancel', async () => this.clientUpdater?.cancel() ?? this.clientState());
+    handle('client:ackNotice', async (b) => {
+      const build = buildArg(b);
+      return this.clientUpdater?.ackNotice(build) ?? this.clientState();
+    });
+    handle('addon:watchState', async () => this.watch.snapshot());
     handle('config:get', () => this.config());
     handle('mods:search', async (q) => {
       const r = await this.deps.provider.search(queryArg(q));
@@ -250,7 +311,9 @@ export class AppService {
     handle('local:state', (f) => this.localState(flavorArg(f)));
     handle('addon:check', async (f, root) => {
       const flavorId = flavorArg(f);
-      return this.manager.checkUpdates(await this.targetRoot(flavorId, expectedRootArg(root)), flavorId);
+      // 等一次有效检查完成后返回权威快照（含合并结果与 rev）；界面不使用未经快照校验的原始结果
+      await this.watch.check(flavorId, await this.targetRoot(flavorId, expectedRootArg(root)));
+      return this.watch.snapshot();
     });
     handle('addon:install', async (m, f, root) => {
       const flavorId = flavorArg(f);

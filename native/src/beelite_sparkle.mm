@@ -2,7 +2,10 @@
 //
 // 只提供五个固定操作：init / probe / beginUpdate / installNow / cancel。
 // - probe：checkForUpdateInformation，只探测，不下载。
-// - beginUpdate：本次会话授权（g_authorized）后发起用户检查；只有授权内，driver 才对“发现更新”回复 Install（即开始下载）。
+// - beginUpdate(expectedBuild)：本次会话授权（g_authorized）后发起用户检查；授权只对用户确认的构建号 g_expectedBuild 有效。
+//   只有授权内且构建一致，driver 才对“发现更新”回复 Install（即开始下载）；服务器给出另一个构建时不下载，上报 build-changed。
+// - 版本、构建号与更新说明总是从同一个 SUAppcastItem 一起上报（bl_notes.h）；说明只取签名校验成功的纯文本 description，
+//   且不让 Sparkle 下载外部 release notes（shouldDownloadReleaseNotesForUpdate 返回 NO）。
 // - 下载、EdDSA 验签、解压完成后（或会话发现更新已处于 Installing 阶段时），driver 持有安装回复，不自行安装；
 //   由 JS 排空写操作后调用 installNow。回复策略见 bl_policy.h。
 // - cancel：只在确有取消手段时生效（持有的安装回复以 Skip 取消、下载取消块、用户检查取消块）；解压阶段无法取消。
@@ -10,11 +13,14 @@
 #import <Cocoa/Cocoa.h>
 #import <Sparkle/Sparkle.h>
 #include <node_api.h>
+#include "bl_notes.h"
 #include "bl_policy.h"
 
 static napi_threadsafe_function g_tsfn = NULL;
 static BOOL g_closing = NO;
 static BOOL g_authorized = NO;
+/** 本次授权对应的构建号（SUAppcastItem.versionString） */
+static NSString *g_expectedBuild = nil;
 static SPUUpdater *g_updater = nil;
 static id g_driver = nil;
 static id g_delegate = nil;
@@ -84,6 +90,7 @@ static bl_stage StageOf(SPUUserUpdateState *state) {
 
 static void ClearSession(void) {
   g_authorized = NO;
+  g_expectedBuild = nil;
   g_readyReply = nil;
   g_downloadCancel = nil;
   g_checkCancel = nil;
@@ -96,7 +103,11 @@ static void ClearSession(void) {
 
 @implementation BeeLiteUpdaterDelegate
 - (void)updater:(SPUUpdater *)updater didFindValidUpdate:(SUAppcastItem *)item {
-  Emit(@{@"type" : @"valid-update", @"version" : item.versionString ?: @"", @"displayVersion" : item.displayVersionString ?: @""});
+  Emit(BLItemEvent(@"valid-update", item, nil));
+}
+- (BOOL)updater:(SPUUpdater *)updater shouldDownloadReleaseNotesForUpdate:(SUAppcastItem *)updateItem {
+  // 只使用 appcast 内联、随 feed 签名的纯文本说明；不请求任何外部 release notes 链接
+  return NO;
 }
 - (void)updaterDidNotFindUpdate:(SPUUpdater *)updater error:(NSError *)error {
   Emit(@{@"type" : @"no-update"});
@@ -127,9 +138,17 @@ static void ClearSession(void) {
 }
 - (void)showUpdateFoundWithAppcastItem:(SUAppcastItem *)appcastItem state:(SPUUserUpdateState *)state reply:(void (^)(SPUUserUpdateChoice))reply {
   g_checkCancel = nil;
-  bl_action action = bl_update_found_action(g_authorized, appcastItem.informationOnlyUpdate, StageOf(state));
+  BOOL matches = g_expectedBuild != nil && [g_expectedBuild isEqualToString:(appcastItem.versionString ?: @"")];
+  BOOL changed = g_authorized && !matches;
+  bl_action action = bl_update_found_action(bl_authorized_for(g_authorized, matches), appcastItem.informationOnlyUpdate, StageOf(state));
   BOOL allowed = action == BL_REPLY_INSTALL || action == BL_HOLD;
-  Emit(@{@"type" : @"update-found", @"authorized" : @(allowed), @"version" : appcastItem.versionString ?: @"", @"displayVersion" : appcastItem.displayVersionString ?: @""});
+  if (changed) {
+    // 用户确认的是另一个构建：本次不下载、不安装；授权作废，由用户看过新构建的说明后重新点击
+    g_authorized = NO;
+    g_expectedBuild = nil;
+    Emit(BLItemEvent(@"build-changed", appcastItem, nil));
+  }
+  Emit(BLItemEvent(@"update-found", appcastItem, @{@"authorized" : @(allowed)}));
   if (action == BL_HOLD) {
     // 已处于 Installing 阶段：回复 Install 会立即退出重启，必须先交给主进程排空写操作
     g_readyReply = [reply copy];
@@ -280,10 +299,30 @@ static napi_value Probe(napi_env env, napi_callback_info info) {
   return Bool(env, true);
 }
 
+/** 读取构建号参数：1–64 个字符，只允许字母、数字与 . _ + - */
+static NSString *BuildArg(napi_env env, napi_callback_info info) {
+  size_t argc = 1;
+  napi_value argv[1];
+  if (napi_get_cb_info(env, info, &argc, argv, NULL, NULL) != napi_ok || argc < 1) return nil;
+  napi_valuetype t;
+  if (napi_typeof(env, argv[0], &t) != napi_ok || t != napi_string) return nil;
+  char buf[72];
+  size_t len = 0;
+  if (napi_get_value_string_utf8(env, argv[0], buf, sizeof(buf), &len) != napi_ok || len == 0 || len > 64) return nil;
+  for (size_t i = 0; i < len; i++) {
+    char c = buf[i];
+    BOOL ok = (c >= '0' && c <= '9') || (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || c == '.' || c == '_' || c == '+' || c == '-';
+    if (!ok) return nil;
+  }
+  return [[NSString alloc] initWithBytes:buf length:len encoding:NSUTF8StringEncoding];
+}
+
 static napi_value BeginUpdate(napi_env env, napi_callback_info info) {
-  if (!Ready() || !g_updater.canCheckForUpdates || g_updater.sessionInProgress) return Bool(env, false);
+  NSString *build = BuildArg(env, info);
+  if (build == nil || !Ready() || !g_updater.canCheckForUpdates || g_updater.sessionInProgress) return Bool(env, false);
   ClearSession();
   g_authorized = YES;
+  g_expectedBuild = build;
   [g_updater checkForUpdates];
   return Bool(env, true);
 }

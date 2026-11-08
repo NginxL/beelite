@@ -14,6 +14,14 @@
 
 这些设置由 `npm run dist` 末尾的 `scripts/verify-app.mjs production` 检查；生产包中出现测试身份、测试 feed 或测试公钥时会失败。生产环境如需关闭其中任何一项，需要重新评审。
 
+### 更新说明
+
+- 每个版本的用户说明只有一个来源：仓库中的 `release-notes/<版本>.txt`（UTF-8 纯文本，不超过 4000 个字符，不能有控制字符）。它同时用于 appcast 和 GitHub Release 的说明。
+- 生产模式的 `npm run release:appcast` 强制要求与安装包版本号同名的 `release-notes/<版本>.txt` 存在且非空，否则失败；生产模式拒绝 `--notes`，不能用其他文件覆盖。e2e 模式才接受 `--notes <文件>`，不提供时不写说明。
+- `release-appcast.mjs` 把它写成 appcast 条目中的 `<description sparkle:format="plain-text">…</description>`（正文 XML 转义），然后才对 feed 签名，所以说明受 feed 签名保护。属性名必须是 `sparkle:format`（官方 Sparkle 2.9.6 `SUConstants.m` 的 `SUAppcastAttributeFormat`）；写成其他名字时 Sparkle 会按 HTML 处理，客户端不会显示。
+- 不要在 appcast 中加入 `sparkle:releaseNotesLink` 或 `sparkle:fullReleaseNotesLink`。0.1.3 起的原生模块对 `shouldDownloadReleaseNotesForUpdate` 返回 NO，不请求外部说明；只在 feed 签名校验成功、格式为 `plain-text` 时把说明交给界面，界面按纯文本显示。
+- 兼容性：0.1.1 / 0.1.2 的客户端忽略 `<description>`，照常更新，但不会弹出说明；用户先升级到 0.1.3 之后，从下一个版本起才会看到说明。旧版本不会因为 feed 中有说明而获得新的界面。
+
 ## 签名密钥
 
 - 生产签名密钥保存在维护者 Mac 的 login Keychain 中：generic password，服务 `https://sparkle-project.org`，账户 `app.beelite.addons`。由 Sparkle 官方 `generate_keys --account app.beelite.addons` 生成；已存在时该命令只会显示公钥，不会覆盖。
@@ -24,7 +32,7 @@
 
 ## 发布步骤
 
-1. 更新 `package.json` 与 `package-lock.json` 中的版本号（Sparkle 按版本号比较新旧，必须递增）。
+1. 更新 `package.json` 与 `package-lock.json` 中的版本号（Sparkle 按版本号比较新旧，必须递增），并新建 `release-notes/<版本>.txt` 写好面向用户的更新说明（`npm test` 会检查当前版本的说明文件存在且合法）。
 2. 运行测试与打包：
 
    ```sh
@@ -40,10 +48,10 @@
    npm run release:appcast -- --zip release/BeeLite-<版本>-arm64-mac.zip
    ```
 
-   脚本会解压安装包并再次执行产物校验；用 `generate_keys --account app.beelite.addons -p` 只读查询签名账户的公钥，与安装包内置的 `SUPublicEDKey` 不一致时直接失败（避免发布客户端会拒绝的更新）；用 Keychain 中的私钥签名安装包并立即校验该签名；生成 `release/appcast.xml`（包含版本号、最低 macOS 13.0.0、arm64 要求和下载地址 `https://github.com/NginxL/beelite/releases/download/v<版本>/<文件名>`；生产模式不接受指向其他地址的 `--download-url`），对 appcast 签名后立即校验，并写出 `release/SHA256SUMS`。
+   脚本会解压安装包并执行产物校验；按安装包的版本号读取 `release-notes/<版本>.txt`（缺失或为空时失败，生产模式不接受 `--notes`）；用 `generate_keys --account app.beelite.addons -p` 只读查询签名账户的公钥，与安装包内置的 `SUPublicEDKey` 不一致时直接失败（避免发布客户端会拒绝的更新）；用 Keychain 中的私钥签名安装包并立即校验该签名；生成 `release/appcast.xml`（包含版本号、最低 macOS 13.0.0、arm64 要求和下载地址 `https://github.com/NginxL/beelite/releases/download/v<版本>/<文件名>`；生产模式不接受指向其他地址的 `--download-url`），在条目中写入纯文本说明后对 appcast 签名并立即校验，写出 `release/SHA256SUMS`，并把同一份说明另存为 `release/RELEASE_NOTES.txt`。
 
-4. 先把源码与文档提交并推送，在 GitHub 上新建 tag 为 `v<版本>`、目标为该次提交完整 SHA 的 **draft** Release，上传 `BeeLite-<版本>-arm64-mac.zip`、`appcast.xml` 和 `SHA256SUMS`（不要上传 `latest-mac.yml` 或 blockmap）。
-5. 从 draft 的资产地址下载回这三个文件，核对 SHA256 后再发布 Release，并确认它是 latest。发布后 `releases/latest/download/appcast.xml` 会立即指向新版本：用匿名请求下载它，再用 `sign_update --account app.beelite.addons --verify appcast.xml` 确认 feed 签名有效，并核对其中的版本号、下载地址和文件长度。
+4. 先把源码与文档提交并推送，在 GitHub 上新建 tag 为 `v<版本>`、目标为该次提交完整 SHA 的 **draft** Release，说明使用同一份文本（例如 `gh release create v<版本> --draft --target <完整 SHA> --notes-file release/RELEASE_NOTES.txt …`），上传 `BeeLite-<版本>-arm64-mac.zip`、`appcast.xml` 和 `SHA256SUMS`（不要上传 `latest-mac.yml`、blockmap 或 `RELEASE_NOTES.txt`）。
+5. 从 draft 的资产地址下载回这三个文件，核对 SHA256 后再发布 Release，并确认它是 latest。发布后 `releases/latest/download/appcast.xml` 会立即指向新版本：用匿名请求下载它，再用 `sign_update --account app.beelite.addons --verify appcast.xml` 确认 feed 签名有效，并核对其中的版本号、下载地址、文件长度，以及 `<description sparkle:format="plain-text">` 的内容与 `release-notes/<版本>.txt` 一致。
 6. 撤回或纠正有问题的版本：
    - Sparkle 只会提供比已安装版本更新的版本，**不会降级**。已经更新到问题版本的用户，不会因为 latest 改动而回到旧版本。要修复他们，只能发布一个版本号更高、带有效签名 appcast 的修复版本。
    - 只想阻止尚未更新的用户收到问题版本时，可以把 latest 改回上一个**同样附带有效签名 appcast** 的 Release。
@@ -52,6 +60,6 @@
 
 ## 发布前的端到端验收
 
-`npm run e2e:build` 会构建两个隔离的测试版本（productName `BeeLite E2E`、appId `app.beelite.addons.e2e`，使用每次新建的测试签名账户和 `http://127.0.0.1:47831/appcast.xml`），并生成正常与负向用例的 feed 目录；每次运行目录中的 `identity.json` 记录了测试账户和删除命令，验收步骤见 [E2E.md](E2E.md)。测试包的 userData 与 Sparkle 偏好都按测试身份隔离，不会读写正式版本的数据；但这些位置是固定的，多次运行共用，清理时只能删除本次运行创建的内容（见 E2E.md）。
+`npm run e2e:build` 会构建两个隔离的测试版本（productName `BeeLite E2E`、appId `app.beelite.addons.e2e`，使用每次新建的测试签名账户和 `http://127.0.0.1:47831/appcast.xml`），并生成正常（带测试说明 `test/fixtures/e2e-release-notes.txt`）、无说明与负向用例的 feed 目录；每次运行目录中的 `identity.json` 记录了测试账户和删除命令，验收步骤见 [E2E.md](E2E.md)。测试包的 userData 与 Sparkle 偏好都按测试身份隔离，不会读写正式版本的数据；但这些位置是固定的，多次运行共用，清理时只能删除本次运行创建的内容（见 E2E.md）。
 
 `node scripts/e2e-feed-server.mjs <feed 目录> --port 47831 [--rate <字节/秒>]` 提供本地 feed。验收结束后按 `identity.json` 删除本次测试密钥。

@@ -6,12 +6,15 @@
 |---|---|
 | 应用 | `BeeLite E2E.app`（productName `BeeLite E2E`，appId `app.beelite.addons.e2e`） |
 | 旧版 / 新版 | `v0.9.1/mac-arm64/BeeLite E2E.app` / `feed/ok/BeeLite-E2E-0.9.2-arm64-mac.zip` |
+| 更新说明 | `feed/ok` 的 appcast 带纯文本说明（取自 `test/fixtures/e2e-release-notes.txt`，含 `<b>`、`<script>`、`&` 等应原样显示的字符）；`feed/no-notes` 是同一安装包、签名有效但不带说明的 feed |
 | feed | `http://127.0.0.1:47831/appcast.xml`（Electron 默认 ATS 允许 127.0.0.1 的 http） |
 | userData | `~/Library/Application Support/BeeLite E2E`（只属于测试包） |
 | Sparkle 偏好 | `defaults` 域 `app.beelite.addons.e2e` |
 | 测试签名 | 每次运行新建的 Keychain 账户 `beelite-e2e-<编号>`，见 `identity.json` |
 
-可以先离线核对用例：`native/vendor/bin/sign_update --account <测试账户> --verify feed/<用例>/appcast.xml` 对 `ok` 应成功，对 `tampered-feed`、`unsigned-feed` 应失败。
+可以先离线核对用例：`native/vendor/bin/sign_update --account <测试账户> --verify feed/<用例>/appcast.xml` 对 `ok`、`no-notes` 应成功，对 `tampered-feed`、`unsigned-feed` 应失败。`feed/ok/appcast.xml` 中应有 `<description sparkle:format="plain-text">`，且没有 `releaseNotesLink`。
+
+测试包是完整的应用，会照常对绑定的临时游戏目录做插件更新自动检查（只读，访问真实的 NewBeeBox 接口查询已安装插件的最新文件）；验收客户端更新时可以忽略插件提示，但不要绑定真实游戏目录。
 
 ## 准备
 
@@ -35,10 +38,13 @@
 
 ## 正向
 
-1. 启动旧版。约 5 秒后侧栏应显示“发现新版本 v0.9.2”，feed 服务器日志只出现 `appcast.xml`，**不出现 zip 请求**（只探测不下载）。
-2. 点击侧栏“下载并更新”（一次）。依次出现下载百分比、“正在校验并解压…”、“正在安装并重新启动…”，应用自动重启为 0.9.2，中间不需要任何二次确认；替换较慢时可能出现 Sparkle 的安装进度（重启期间按上一节的方式观察）。
-3. 重启后：版本显示 0.9.2；哨兵文件、`settings.json`、临时游戏目录与插件不变；点“检查更新”显示“已是最新版本”。
-4. 菜单“蜂简 → 检查客户端更新…”同样只探测。
+1. 启动旧版。约 5 秒后侧栏应显示“发现新版本 v0.9.2”，并自动弹出更新说明：标题“蜂简 v0.9.2 可用”，显示当前版本 v0.9.1，说明内容与夹具文件一致，`<b>`、`<script>` 原样显示为文字，默认焦点在“稍后”。feed 服务器日志只出现 `appcast.xml`，**不出现 zip 请求**（只探测不下载）。
+2. 说明打开时用菜单“窗口 → 重新载入”：界面重新载入后不再自动弹出（说明一显示就已记为提醒过）。点“稍后”：不出现 zip 请求，侧栏仍可“下载并更新”。点菜单“蜂简 → 检查客户端更新…”再次探测到同一版本时**不再自动弹出**；侧栏“更新说明”可以重新打开同一份说明。
+3. 在说明中或侧栏点击“下载并更新”（一次）。依次出现下载百分比、“正在校验并解压…”、“正在安装并重新启动…”，应用自动重启为 0.9.2，中间不需要任何二次确认；替换较慢时可能出现 Sparkle 的安装进度（重启期间按上一节的方式观察）。
+4. 重启后：版本显示 0.9.2；哨兵文件、`settings.json`、临时游戏目录与插件不变；点“检查更新”显示“已是最新版本”。
+5. 菜单“蜂简 → 检查客户端更新…”同样只探测。
+6. 无说明：重新准备旧版，把 feed 指向 `feed/no-notes` 后启动，弹窗中应显示“此版本未提供更新说明。”，其余流程相同。
+7. 互斥：在旧版中先打开一个确认框（例如“解除绑定”）再触发检查，说明应等确认框关闭后才弹出，不会叠在确认框上。
 
 ## 写操作保护
 
@@ -85,5 +91,7 @@ defaults delete app.beelite.addons.e2e                     # 仅当准备前没�
 如果准备前已经存在，就保留原样，只删除本次运行自己放入的哨兵文件和临时游戏目录。任何情况下都不要删除生产身份 `BeeLite` / `app.beelite.addons` 的数据。
 
 ## 无法在本机证明的情况
+
+点击“下载并更新”之后服务器上的版本又变成另一个构建时，原生不下载、改为展示新构建的说明——这需要在探测与点击之间切换到第三个版本的 feed，构建脚本没有生成这个用例，由单元测试与原生策略测试覆盖。
 
 macOS 13 实机、无管理员权限账户的系统授权框、受管设备（MDM）拦截、新版启动后业务异常的自动回滚（Sparkle 不提供）。

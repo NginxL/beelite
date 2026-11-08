@@ -91,7 +91,8 @@ export async function requestJson(url: string, body: unknown | undefined, opts: 
   let res: Response | null = null;
   try {
     res = await fetchChecked(fetchFn, url, init);
-    if (!res.ok) throw new UserError(`服务器错误（HTTP ${res.status}）`);
+    // 408 / 429 / 5xx 视为临时错误（只影响自动检查的重试间隔，提示文字不变）
+    if (!res.ok) throw new UserError(`服务器错误（HTTP ${res.status}）`, res.status === 408 || res.status === 429 || res.status >= 500 ? 'http-transient' : 'user');
     const declared = Number(res.headers.get('content-length') ?? '');
     if (Number.isFinite(declared) && declared > MAX_JSON_BYTES) throw new UserError('服务器响应过大');
     const chunks: Uint8Array[] = [];

@@ -123,16 +123,16 @@ export class NewBeeBoxProvider {
     return requestJson(API_BASE + path, body, { fetchFn: this.fetchFn, signal });
   }
 
-  async getConfig(force = false): Promise<RemoteConfig> {
+  async getConfig(force = false, signal?: AbortSignal): Promise<RemoteConfig> {
     if (!force && this.configCache && Date.now() - this.configCache.at < CONFIG_TTL_MS) return this.configCache.value;
-    const raw = await requestJson(CONFIG_URL, undefined, { fetchFn: this.fetchFn });
+    const raw = await requestJson(CONFIG_URL, undefined, { fetchFn: this.fetchFn, signal });
     const value = parseConfig(raw);
     this.configCache = { at: Date.now(), value };
     return value;
   }
 
-  async flavorVersions(flavorId: number): Promise<string[]> {
-    const cfg = await this.getConfig();
+  async flavorVersions(flavorId: number, signal?: AbortSignal): Promise<string[]> {
+    const cfg = await this.getConfig(false, signal);
     const f = cfg.flavors.find((x) => x.id === flavorId);
     if (!f || f.versions.length === 0) throw new UserError('远端配置中没有该游戏版本');
     return f.versions;
@@ -177,7 +177,7 @@ export class NewBeeBoxProvider {
 
   /** 查询指定 flavor 的最新正式文件（strategy=1）；服务端无对应文件时返回 code -4，不做跨版本回退 */
   async latest(modId: string, flavorId: number, signal?: AbortSignal): Promise<LatestFile> {
-    const versions = await this.flavorVersions(flavorId);
+    const versions = await this.flavorVersions(flavorId, signal);
     const data = unwrap(
       await this.post('/v3/mod_file/mod_file_latest', { mod_id: Number(idString(modId)), game_version_id: flavorId, strategy: 1, type: 3 }, signal),
     );

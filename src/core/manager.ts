@@ -1,8 +1,9 @@
 // 插件管理：安装 / 更新 / 重装、卸载、恢复、启动恢复。所有写操作按目录串行，并通过 journal 事务保护。
+import { createHash } from 'node:crypto';
 import { mkdir, readdir, rename, rm, rmdir, unlink } from 'node:fs/promises';
 import path from 'node:path';
 import type { DirState, LocalFolder, LocalState, ManagedProjectView, OpResult, ProfileInfo, RecoveryEntryView, TaskPhase, TocInfo, UpdateCheckItem } from '../shared/types';
-import { SimulatedCrash, UserError, errorMessage } from './errors';
+import { SimulatedCrash, UserError, errorMessage, isTransientError } from './errors';
 import { getFlavor } from './flavors';
 import { inspectLayout, newTxId, pathExists, readFileNoFollow, syncDir, writableLayout, writeFileAtomic, type Layout } from './layout';
 import { downloadToFile, type DownloadOptions, type DownloadResult } from './net';
@@ -501,8 +502,20 @@ export class AddonManager {
 
   /** 检查 root 中托管插件的更新；flavorId 是该目录当前绑定的游戏版本，来源版本不同的项目不查询、不视为可更新 */
   async checkUpdates(root: string, flavorId: number, signal?: AbortSignal): Promise<UpdateCheckItem[]> {
+    return (await this.checkUpdatesDetailed(root, flavorId, signal)).items;
+  }
+
+  /**
+   * 同 checkUpdates，另外返回检查所依据的清单指纹。只读：不创建目录、不恢复事务、不写任何文件。
+   * signal 中止后不再发起剩余项目的查询，并以中止错误结束（不会返回不完整的结果）。
+   */
+  async checkUpdatesDetailed(root: string, flavorId: number, signal?: AbortSignal): Promise<{ items: UpdateCheckItem[]; fingerprint: string }> {
+    signal?.throwIfAborted();
     const info = await inspectLayout(root, false);
-    if (!info.hasMeta) return [];
+    if (!info.hasMeta) {
+      signal?.throwIfAborted();
+      return { items: [], fingerprint: manifestFingerprint(emptyManifest()) };
+    }
     const { manifest } = await readManifest(info.l);
     const out: UpdateCheckItem[] = [];
     const projects: ProjectRecord[] = [];
@@ -510,23 +523,33 @@ export class AddonManager {
       if (p.flavorId === flavorId) projects.push(p);
       else {
         const from = getFlavor(p.flavorId)?.name ?? String(p.flavorId);
-        out.push({ modId: p.modId, hasUpdate: false, latestFileId: null, latestVersion: null, error: null, skipped: `按「${from}」版本安装，与当前游戏版本不同，不检查更新` });
+        out.push({ modId: p.modId, hasUpdate: false, latestFileId: null, latestVersion: null, error: null, skipped: `按「${from}」版本安装，与当前游戏版本不同，不检查更新`, installedFileId: p.fileId, name: p.name });
       }
     }
     let next = 0;
     const worker = async () => {
-      while (next < projects.length) {
+      while (next < projects.length && !signal?.aborted) {
         const p = projects[next++];
+        const base = { modId: p.modId, installedFileId: p.fileId, name: p.name };
         try {
           const latest = await this.opts.source.latest(p.modId, p.flavorId, signal);
-          out.push({ modId: p.modId, hasUpdate: latest.compatible && latest.fileId !== p.fileId, latestFileId: latest.fileId, latestVersion: latest.displayName, error: latest.compatible ? null : '最新文件不支持当前游戏版本' });
+          out.push({ ...base, hasUpdate: latest.compatible && latest.fileId !== p.fileId, latestFileId: latest.fileId, latestVersion: latest.displayName, error: latest.compatible ? null : '最新文件不支持当前游戏版本' });
         } catch (err) {
-          out.push({ modId: p.modId, hasUpdate: false, latestFileId: null, latestVersion: null, error: errorMessage(err) });
+          if (signal?.aborted) break;
+          out.push({ ...base, hasUpdate: false, latestFileId: null, latestVersion: null, error: errorMessage(err), transient: isTransientError(err) });
         }
       }
     };
     await Promise.all([worker(), worker(), worker()]);
-    return out;
+    signal?.throwIfAborted();
+    return { items: out, fingerprint: manifestFingerprint(manifest) };
+  }
+
+  /** 当前清单（只读），与 checkUpdatesDetailed 的判定一致：蜂简数据目录不完整时视为空清单 */
+  async readCheckedManifest(root: string): Promise<{ manifest: Manifest; fingerprint: string }> {
+    const info = await inspectLayout(root, false);
+    const manifest = info.hasMeta ? (await readManifest(info.l)).manifest : emptyManifest();
+    return { manifest, fingerprint: manifestFingerprint(manifest) };
   }
 
   /** 读取 manifest（只读） */
@@ -535,6 +558,17 @@ export class AddonManager {
     if (!(await pathExists(info.l.metaDir))) return emptyManifest();
     return (await readManifest(info.l)).manifest;
   }
+}
+
+/**
+ * 清单指纹：最后提交的事务编号与所有托管项目（编号、来源版本、文件编号、目录）。
+ * 任何安装、更新、卸载、恢复都会提交新事务；同一文件编号的重装也会改变事务编号。待删除队列的清理不影响指纹。
+ */
+export function manifestFingerprint(m: Manifest): string {
+  const projects = Object.values(m.projects)
+    .map((p) => [p.modId, p.flavorId, p.fileId, [...p.folders].sort()])
+    .sort((a, b) => String(a[0]).localeCompare(String(b[0])));
+  return createHash('sha256').update(JSON.stringify([m.lastTxId, projects])).digest('hex').slice(0, 32);
 }
 
 export { SimulatedCrash };

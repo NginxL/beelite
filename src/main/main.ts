@@ -1,5 +1,5 @@
 // 蜂简 BeeLite 主进程：窗口、本地页面协议、安全策略、启动恢复与客户端更新。
-import { app, BrowserWindow, Menu, protocol, session, type WebContents } from 'electron';
+import { app, BrowserWindow, Menu, powerMonitor, protocol, session, type WebContents } from 'electron';
 import { readFile } from 'node:fs/promises';
 import path from 'node:path';
 import { ClientUpdater } from '../core/client-update';
@@ -161,6 +161,8 @@ async function start(): Promise<void> {
   const settings = new SettingsStore(path.join(app.getPath('userData'), 'settings.json'));
   const service = new AppService({ getWindow: () => mainWindow, settings, provider: new NewBeeBoxProvider(), gate });
   service.register();
+  // 退出时停止插件更新检查：中止进行中的请求，迟到的结果不发布
+  app.on('before-quit', () => service.watch.stop());
 
   // 测试绑定与启动恢复（残留的未完成事务）也计入写操作；全部完成后才启用客户端更新。
   // 设置无法读取时跳过恢复但不中断启动，窗口与客户端更新照常可用
@@ -171,6 +173,10 @@ async function start(): Promise<void> {
     prepare: () => applyTestBindings(settings),
     warn: (...args) => console.warn(...args),
   });
+
+  // 启动恢复完成后开始插件更新检查（只读）：立即一次，之后每小时；系统唤醒后按墙钟复核是否到期
+  service.watch.start();
+  powerMonitor.on('resume', () => service.watch.poke());
 
   const loaded = loadSparkleBridge();
   clientUpdater = new ClientUpdater({

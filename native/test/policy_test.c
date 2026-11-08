@@ -31,6 +31,19 @@ int main(void) {
   for (int a = 0; a <= 1; a++)
     for (int i = 0; i <= 1; i++) EXPECT(bl_update_found_action(a, i, BL_STAGE_INSTALLING) != BL_REPLY_INSTALL, "Installing 阶段不得立即 Install");
 
+  // 授权只对用户确认的构建有效：服务器给出另一个构建时不下载、不持有，未下载/已下载只 Dismiss（不跳过版本）
+  EXPECT(bl_authorized_for(true, true) == true, "授权且构建一致才算授权");
+  EXPECT(bl_authorized_for(true, false) == false, "授权但构建不同不算授权");
+  EXPECT(bl_authorized_for(false, true) == false, "未授权");
+  EXPECT(bl_update_found_action(bl_authorized_for(true, false), false, BL_STAGE_NOT_DOWNLOADED) == BL_REPLY_DISMISS, "构建不同+未下载应 Dismiss，不下载");
+  EXPECT(bl_update_found_action(bl_authorized_for(true, false), false, BL_STAGE_DOWNLOADED) == BL_REPLY_DISMISS, "构建不同+已下载应 Dismiss，不安装");
+  EXPECT(bl_update_found_action(bl_authorized_for(true, false), false, BL_STAGE_INSTALLING) == BL_REPLY_SKIP, "构建不同+Installing 应取消安装");
+  for (int s = 0; s <= 2; s++) {
+    bl_action a = bl_update_found_action(bl_authorized_for(true, false), false, (bl_stage)s);
+    EXPECT(a != BL_REPLY_INSTALL && a != BL_HOLD, "构建不同时任何阶段都不得 Install 或持有回复");
+  }
+  EXPECT(bl_update_found_action(bl_authorized_for(true, true), false, BL_STAGE_NOT_DOWNLOADED) == BL_REPLY_INSTALL, "构建一致+未下载应 Install");
+
   // 准备安装：授权持有；未授权 Skip
   EXPECT(bl_ready_action(true) == BL_HOLD, "授权的准备安装应持有");
   EXPECT(bl_ready_action(false) == BL_REPLY_SKIP, "未授权的准备安装应 Skip");

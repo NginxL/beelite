@@ -1,6 +1,6 @@
 // 全局状态：当前 flavor、本地状态、更新检查结果、进行中的写操作。各页面通过 on() 订阅变化。
 
-import type { AppConfig, BeeLiteApi, FlavorInfo, LocalState, ManagedProjectView, OpResult, UpdateCheckItem } from '../shared/types';
+import type { AddonWatchEntry, AddonWatchSnapshot, AppConfig, BeeLiteApi, FlavorInfo, LocalState, ManagedProjectView, OpResult, UpdateCheckItem } from '../shared/types';
 import { confirmDialog, toast } from './dom.js';
 import { errMsg } from './format.js';
 
@@ -12,7 +12,8 @@ declare global {
 
 export const api = (): BeeLiteApi => window.beelite;
 
-type EventName = 'flavor' | 'local';
+/** flavor：切换版本；local：本地状态或按钮状态变化；watch：主进程插件更新检查快照变化 */
+type EventName = 'flavor' | 'local' | 'watch';
 const listeners = new Map<EventName, Set<() => void>>();
 
 export function on(ev: EventName, fn: () => void): void {
@@ -37,9 +38,13 @@ export const state = {
   local: null as LocalState | null,
   localLoading: false,
   localError: null as string | null,
-  /** 当前 flavor 的更新检查结果，按 modId */
+  /** 当前目标（版本 + 目录）的更新检查结果，按 modId；只在 updatesFor 与当前目标一致时有效 */
   updates: new Map<string, UpdateCheckItem>(),
   updatesChecked: false,
+  /** updates 所属的目标 */
+  updatesFor: null as Target | null,
+  /** 主进程插件更新检查快照（所有已绑定目录） */
+  watch: null as AddonWatchSnapshot | null,
   /** 进行中的操作键，用于禁用按钮防止重复点击 */
   busy: new Set<string>(),
 };
@@ -99,14 +104,80 @@ export function isOtherFlavor(p: ManagedProjectView): boolean {
   return p.flavorId !== (state.local?.flavorId ?? state.flavorId);
 }
 
+const sameTarget = (a: Target | null, b: Target | null): boolean => !!a && !!b && a.flavorId === b.flavorId && a.root === b.root;
+
+/**
+ * 某个本地项目的检查结果：结果必须属于当前目标（版本 + 目录），且检查时的本地文件编号与现在相同；
+ * 否则（换绑目录、更新/重装/卸载后恢复等）视为没有检查结果，不能沿用其他目录或旧文件的结论。
+ */
+export function updateFor(p: ManagedProjectView): UpdateCheckItem | undefined {
+  if (!sameTarget(state.updatesFor, currentTarget())) return undefined;
+  const u = state.updates.get(p.modId);
+  return u && u.installedFileId === p.fileId ? u : undefined;
+}
+
 /** 有更新：检查结果说有更新，且本地文件还不是最新文件（更新完成后自动失效） */
 export function projectHasUpdate(p: ManagedProjectView): boolean {
-  const u = state.updates.get(p.modId);
+  const u = updateFor(p);
   return !!u && u.hasUpdate && u.latestFileId !== p.fileId;
 }
 
 export function updateCount(): number {
   return (state.local?.managed ?? []).filter(projectHasUpdate).length;
+}
+
+/** 当前目标在快照中的条目 */
+export function currentWatchEntry(): AddonWatchEntry | undefined {
+  const t = currentTarget();
+  if (!t) return undefined;
+  return state.watch?.entries.find((e) => e.flavorId === t.flavorId && e.root === t.root);
+}
+
+/**
+ * 各游戏版本可更新的插件数：当前显示的目标用本地状态逐项核对；其他已绑定目录用主进程按其清单核对过的数量。
+ * 只统计与当前绑定一致的目录（快照只包含已绑定目录）。
+ */
+export function pendingByFlavor(): Map<number, number> {
+  const out = new Map<number, number>();
+  const t = currentTarget();
+  for (const e of state.watch?.entries ?? []) {
+    if (t && e.flavorId === t.flavorId) continue;
+    if (e.flavorId === state.flavorId) continue; // 当前版本的本地状态尚未就绪时不显示可能过时的数量
+    if (e.pending > 0) out.set(e.flavorId, e.pending);
+  }
+  const n = updateCount();
+  if (t && n > 0) out.set(t.flavorId, n);
+  return out;
+}
+
+/**
+ * 检查结果完全取自主进程的权威快照中当前目标（版本 + 目录）的条目，绝不套用其他目录的结果。
+ * 快照中没有该目录、尚未完成检查（例如绑定刚变更、结果已作废）或整个目录检查失败时，清空界面上的结果。
+ */
+export function syncUpdatesFromWatch(): void {
+  const t = currentTarget();
+  state.updatesFor = t;
+  const e = currentWatchEntry();
+  if (!t || !e || e.checkedAt === null) {
+    state.updates = new Map();
+    state.updatesChecked = false;
+    return;
+  }
+  state.updates = new Map(e.items.map((i) => [i.modId, i]));
+  state.updatesChecked = e.status !== 'error';
+}
+
+/**
+ * 收到主进程快照（事件、启动时主动获取或手动检查的回复）：同一次运行内只按 rev 判断新旧，丢弃过时的快照；
+ * 检查时间只用于显示，不参与比较（系统时钟回拨不影响）。
+ */
+export function applyWatch(s: AddonWatchSnapshot): boolean {
+  if (state.watch && s.instance === state.watch.instance && s.rev <= state.watch.rev) return false;
+  state.watch = s;
+  syncUpdatesFromWatch();
+  emit('watch');
+  emit('local');
+  return true;
 }
 
 export function isBusy(key: string): boolean {
@@ -127,6 +198,8 @@ export async function refreshLocal(): Promise<void> {
     if (seq !== localSeq) return;
     state.local = r;
     state.localError = null;
+    // 目录可能已在别处换绑：只刷新也要丢弃属于旧目录的检查结果
+    syncUpdatesFromWatch();
   } catch (err) {
     if (seq !== localSeq) return;
     state.localError = errMsg(err);
@@ -147,6 +220,7 @@ export function setFlavor(id: number): void {
   state.localError = null;
   state.updates = new Map();
   state.updatesChecked = false;
+  state.updatesFor = null;
   emit('flavor');
   void refreshLocal();
 }
@@ -199,6 +273,7 @@ export async function unbindDirectory(): Promise<void> {
     if (fid === state.flavorId) {
       state.updates = new Map();
       state.updatesChecked = false;
+      state.updatesFor = null;
       await refreshLocal();
     } else emit('local');
   }
@@ -245,12 +320,12 @@ export async function checkUpdates(silent = false): Promise<void> {
   state.busy.add('check');
   emit('local');
   try {
-    const items = await api().checkUpdates(t.flavorId, t.root);
-    // 结果只属于发起时的版本与目录
+    // 回复是主进程的权威快照：按 rev 合并（晚到的回复不会覆盖更新的快照），界面结果只来自快照
+    applyWatch(await api().checkUpdates(t.flavorId, t.root));
+    // 提示只针对发起时的版本与目录
     const now = currentTarget();
     if (seq !== updateSeq || !now || now.flavorId !== t.flavorId || now.root !== t.root) return;
-    state.updates = new Map(items.map((i) => [i.modId, i]));
-    state.updatesChecked = true;
+    const items = currentWatchEntry()?.items ?? [];
     if (!silent) {
       const n = updateCount();
       const checked = items.filter((i) => !i.skipped);
