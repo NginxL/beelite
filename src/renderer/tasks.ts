@@ -30,6 +30,8 @@ export function handleTask(e: TaskEvent): void {
   const panel = byId('task-panel');
   let v = views.get(e.taskId);
   if (!v) {
+    // 排队中的任务（例如全部更新中尚未开始的项目）不占卡片，开始处理时才出现；从未开始就结束的也不新建卡片
+    if (e.phase === 'queued' || FINAL.includes(e.phase)) return;
     v = { el: h('div', { class: 'task' }), timer: 0, cancelling: false };
     views.set(e.taskId, v);
     panel.appendChild(v.el);

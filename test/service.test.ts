@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import { mkdir, readdir, readFile, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { runUpdateAll } from '../src/core/batch';
+import { UserError } from '../src/core/errors';
 import { inspectPickedRoot, SettingsStore } from '../src/core/profiles';
 import { cleanupRunDir, createRunDir } from '../scripts/smoke-dir';
 import { addonEntries, cleanup, exists, FakeSource, makeGameRoot, makeManager, makeZip, tmpDir } from './helpers';
@@ -45,6 +46,33 @@ test('全部更新：用户取消的项目不计为成功', async () => {
   assert.equal(r.ok, false);
   assert.match(r.message, /已更新 0 个插件/);
   assert.match(r.message, /取消 2 个/);
+  await cleanup(base);
+});
+
+test('全部更新：计划在第一项开始之前给出一次；任务中被取消的项目计为取消而不是失败，并继续处理下一项', async () => {
+  const base = await tmpDir();
+  const root = await makeGameRoot(base);
+  const src = new FakeSource();
+  const m = await twoOutdated(root, src);
+  const log: string[] = [];
+  const r = await runUpdateAll({
+    manager: m,
+    root,
+    flavorId: F,
+    isStillBound: async () => true,
+    plan: (ps) => log.push(`plan:${ps.map((p) => p.modId).join(',')}`),
+    installOne: async (p, r0) => {
+      log.push(`install:${p.modId}`);
+      if (log.length === 2) throw new UserError('已取消', 'cancelled');
+      return m.install(r0, p.flavorId, p.modId);
+    },
+  });
+  assert.equal(log.length, 3);
+  assert.match(log[0], /^plan:(1,2|2,1)$/);
+  assert.deepEqual(log.slice(1), log[0].slice(5).split(',').map((id) => `install:${id}`), '按计划顺序处理');
+  assert.equal(r.ok, false);
+  assert.match(r.message, /已更新 1 个插件，取消 1 个/);
+  assert.doesNotMatch(r.message, /失败/);
   await cleanup(base);
 });
 

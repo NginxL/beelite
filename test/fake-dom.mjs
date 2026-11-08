@@ -100,6 +100,10 @@ export class FakeElement extends FakeNode {
   all() {
     return [this, ...this.childNodes.filter((c) => c instanceof FakeElement).flatMap((c) => c.all())];
   }
+  /** 只支持 “.类名” 选择器 */
+  querySelector(sel) {
+    return this.all().find((e) => e !== this && e.classList.contains(sel.slice(1))) ?? null;
+  }
 }
 
 /** 安装全局 document / window；返回固定的根元素 */

@@ -23,10 +23,20 @@ interface Stub {
   exposed: BeeLiteApi | null;
   /** 主进程推送给窗口的事件（通道与内容） */
   sent: { channel: string; payload: unknown }[];
+  /** preload 经 ipcRenderer.on 订阅的事件 */
+  listeners: Map<string, Set<(e: unknown, payload: unknown) => void>>;
 }
 
-const stub: Stub = { handlers: new Map(), messageBoxResponse: 0, messageBoxes: [], openDialogs: 0, pick: null, exposed: null, sent: [] };
-const webContents = { send: (channel: string, payload: unknown) => void stub.sent.push({ channel, payload }) };
+const stub: Stub = { handlers: new Map(), messageBoxResponse: 0, messageBoxes: [], openDialogs: 0, pick: null, exposed: null, sent: [], listeners: new Map() };
+const webContents = {
+  // 与 Electron 一致：按发送顺序异步送达界面的订阅者（早于随后才完成的 invoke 回复），不在主进程的调用栈中同步执行界面代码
+  send: (channel: string, payload: unknown) => {
+    stub.sent.push({ channel, payload });
+    queueMicrotask(() => {
+      for (const fn of stub.listeners.get(channel) ?? []) fn({}, payload);
+    });
+  },
+};
 const senderEvent = { sender: webContents, senderFrame: { url: 'app://beelite/index.html' } };
 
 /** 所有经过 IPC 的调用（通道与参数），用来断言渲染层实际发送的目标 */
@@ -54,7 +64,15 @@ const fakeElectron = {
     },
   },
   contextBridge: { exposeInMainWorld: (_name: string, api: BeeLiteApi) => void (stub.exposed = api) },
-  ipcRenderer: { invoke, on: () => undefined, removeListener: () => undefined },
+  ipcRenderer: {
+    invoke,
+    on: (channel: string, fn: (e: unknown, payload: unknown) => void) => {
+      let set = stub.listeners.get(channel);
+      if (!set) stub.listeners.set(channel, (set = new Set()));
+      set.add(fn);
+    },
+    removeListener: (channel: string, fn: (e: unknown, payload: unknown) => void) => void stub.listeners.get(channel)?.delete(fn),
+  },
 };
 
 /** 让后续 require('electron') 得到假模块（必须在加载 ipc / preload 之前调用） */
@@ -81,6 +99,7 @@ export function createHarness(opts: { settingsFile: string; source: FakeSource; 
   stub.openDialogs = 0;
   stub.pick = null;
   stub.sent = [];
+  stub.listeners = new Map();
   ipcCalls.length = 0;
   // eslint-disable-next-line @typescript-eslint/no-require-imports
   const { AppService } = require('../src/main/ipc') as typeof import('../src/main/ipc');

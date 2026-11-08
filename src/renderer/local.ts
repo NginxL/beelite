@@ -1,12 +1,13 @@
 // 我的插件页：已托管 / 未托管 / 回收站
 
-import type { LocalFolder, LocalState, ManagedProjectView, RecoveryEntryView } from '../shared/types';
-import { modKey, updateProject } from './actions.js';
+import type { LocalFolder, LocalState, ManagedProjectView, RecoveryEntryView, TaskPhase } from '../shared/types';
+import { BATCH_REASON, updateProject } from './actions.js';
 import { confirmDialog, h, modIcon, mount, spinner } from './dom.js';
 import { cleanTocText, formatDateTime } from './format.js';
 import {
-  api, bindDirectory, checkUpdates, currentFlavor, currentWatchEntry, flavorName, isBlocked, isBusy, isOtherFlavor,
-  on, projectHasUpdate, refreshLocal, requireTarget, runWrite, state, stillTarget, updateCount, updateFor,
+  anyModBusy, api, batchHoldText, bindDirectory, checkUpdates, clearTaskNotes, currentFlavor, currentTarget, currentWatchEntry, flavorName, isBlocked, isBusy, isFinalPhase,
+  isOtherFlavor, modBusy, modKey, on, projectHasUpdate, refreshLocal, requireTarget, rowTask, runWrite, state, stillTarget, targetKey,
+  updateAllKey, updateCount, updateFor, updatingAll, type RowTask,
 } from './state.js';
 
 type Tab = 'managed' | 'unmanaged' | 'recovery';
@@ -21,6 +22,43 @@ let tab: Tab = 'managed';
 let filter = '';
 /** 展开了目录列表的项目，重绘时保持展开 */
 const openFolders = new Set<string>();
+/** 当前显示的进行中任务的状态文字（名称旁的标签与操作按钮中的文字，按插件编号），下载百分比变化时就地更新 */
+const progressEls = new Map<string, HTMLElement[]>();
+
+function trackProgress(modId: string, el: HTMLElement): HTMLElement {
+  const list = progressEls.get(modId);
+  if (list) list.push(el);
+  else progressEls.set(modId, [el]);
+  return el;
+}
+
+/** 占据“更新”按钮位置的不可点击状态按钮（中性样式）；modId 给出时文字随任务进度就地更新 */
+function busyButton(text: string, title: string, modId?: string): HTMLButtonElement {
+  const label = h('span', { text });
+  if (modId) trackProgress(modId, label);
+  return h('button', { class: 'btn btn-sm btn-busy', disabled: true, title }, spinner(true), label);
+}
+/** 全部更新进行中时保持开始时的行顺序，完成的项目不在列表中跳动；结束后恢复正常排序 */
+let frozenOrder: { key: string; pos: Map<string, number> } | null = null;
+
+const ROW_PHASE_TEXT: Partial<Record<TaskPhase, string>> = {
+  queued: '等待中',
+  checking: '准备中',
+  downloading: '下载中',
+  verifying: '校验中',
+  installing: '安装中',
+};
+
+function taskText(r: RowTask): string {
+  const text = ROW_PHASE_TEXT[r.phase] ?? '处理中';
+  return r.phase === 'downloading' && r.percent !== null ? `${text} ${r.percent}%` : text;
+}
+
+/** 失败或取消的说明：版本保持不变 */
+function taskNote(r: RowTask): string {
+  if (r.phase === 'failed') return `未完成：${r.message ?? '操作失败'}`;
+  return r.message ?? '已取消';
+}
 
 let toolbarEl!: HTMLElement;
 let bodyEl!: HTMLElement;
@@ -39,6 +77,14 @@ export function initLocal(root: HTMLElement): void {
   mount(root, toolbarEl, bodyEl);
 
   on('local', render);
+  on('progress', () => {
+    for (const [modId, els] of progressEls) {
+      const r = rowTask(modId);
+      if (!r || isFinalPhase(r.phase)) continue;
+      const text = taskText(r);
+      for (const el of els) if (el.textContent !== text) el.textContent = text;
+    }
+  });
   on('flavor', () => {
     filter = '';
     filterInput.value = '';
@@ -58,7 +104,8 @@ function renderToolbar(): void {
   const blocked = isBlocked();
   const n = updateCount();
   const checking = isBusy('check');
-  const updatingAll = isBusy('updateAll');
+  const batch = updatingAll();
+  const modsBusy = anyModBusy();
 
   const info = checkInfo();
   mount(toolbarEl,
@@ -75,10 +122,10 @@ function renderToolbar(): void {
       }, checking ? [spinner(true), '检查中'] : '检查更新'),
       h('button', {
         class: 'btn btn-primary',
-        disabled: !hasRoot || blocked || n === 0 || updatingAll,
-        title: blocked ? '游戏目录当前不可写入' : '',
+        disabled: !hasRoot || blocked || n === 0 || batch || modsBusy,
+        title: blocked ? '游戏目录当前不可写入' : modsBusy && !batch ? '有插件正在处理，完成后再全部更新' : '',
         on: { click: () => void doUpdateAll() },
-      }, updatingAll ? [spinner(true), '更新中'] : `全部更新 (${n})`),
+      }, batch ? [spinner(true), '更新中'] : `全部更新 (${n})`),
       h('button', {
         class: 'btn',
         disabled: state.localLoading,
@@ -112,8 +159,15 @@ export function showManagedTab(): void {
 
 export async function doUpdateAll(): Promise<void> {
   const t = requireTarget();
-  if (!t) return;
-  await runWrite('updateAll', () => api().updateAll(t.flavorId, t.root));
+  // 同一目标已在全部更新，或有插件正在单独处理时不再发起
+  if (!t || updatingAll(t) || anyModBusy()) return;
+  clearTaskNotes(t);
+  state.batchPlanned.delete(targetKey(t));
+  try {
+    await runWrite(updateAllKey(t), () => api().updateAll(t.flavorId, t.root));
+  } finally {
+    state.batchPlanned.delete(targetKey(t));
+  }
 }
 
 function renderBody(): void {
@@ -164,6 +218,7 @@ function renderBody(): void {
   ));
 
   let content: HTMLElement;
+  progressEls.clear();
   if (tab === 'managed') content = renderManaged(local);
   else if (tab === 'unmanaged') content = renderUnmanaged(local);
   else content = renderRecovery(local);
@@ -182,13 +237,25 @@ function renderManaged(local: LocalState): HTMLElement {
     return box;
   }
   const list = [...local.managed].sort((a, b) => Number(projectHasUpdate(b)) - Number(projectHasUpdate(a)) || a.name.localeCompare(b.name, 'zh'));
+  const t = currentTarget();
+  if (t && updatingAll(t)) {
+    if (frozenOrder?.key !== targetKey(t)) frozenOrder = { key: targetKey(t), pos: new Map(list.map((p, i) => [p.modId, i])) };
+    const pos = frozenOrder.pos;
+    // 批次开始后才出现的项目排在后面，彼此保持正常顺序
+    list.sort((a, b) => (pos.get(a.modId) ?? pos.size) - (pos.get(b.modId) ?? pos.size));
+  } else frozenOrder = null;
   mount(box, h('div', { class: 'row-list' }, list.map((p) => managedRow(p))));
   return box;
 }
 
 function managedRow(p: ManagedProjectView): HTMLElement {
   const blocked = isBlocked();
-  const busy = isBusy(modKey(p.modId));
+  const t = currentTarget();
+  const task = rowTask(p.modId);
+  const active = !!task && !isFinalPhase(task.phase);
+  const busy = modBusy(p.modId);
+  /** 已发起、还没有任务进度的单项操作（受理前、卸载等） */
+  const pending = !active && !!t && isBusy(modKey(t, p.modId));
   const hasUpdate = projectHasUpdate(p);
   const u = updateFor(p);
   const missing = p.folders.filter((f) => !f.present).length;
@@ -196,10 +263,15 @@ function managedRow(p: ManagedProjectView): HTMLElement {
   const otherTitle = `该插件按「${flavorName(p.flavorId)}」版本安装，与当前游戏版本不同：可以卸载（卸载后可恢复），但不会检查更新、更新或重装。如需改用当前版本，请先卸载再安装。`;
 
   let status: HTMLElement | null = null;
-  if (hasUpdate) status = h('span', { class: 'tag tag-accent', text: `可更新到 ${u?.latestVersion ?? '新版本'}`, title: u?.stale ? (u.error ?? '') : '' });
+  if (active) {
+    status = trackProgress(p.modId, h('span', { class: 'tag tag-accent tag-task', text: taskText(task) }));
+  } else if (hasUpdate) status = h('span', { class: 'tag tag-accent', text: `可更新到 ${u?.latestVersion ?? '新版本'}`, title: u?.stale ? (u.error ?? '') : '' });
   else if (u?.skipped) status = h('span', { class: 'tag tag-muted', text: '不检查更新', title: u.skipped });
   else if (u?.error) status = h('span', { class: 'small-error', text: u.error, title: u.error });
   else if (state.updatesChecked && u) status = h('span', { class: 'tag tag-muted', text: '已是最新' });
+  const note = task && !active
+    ? h('span', { class: task.phase === 'failed' ? 'small-error' : 'tag tag-muted', text: taskNote(task), title: task.message ?? '' })
+    : null;
 
   const folders = h('details', { class: 'folders', open: openFolders.has(p.modId) },
     h('summary', null, `${p.folders.length} 个目录`, missing > 0 ? h('span', { class: 'tag tag-danger', text: `缺失 ${missing}` }) : null),
@@ -213,7 +285,17 @@ function managedRow(p: ManagedProjectView): HTMLElement {
     else openFolders.delete(p.modId);
   });
 
-  const disabledTitle = blocked ? '游戏目录当前不可写入' : '';
+  const disabledTitle = blocked ? '游戏目录当前不可写入' : busy && updatingAll() ? BATCH_REASON : '';
+  // “更新”按钮的位置：进行中的任务显示阶段与进度，已发起尚未开始的操作显示处理中，全部更新期间的其他可更新插件显示检查中 / 全部更新中
+  const hold = batchHoldText();
+  let updateBtn: HTMLElement | null = null;
+  if (active) updateBtn = busyButton(taskText(task), disabledTitle || '正在处理这个插件', p.modId);
+  else if (pending) updateBtn = busyButton('处理中', '正在处理这个插件');
+  else if (hasUpdate && !otherFlavor) {
+    updateBtn = hold
+      ? busyButton(hold, BATCH_REASON)
+      : h('button', { class: 'btn btn-sm btn-primary', disabled: blocked || busy, title: disabledTitle, on: { click: () => void updateProject(p, false) } }, '更新');
+  }
   return h('div', { class: 'row' },
     modIcon(p.logo, p.name, 'sm'),
     h('div', { class: 'row-main' },
@@ -221,6 +303,7 @@ function managedRow(p: ManagedProjectView): HTMLElement {
         h('span', { class: 'row-name', text: p.name }),
         h('span', { class: otherFlavor ? 'tag tag-warn' : 'tag', text: flavorName(p.flavorId), title: otherFlavor ? otherTitle : '' }),
         status,
+        note,
       ),
       h('div', { class: 'row-meta' },
         h('span', { text: `版本 ${p.version || '—'}` }),
@@ -229,11 +312,7 @@ function managedRow(p: ManagedProjectView): HTMLElement {
       folders,
     ),
     h('div', { class: 'row-actions' },
-      busy ? h('span', { class: 'busy-text' }, spinner(true), '处理中') : null,
-      hasUpdate && !otherFlavor ? h('button', {
-        class: 'btn btn-sm btn-primary', disabled: blocked || busy, title: disabledTitle,
-        on: { click: () => void updateProject(p, false) },
-      }, '更新') : null,
+      updateBtn,
       h('button', {
         class: 'btn btn-sm', disabled: blocked || busy || otherFlavor, title: disabledTitle || (otherFlavor ? otherTitle : '重新下载并安装最新文件'),
         on: { click: () => void updateProject(p, true) },
@@ -249,7 +328,7 @@ function managedRow(p: ManagedProjectView): HTMLElement {
 /** 卸载：作用于当前显示的目录（包括来源版本不同的插件）；确认前记录目标，确认后复核 */
 export async function uninstallProject(p: ManagedProjectView): Promise<void> {
   const t = requireTarget();
-  if (!t) return;
+  if (!t || modBusy(p.modId)) return;
   const present = p.folders.filter((f) => f.present).map((f) => f.name);
   const ok = await confirmDialog({
     title: `卸载「${p.name}」？`,
@@ -258,8 +337,8 @@ export async function uninstallProject(p: ManagedProjectView): Promise<void> {
     confirmText: '卸载',
     danger: true,
   });
-  if (!ok || !stillTarget(t)) return;
-  await runWrite(modKey(p.modId), () => api().uninstallProject(p.modId, t.flavorId, t.root));
+  if (!ok || !stillTarget(t) || modBusy(p.modId)) return;
+  await runWrite(modKey(t, p.modId), () => api().uninstallProject(p.modId, t.flavorId, t.root));
 }
 
 // ---------- 未托管 ----------

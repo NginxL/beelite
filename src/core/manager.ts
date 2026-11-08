@@ -34,6 +34,9 @@ export interface ManagerOptions {
   hook?: StepHook;
 }
 
+/** 安装结果；installed 是本次提交到清单的记录，没有提交（已是最新、用户取消）时缺省 */
+export type InstallResult = OpResult & { installed?: ProjectRecord };
+
 export interface InstallOptions {
   force?: boolean;
   signal?: AbortSignal;
@@ -270,7 +273,7 @@ export class AddonManager {
 
   // ---------- 安装 / 更新 ----------
 
-  async install(root: string, flavorId: number, modId: string, o: InstallOptions = {}): Promise<OpResult> {
+  async install(root: string, flavorId: number, modId: string, o: InstallOptions = {}): Promise<InstallResult> {
     const phase = o.onPhase ?? (() => undefined);
     phase('checking');
     // 免费与可访问性复核、按 flavor 取最新文件（服务端没有该版本文件时会直接报错，不做回退）
@@ -388,6 +391,7 @@ export class AddonManager {
               ? `「${detail.name}」${latest.displayName} 已重新安装`
               : `「${detail.name}」已更新到 ${latest.displayName}`,
           warnings,
+          installed: { ...next.projects[modId], folders: [...zip.modules] },
         };
       } catch (err) {
         // 没有残留 journal 说明没有进入或已完整回滚提交阶段：只清理本次下载的暂存内容与空的回收目录。

@@ -8,7 +8,7 @@ import { byId, h, mount, spinner, toast } from './dom.js';
 import { errMsg } from './format.js';
 import { initLocal, showManagedTab } from './local.js';
 import { handleTask } from './tasks.js';
-import { api, applyWatch, bindDirectory, flavorName, isBusy, on, pendingByFlavor, setFlavor, state, unbindDirectory } from './state.js';
+import { api, applyTask, applyWatch, bindDirectory, flavorName, isBusy, on, pendingByFlavor, setFlavor, state, unbindDirectory } from './state.js';
 
 type Page = 'discover' | 'local';
 
@@ -173,7 +173,11 @@ function boot(): void {
     ));
     return;
   }
-  window.beelite.onTask(handleTask);
+  // 任务事件同时更新对应插件行（按目标 + 插件编号）与右下角任务面板
+  window.beelite.onTask((e) => {
+    applyTask(e);
+    handleTask(e);
+  });
   // 插件更新检查在主进程进行，可能早于界面完成：先订阅事件再获取快照，按 rev 丢弃过时的一方
   window.beelite.onAddonWatch(onWatch);
   void window.beelite.watchState().then(onWatch, () => undefined);

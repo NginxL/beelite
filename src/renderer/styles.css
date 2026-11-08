@@ -158,6 +158,9 @@ select:focus { border-color: var(--accent); }
 .btn-primary:hover:not(:disabled) { background: var(--accent-hover); border-color: var(--accent-hover); }
 .btn-danger { background: var(--danger); border-color: var(--danger); color: #fff; font-weight: 600; }
 .btn-danger:hover:not(:disabled) { background: #f26b68; border-color: #f26b68; }
+/* 占据操作按钮位置的处理中状态：中性样式，进度数字等宽 */
+.btn-busy { min-width: 104px; font-variant-numeric: tabular-nums; }
+.btn-busy:disabled { opacity: .8; cursor: default; color: var(--muted); }
 .btn-ghost-danger { background: transparent; color: #f08482; }
 .btn-ghost-danger:hover:not(:disabled) { background: var(--danger-soft); border-color: rgba(239, 83, 80, .4); }
 .btn-text { background: transparent; border-color: transparent; color: var(--muted); }
@@ -278,6 +281,8 @@ select:focus { border-color: var(--accent); }
 .tag-warn { background: rgba(229, 165, 10, .14); color: #f3c34a; }
 .tag-danger { background: var(--danger-soft); color: #f08482; margin-left: 6px; }
 .tag-muted { background: #262a31; color: var(--muted); }
+/* 行内任务进度：数字等宽，百分比变化时标签宽度不跳动 */
+.tag-task { font-variant-numeric: tabular-nums; min-width: 72px; }
 .tag-row { display: flex; flex-wrap: wrap; gap: 6px; }
 
 /* ---------- 详情抽屉 ---------- */

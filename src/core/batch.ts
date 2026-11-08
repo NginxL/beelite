@@ -1,7 +1,7 @@
 // 全部更新：整个批次固定在开始时确定的目标根目录；每项开始前确认绑定未变化，变化即安全停止。
 // 结果如实汇总：检查失败、更新失败、用户取消、检查后发生变化都不计为成功。
 import type { OpResult, UpdateCheckItem } from '../shared/types';
-import { errorMessage } from './errors';
+import { errorMessage, UserError } from './errors';
 import type { AddonManager } from './manager';
 import type { ProjectRecord } from './store';
 
@@ -20,6 +20,8 @@ export interface UpdateAllOptions {
    * 应用中经由检查协调器排队，避免与自动检查叠加并发。批次已在写入闸门内，这里不能等待闸门归零。
    */
   check?: (root: string, flavorId: number) => Promise<UpdateCheckItem[]>;
+  /** 检查完成、确定要更新的项目后调用一次（按处理顺序），之后才开始第一项 */
+  plan?: (projects: ProjectRecord[]) => void;
 }
 
 export async function runUpdateAll(o: UpdateAllOptions): Promise<OpResult> {
@@ -55,6 +57,7 @@ export async function runUpdateAll(o: UpdateAllOptions): Promise<OpResult> {
   let cancelled = 0;
   const failed: string[] = [];
   let stopped = false;
+  o.plan?.(todo.map((c) => manifest.projects[c.modId]));
   for (const c of todo) {
     const p = manifest.projects[c.modId];
     if (!(await o.isStillBound())) {
@@ -66,7 +69,9 @@ export async function runUpdateAll(o: UpdateAllOptions): Promise<OpResult> {
       if (r.ok) updated++;
       else cancelled++;
     } catch (err) {
-      failed.push(`${p.name}：${errorMessage(err)}`);
+      // 用户在任务中取消的这一项计为取消，不计为失败；批次继续处理下一项
+      if (err instanceof UserError && err.code === 'cancelled') cancelled++;
+      else failed.push(`${p.name}：${errorMessage(err)}`);
     }
   }
 

@@ -187,13 +187,31 @@ export interface AddonWatchSnapshot {
 
 export type TaskPhase = 'queued' | 'checking' | 'downloading' | 'verifying' | 'installing' | 'done' | 'failed' | 'cancelled';
 
+/** 一次安装或更新提交到清单的记录（主进程在提交后给出，界面据此显示已安装的版本，不按远端最新文件推测） */
+export interface InstalledRecord {
+  flavorId: number;
+  fileId: string;
+  version: string;
+  name: string;
+  logo: string | null;
+  folders: string[];
+  installedAt: number;
+}
+
 export interface TaskEvent {
   taskId: string;
+  /** 只用于显示，不作为身份 */
   label: string;
   phase: TaskPhase;
+  /** 任务受理时确定的游戏版本、目录与插件编号：界面只按三者完全一致把任务关联到插件行 */
+  flavorId: number;
+  root: string;
+  modId: string;
   received?: number;
   total?: number;
   message?: string;
+  /** 只出现在 done 中，且仅当这次确实提交了新的清单记录（“已是最新”等未改动的情况没有） */
+  installed?: InstalledRecord;
 }
 
 export interface OpResult {

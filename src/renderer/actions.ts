@@ -3,18 +3,23 @@
 import type { ManagedProjectView } from '../shared/types';
 import { h, spinner } from './dom.js';
 import { toast } from './dom.js';
-import { api, ensureBound, findManaged, isBlocked, isBusy, isOtherFlavor, projectHasUpdate, requireTarget, runWrite, state } from './state.js';
+import {
+  api, batchHoldText, clearTaskNotes, currentTarget, ensureBound, findManaged, isBlocked, isBusy, isFinalPhase, isOtherFlavor, modBusy, modKey,
+  projectHasUpdate, requireTarget, rowTask, runWrite, state,
+} from './state.js';
 
-export const modKey = (modId: string): string => `mod:${modId}`;
+/** 全部更新进行中时插件写入口的说明 */
+export const BATCH_REASON = '正在全部更新，完成后可操作';
 
 export async function installMod(modId: string): Promise<void> {
   const fid = state.flavorId;
-  if (isBusy(modKey(modId))) return;
+  if (modBusy(modId)) return;
   if (!(await ensureBound())) return;
   if (fid !== state.flavorId) return; // 选目录期间切换了版本，放弃
   const t = requireTarget();
-  if (!t || t.flavorId !== fid) return;
-  await runWrite(modKey(modId), () => api().install(modId, t.flavorId, t.root));
+  if (!t || t.flavorId !== fid || modBusy(modId)) return;
+  clearTaskNotes(t, modId);
+  await runWrite(modKey(t, modId), () => api().install(modId, t.flavorId, t.root));
 }
 
 /** 更新或重装：目标是当前显示的版本与目录，而不是插件记录的来源版本；来源版本不同时拒绝（主进程同样拒绝） */
@@ -25,7 +30,9 @@ export async function updateProject(p: ManagedProjectView, force: boolean): Prom
     toast(`「${p.name}」按其他游戏版本安装，不能用当前版本的文件更新或重装。如需改用当前版本，请先卸载再安装。`, 'error');
     return;
   }
-  await runWrite(modKey(p.modId), () => api().update(p.modId, t.flavorId, force, t.root));
+  if (modBusy(p.modId)) return;
+  clearTaskNotes(t, p.modId);
+  await runWrite(modKey(t, p.modId), () => api().update(p.modId, t.flavorId, force, t.root));
 }
 
 /**
@@ -37,7 +44,9 @@ export function modActionButton(mod: { id: string; accessible: boolean }, block:
     e.stopPropagation();
     fn();
   };
-  if (isBusy(modKey(mod.id))) {
+  const t = currentTarget();
+  const task = rowTask(mod.id);
+  if ((t && isBusy(modKey(t, mod.id))) || (task && !isFinalPhase(task.phase))) {
     return h('button', { class: 'btn btn-sm', disabled: true }, spinner(true), '处理中');
   }
   const blocked = isBlocked() ? '游戏目录当前不可写入' : null;
@@ -47,6 +56,8 @@ export function modActionButton(mod: { id: string; accessible: boolean }, block:
   }
   if (p) {
     if (projectHasUpdate(p)) {
+      const hold = batchHoldText();
+      if (hold) return h('button', { class: 'btn btn-sm btn-busy', disabled: true, title: BATCH_REASON }, spinner(true), hold);
       const reason = blocked ?? block;
       return h('button', {
         class: 'btn btn-sm btn-primary',

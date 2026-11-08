@@ -2,20 +2,21 @@
 import { app, dialog, ipcMain, type BrowserWindow, type IpcMainInvokeEvent } from 'electron';
 import { stat } from 'node:fs/promises';
 import path from 'node:path';
-import type { AddonWatchSnapshot, AppConfig, ClientUpdateState, FlavorInfo, LocalState, OpResult, ProfileInfo, SearchQuery, SortOrder, TaskEvent, TaskPhase } from '../shared/types';
+import type { AddonWatchSnapshot, AppConfig, ClientUpdateState, FlavorInfo, InstalledRecord, LocalState, OpResult, ProfileInfo, SearchQuery, SortOrder, TaskEvent, TaskPhase } from '../shared/types';
 import { AddonUpdateWatch, type WatchClock } from '../core/addon-watch';
 import { errorMessage, UserError } from '../core/errors';
 import { DEFAULT_FLAVOR_ID, FLAVORS, getFlavor, interfaceFromVersion } from '../core/flavors';
 import { runUpdateAll } from '../core/batch';
 import { BUILD_RE, type ClientUpdater } from '../core/client-update';
 import { guardHandler, type MutationGate } from '../core/gate';
-import { AddonManager, type ManagerOptions } from '../core/manager';
+import { AddonManager, type InstallResult, type ManagerOptions } from '../core/manager';
 import { isValidModuleName } from '../core/paths';
 import { inspectPickedRoot, SettingsStore } from '../core/profiles';
 import { NewBeeBoxProvider } from '../core/provider';
-import { ID_RE } from '../core/store';
+import { ID_RE, type ProjectRecord } from '../core/store';
 
 const ORDERS: readonly SortOrder[] = ['ranking', 'update', 'total_download', 'favourite'];
+const FINAL_PHASES: ReadonlySet<TaskPhase> = new Set(['done', 'failed', 'cancelled']);
 const WOW_APP_DIR = '/Applications/World of Warcraft';
 
 export const APP_ORIGIN = 'app://beelite';
@@ -45,6 +46,9 @@ function expectedRootArg(v: unknown): string {
 function buildArg(v: unknown): string {
   if (typeof v !== 'string' || !BUILD_RE.test(v)) throw new UserError('版本参数无效');
   return v;
+}
+function installedView(p: ProjectRecord): InstalledRecord {
+  return { flavorId: p.flavorId, fileId: p.fileId, version: p.version, name: p.name, logo: p.logo, folders: [...p.folders], installedAt: p.installedAt };
 }
 function queryArg(v: unknown): SearchQuery {
   if (typeof v !== 'object' || v === null) throw new UserError('搜索参数无效');
@@ -206,42 +210,84 @@ export class AppService {
     return this.manager.localState({ ...profile, root: profile.root }, flavorId);
   }
 
-  /** 以任务形式执行安装/更新，向界面推送进度，可取消；root 在受理时已确定，之后即使换绑也只写入它 */
-  private async runInstall(modId: string, flavorId: number, force: boolean, root: string): Promise<OpResult> {
-    const taskId = `t${++this.taskSeq}`;
+  private newTaskId(): string {
+    return `t${++this.taskSeq}`;
+  }
+
+  /**
+   * 以任务形式执行安装/更新，向界面推送进度，可取消；root 在受理时已确定，之后即使换绑也只写入它。
+   * 每个任务只发一个终态，在安装返回（目录锁已释放）之后发送；done 带上本次提交到清单的记录。
+   * syncWatch：发终态之前先把这次写入同步到更新检查结果（只读清单，不扫描目录），全部更新据此在进入下一项之前完成同步；
+   * 单项操作由写通道结束后的 afterMutation 同步。
+   */
+  private async runInstall(modId: string, flavorId: number, force: boolean, root: string, o: { taskId?: string; syncWatch?: boolean } = {}): Promise<OpResult> {
+    const taskId = o.taskId ?? this.newTaskId();
     const label = this.names.get(modId) ?? `插件 ${modId}`;
     const ac = new AbortController();
     this.tasks.set(taskId, ac);
-    const send = (phase: TaskPhase, extra: Partial<TaskEvent> = {}) => this.emit({ taskId, label, phase, ...extra });
+    const send = (phase: TaskPhase, extra: Partial<TaskEvent> = {}) => this.emit({ taskId, label, phase, flavorId, root, modId, ...extra });
     send('queued');
+    let r: InstallResult | null = null;
+    let failure: unknown = null;
     try {
-      const r = await this.manager.install(root, flavorId, modId, { force, signal: ac.signal, onPhase: (phase, received, total) => send(phase, { received, total }) });
-      send(r.ok ? 'done' : 'cancelled', { message: r.message });
-      return r;
+      // 终态统一在下面发送，这里只转发进行中的阶段
+      r = await this.manager.install(root, flavorId, modId, {
+        force,
+        signal: ac.signal,
+        onPhase: (phase, received, total) => {
+          if (!FINAL_PHASES.has(phase)) send(phase, { received, total });
+        },
+      });
     } catch (err) {
-      const message = ac.signal.aborted ? '已取消' : errorMessage(err);
-      send(ac.signal.aborted ? 'cancelled' : 'failed', { message });
-      throw new Error(message);
+      failure = err;
     } finally {
       this.tasks.delete(taskId);
     }
+    // 同步失败（例如清单暂时无法读回）由检查协调器标为无法确认，不影响这次安装的结果
+    if (o.syncWatch) await this.watch.afterWrite(flavorId, root).catch(() => undefined);
+    if (r) {
+      const { installed, ...result } = r;
+      send(result.ok ? 'done' : 'cancelled', { message: result.message, ...(installed ? { installed: installedView(installed) } : {}) });
+      return result;
+    }
+    const cancelled = ac.signal.aborted;
+    const message = cancelled ? '已取消' : errorMessage(failure);
+    send(cancelled ? 'cancelled' : 'failed', { message });
+    throw cancelled ? new UserError(message, 'cancelled') : new Error(message);
   }
 
   /** 全部更新：批次固定在开始时绑定的目录，绑定变化即停止；只更新来源版本与当前版本一致的插件 */
   async updateAll(flavorId: number, expected: string): Promise<OpResult> {
     const root = await this.targetRoot(flavorId, expected);
-    return runUpdateAll({
-      manager: this.manager,
-      root,
-      flavorId,
-      isStillBound: async () => (await this.deps.settings.profile(flavorId)).root === root,
-      // 批次已在写入闸门内：强制新检查排在自动检查之前、不等待闸门，避免与自动检查叠加并发
-      check: (r, f) => this.watch.check(f, r, { fresh: true }),
-      installOne: (p, fixedRoot) => {
-        this.names.set(p.modId, p.name);
-        return this.runInstall(p.modId, flavorId, false, fixedRoot);
-      },
-    });
+    /** 已排入计划、尚未开始的项目 */
+    const waiting = new Map<string, { taskId: string; label: string }>();
+    try {
+      return await runUpdateAll({
+        manager: this.manager,
+        root,
+        flavorId,
+        isStillBound: async () => (await this.deps.settings.profile(flavorId)).root === root,
+        // 批次已在写入闸门内：强制新检查排在自动检查之前、不等待闸门，避免与自动检查叠加并发
+        check: (r, f) => this.watch.check(f, r, { fresh: true }),
+        // 计划确定后为每一项发出“排队中”，开始处理时沿用同一个任务编号
+        plan: (projects) => {
+          for (const p of projects) {
+            this.names.set(p.modId, p.name);
+            const t = { taskId: this.newTaskId(), label: p.name };
+            waiting.set(p.modId, t);
+            this.emit({ ...t, phase: 'queued', flavorId, root, modId: p.modId });
+          }
+        },
+        installOne: (p, fixedRoot) => {
+          const t = waiting.get(p.modId);
+          waiting.delete(p.modId);
+          return this.runInstall(p.modId, flavorId, false, fixedRoot, { taskId: t?.taskId, syncWatch: true });
+        },
+      });
+    } finally {
+      // 批次停止（绑定变更）或中止：尚未开始的项目结束等待，它们没有执行任何操作
+      for (const [modId, t] of waiting) this.emit({ ...t, phase: 'cancelled', flavorId, root, modId, message: '全部更新已停止，这一项未处理' });
+    }
   }
 
   attachClientUpdater(u: ClientUpdater): void {
