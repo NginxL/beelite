@@ -1,5 +1,6 @@
 // 入口：导航、顶部栏（游戏版本与目录）、启动加载配置
 
+import { initActivityNotice } from './activity-notice.js';
 import { initClientUpdate } from './client-update.js';
 import { initDetail } from './detail.js';
 import { initDiscover, focusSearch } from './discover.js';
@@ -7,8 +8,10 @@ import type { AddonWatchSnapshot } from '../shared/types';
 import { byId, h, mount, spinner, toast } from './dom.js';
 import { errMsg } from './format.js';
 import { initLocal, showManagedTab } from './local.js';
-import { handleTask } from './tasks.js';
-import { api, applyTask, applyWatch, bindDirectory, flavorName, isBusy, on, pendingByFlavor, setFlavor, state, unbindDirectory } from './state.js';
+import { handleTask, syncTasks } from './tasks.js';
+import {
+  api, applyActivity, applyTask, applyWatch, bindDirectory, flavorName, isBusy, on, onActivityAccepted, pendingByFlavor, setFlavor, state, syncActivity, unbindDirectory,
+} from './state.js';
 
 type Page = 'discover' | 'local';
 
@@ -178,6 +181,12 @@ function boot(): void {
     applyTask(e);
     handleTask(e);
   });
+  // 插件写操作状态在主进程（界面重新载入后据此恢复占用、行内进度与任务卡片）：先订阅推送再获取快照，按 rev 丢弃过时的一方；
+  // 取得之前插件写入口保持禁止，获取失败时所有页面顶部显示原因与重试
+  onActivityAccepted(syncTasks);
+  initActivityNotice(byId('activity-warning'));
+  window.beelite.onActivity((s) => void applyActivity(s));
+  void syncActivity();
   // 插件更新检查在主进程进行，可能早于界面完成：先订阅事件再获取快照，按 rev 丢弃过时的一方
   window.beelite.onAddonWatch(onWatch);
   void window.beelite.watchState().then(onWatch, () => undefined);

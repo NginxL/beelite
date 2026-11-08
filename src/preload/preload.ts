@@ -1,7 +1,7 @@
 // 沙箱 preload：只暴露固定的窄接口，界面拿不到 ipcRenderer、Node 或任何文件路径能力。
 // 注意：sandbox 模式下 preload 只能 require('electron')，因此本文件不引用项目内其他运行时模块。
 import { contextBridge, ipcRenderer, type IpcRendererEvent } from 'electron';
-import type { AddonWatchSnapshot, BeeLiteApi, ClientUpdateState, TaskEvent } from '../shared/types';
+import type { ActivitySnapshot, AddonWatchSnapshot, BeeLiteApi, ClientUpdateState, TaskEvent } from '../shared/types';
 
 const invoke = (channel: string, ...args: unknown[]) => ipcRenderer.invoke(channel, ...args);
 
@@ -36,7 +36,7 @@ const api: BeeLiteApi = {
   localState: (flavorId) => invoke('local:state', flavorId),
   checkUpdates: (flavorId, root) => invoke('addon:check', flavorId, root),
   install: (modId, flavorId, root) => invoke('addon:install', modId, flavorId, root),
-  update: (modId, flavorId, force, root) => invoke('addon:update', modId, flavorId, force, root),
+  update: (modId, flavorId, force, expected, root) => invoke('addon:update', modId, flavorId, force, expected, root),
   updateAll: (flavorId, root) => invoke('addon:updateAll', flavorId, root),
   uninstallProject: (modId, flavorId, root) => invoke('addon:uninstall', modId, flavorId, root),
   uninstallFolder: (folder, flavorId, root) => invoke('addon:uninstallFolder', folder, flavorId, root),
@@ -48,6 +48,14 @@ const api: BeeLiteApi = {
     ipcRenderer.on('task:event', listener);
     return () => {
       ipcRenderer.removeListener('task:event', listener);
+    };
+  },
+  activityState: () => invoke('addon:activityState'),
+  onActivity: (cb) => {
+    const listener = (_e: IpcRendererEvent, s: ActivitySnapshot) => cb(s);
+    ipcRenderer.on('addon:activity', listener);
+    return () => {
+      ipcRenderer.removeListener('addon:activity', listener);
     };
   },
 };

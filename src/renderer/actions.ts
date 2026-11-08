@@ -4,8 +4,8 @@ import type { ManagedProjectView } from '../shared/types';
 import { h, spinner } from './dom.js';
 import { toast } from './dom.js';
 import {
-  api, batchHoldText, clearTaskNotes, currentTarget, ensureBound, findManaged, isBlocked, isBusy, isFinalPhase, isOtherFlavor, modBusy, modKey,
-  projectHasUpdate, requireTarget, rowTask, runWrite, state,
+  activityUnknown, api, batchHoldText, clearTaskNotes, currentTarget, ensureBound, findManaged, isBlocked, isBusy, isFinalPhase, isOtherFlavor, isReserved, modBusy,
+  modKey, projectHasUpdate, requireTarget, rowTask, runWrite, state,
 } from './state.js';
 
 /** 全部更新进行中时插件写入口的说明 */
@@ -32,7 +32,9 @@ export async function updateProject(p: ManagedProjectView, force: boolean): Prom
   }
   if (modBusy(p.modId)) return;
   clearTaskNotes(t, p.modId);
-  await runWrite(modKey(t, p.modId), () => api().update(p.modId, t.flavorId, force, t.root));
+  // 界面看到的安装记录：主进程在目录锁内核对，期间被卸载、重装或更新时不做改动
+  const expected = { fileId: p.fileId, installedAt: p.installedAt };
+  await runWrite(modKey(t, p.modId), () => api().update(p.modId, t.flavorId, force, expected, t.root));
 }
 
 /**
@@ -46,8 +48,14 @@ export function modActionButton(mod: { id: string; accessible: boolean }, block:
   };
   const t = currentTarget();
   const task = rowTask(mod.id);
-  if ((t && isBusy(modKey(t, mod.id))) || (task && !isFinalPhase(task.phase))) {
+  if ((t && (isBusy(modKey(t, mod.id)) || isReserved(t, mod.id))) || (task && !isFinalPhase(task.phase))) {
     return h('button', { class: 'btn btn-sm', disabled: true }, spinner(true), '处理中');
+  }
+  if (t && activityUnknown()) {
+    // 获取失败时不显示“同步中”：说明暂不可用，原因与重试在页面顶部
+    return state.activityError
+      ? h('button', { class: 'btn btn-sm', disabled: true, title: `无法获取后台插件操作状态：${state.activityError}。请在页面顶部重试` }, '暂不可用')
+      : h('button', { class: 'btn btn-sm btn-busy', disabled: true, title: '正在同步后台任务状态，完成后可操作' }, spinner(true), '同步中');
   }
   const blocked = isBlocked() ? '游戏目录当前不可写入' : null;
   const p = findManaged(mod.id);
@@ -71,7 +79,8 @@ export function modActionButton(mod: { id: string; accessible: boolean }, block:
   if (!mod.accessible) {
     return h('button', { class: 'btn btn-sm', disabled: true, title: '仅支持免费公开插件' }, '不可安装');
   }
-  const reason = blocked ?? block;
+  // 全部更新计划确定之前，主进程不受理这个目录的新安装
+  const reason = blocked ?? block ?? (t && modBusy(mod.id) ? BATCH_REASON : null);
   return h('button', {
     class: 'btn btn-sm btn-primary',
     disabled: !!reason,

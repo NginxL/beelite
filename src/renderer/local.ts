@@ -2,13 +2,19 @@
 
 import type { LocalFolder, LocalState, ManagedProjectView, RecoveryEntryView, TaskPhase } from '../shared/types';
 import { BATCH_REASON, updateProject } from './actions.js';
+import { ACTIVITY_BLOCKED_TEXT } from './activity-notice.js';
 import { confirmDialog, h, modIcon, mount, spinner } from './dom.js';
 import { cleanTocText, formatDateTime } from './format.js';
 import {
-  anyModBusy, api, batchHoldText, bindDirectory, checkUpdates, clearTaskNotes, currentFlavor, currentTarget, currentWatchEntry, flavorName, isBlocked, isBusy, isFinalPhase,
-  isOtherFlavor, modBusy, modKey, on, projectHasUpdate, refreshLocal, requireTarget, rowTask, runWrite, state, stillTarget, targetKey,
-  updateAllKey, updateCount, updateFor, updatingAll, type RowTask,
+  activityUnknown, anyModBusy, api, batchHoldText, bindDirectory, checkUpdates, clearTaskNotes, currentFlavor, currentTarget, currentWatchEntry, flavorName, isBlocked, isBusy,
+  isFinalPhase, isOtherFlavor, isReserved, modBusy, modKey, on, projectHasUpdate, refreshLocal, requireTarget, rowTask, runWrite, state, stillTarget, targetKey,
+  updateAllKey, updateCount, updateFor, updatingAll, type RowTask, type Target,
 } from './state.js';
+
+/** 活动状态未知时插件写入口的说明 */
+const SYNC_REASON = '后台任务状态尚未取得（正在同步或获取失败），完成后可操作';
+/** 未托管目录写操作的占用键（按目标区分：不同目录中的同名目录互不影响） */
+const folderKey = (t: Target, name: string): string => `folder:${targetKey(t)}\n${name}`;
 
 type Tab = 'managed' | 'unmanaged' | 'recovery';
 
@@ -123,7 +129,7 @@ function renderToolbar(): void {
       h('button', {
         class: 'btn btn-primary',
         disabled: !hasRoot || blocked || n === 0 || batch || modsBusy,
-        title: blocked ? '游戏目录当前不可写入' : modsBusy && !batch ? '有插件正在处理，完成后再全部更新' : '',
+        title: blocked ? '游戏目录当前不可写入' : activityUnknown() ? SYNC_REASON : modsBusy && !batch ? '有插件正在处理，完成后再全部更新' : '',
         on: { click: () => void doUpdateAll() },
       }, batch ? [spinner(true), '更新中'] : `全部更新 (${n})`),
       h('button', {
@@ -162,12 +168,7 @@ export async function doUpdateAll(): Promise<void> {
   // 同一目标已在全部更新，或有插件正在单独处理时不再发起
   if (!t || updatingAll(t) || anyModBusy()) return;
   clearTaskNotes(t);
-  state.batchPlanned.delete(targetKey(t));
-  try {
-    await runWrite(updateAllKey(t), () => api().updateAll(t.flavorId, t.root));
-  } finally {
-    state.batchPlanned.delete(targetKey(t));
-  }
+  await runWrite(updateAllKey(t), () => api().updateAll(t.flavorId, t.root));
 }
 
 function renderBody(): void {
@@ -198,6 +199,10 @@ function renderBody(): void {
   const banners: HTMLElement[] = [];
   if (state.localError) banners.push(h('div', { class: 'banner banner-warn', text: `刷新失败，显示的是上次结果：${state.localError}` }));
   if (local.error) banners.push(h('div', { class: 'banner banner-error', text: local.error }));
+  // 获取失败的原因与重试在页面顶部的全局提示中（所有页面可见）；这里只说明仍在同步
+  if (activityUnknown() && !state.activityError) {
+    banners.push(h('div', { class: 'banner banner-warn', text: `正在同步后台任务状态，完成前${ACTIVITY_BLOCKED_TEXT}…` }));
+  }
   if (local.dir?.status === 'blocked') {
     banners.push(h('div', { class: 'banner banner-error banner-pre' },
       h('div', { class: 'banner-title', text: '游戏目录当前不可写入，已禁用所有写操作' }),
@@ -254,8 +259,8 @@ function managedRow(p: ManagedProjectView): HTMLElement {
   const task = rowTask(p.modId);
   const active = !!task && !isFinalPhase(task.phase);
   const busy = modBusy(p.modId);
-  /** 已发起、还没有任务进度的单项操作（受理前、卸载等） */
-  const pending = !active && !!t && isBusy(modKey(t, p.modId));
+  /** 已发起或已受理、还没有任务进度的单项操作（受理前、卸载等；重新载入后由主进程状态给出） */
+  const pending = !active && !!t && (isBusy(modKey(t, p.modId)) || isReserved(t, p.modId));
   const hasUpdate = projectHasUpdate(p);
   const u = updateFor(p);
   const missing = p.folders.filter((f) => !f.present).length;
@@ -285,7 +290,7 @@ function managedRow(p: ManagedProjectView): HTMLElement {
     else openFolders.delete(p.modId);
   });
 
-  const disabledTitle = blocked ? '游戏目录当前不可写入' : busy && updatingAll() ? BATCH_REASON : '';
+  const disabledTitle = blocked ? '游戏目录当前不可写入' : activityUnknown() ? SYNC_REASON : busy && updatingAll() ? BATCH_REASON : '';
   // “更新”按钮的位置：进行中的任务显示阶段与进度，已发起尚未开始的操作显示处理中，全部更新期间的其他可更新插件显示检查中 / 全部更新中
   const hold = batchHoldText();
   let updateBtn: HTMLElement | null = null;
@@ -293,7 +298,7 @@ function managedRow(p: ManagedProjectView): HTMLElement {
   else if (pending) updateBtn = busyButton('处理中', '正在处理这个插件');
   else if (hasUpdate && !otherFlavor) {
     updateBtn = hold
-      ? busyButton(hold, BATCH_REASON)
+      ? busyButton(hold, activityUnknown() ? SYNC_REASON : BATCH_REASON)
       : h('button', { class: 'btn btn-sm btn-primary', disabled: blocked || busy, title: disabledTitle, on: { click: () => void updateProject(p, false) } }, '更新');
   }
   return h('div', { class: 'row' },
@@ -370,8 +375,8 @@ function renderUnmanagedList(local: LocalState): void {
 
 function folderRow(f: LocalFolder): HTMLElement {
   const blocked = isBlocked();
-  const key = `folder:${f.name}`;
-  const busy = isBusy(key);
+  const t = currentTarget();
+  const busy = !!t && isBusy(folderKey(t, f.name));
   const iface = currentFlavor()?.interfaceNumber ?? null;
   const title = f.toc ? cleanTocText(f.toc.title) : '';
   const tags: HTMLElement[] = [];
@@ -417,7 +422,7 @@ export async function trashFolder(f: LocalFolder): Promise<void> {
     danger: true,
   });
   if (!ok || !stillTarget(t)) return;
-  await runWrite(`folder:${f.name}`, () => api().uninstallFolder(f.name, t.flavorId, t.root));
+  await runWrite(folderKey(t, f.name), () => api().uninstallFolder(f.name, t.flavorId, t.root));
 }
 
 // ---------- 回收站 ----------

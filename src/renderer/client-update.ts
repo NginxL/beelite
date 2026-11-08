@@ -7,7 +7,7 @@
 import type { ClientUpdateState } from '../shared/types';
 import { byId, confirmDialog, h, modalOpen, mount, onModalClosed, toast } from './dom.js';
 import { errMsg } from './format.js';
-import { api, on, state } from './state.js';
+import { activityBusy, activityUnknown, api, on, state } from './state.js';
 
 /** 侧栏更新区域的固定元素：只在初始化时创建一次，之后只更新属性，保证按钮在进度刷新中保持身份与焦点 */
 interface View {
@@ -32,6 +32,14 @@ const autoShown = new Set<string>();
 let promptTimer: ReturnType<typeof setTimeout> | null = null;
 const PROMPT_DELAY_MS = 400;
 
+/**
+ * 有进行中的操作：本界面已发起的请求，或主进程已知的插件写操作（任意目录；界面重新载入后只能从后者得知）。
+ * 只影响是否展示更新说明，不影响侧栏“下载并更新”。
+ */
+function operationsActive(): boolean {
+  return state.busy.size > 0 || activityBusy();
+}
+
 /** 采用较新的状态：rev 更小的（过时的回复或事件）丢弃 */
 function applyState(s: ClientUpdateState): void {
   if (current && typeof current.rev === 'number' && typeof s.rev === 'number' && s.rev < current.rev) return;
@@ -52,7 +60,7 @@ async function openNotes(auto: boolean): Promise<void> {
   const s = current;
   if (!s || !s.canUpdate || !s.availableBuild || notesOpen) return;
   // 不叠在已有确认框上，也不插进进行中的操作（例如永久删除的两次确认之间）
-  if (modalOpen() || state.busy.size > 0) {
+  if (modalOpen() || operationsActive()) {
     if (!auto) toast('请先完成当前的确认或操作，再查看更新说明', 'info');
     return;
   }
@@ -90,7 +98,8 @@ export function maybePromptNotes(): void {
   const s = current;
   if (!s || !s.notice || !s.canUpdate || !s.availableBuild) return;
   if (notesOpen || pending || autoShown.has(s.availableBuild)) return;
-  if (modalOpen() || state.busy.size > 0) return;
+  // 主进程的插件操作状态仍在首次同步：等它到达再判断（获取失败时不因此无限推迟）
+  if (modalOpen() || operationsActive() || (activityUnknown() && state.activityError === null)) return;
   void openNotes(true);
 }
 

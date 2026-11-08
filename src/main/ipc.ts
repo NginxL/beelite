@@ -2,14 +2,15 @@
 import { app, dialog, ipcMain, type BrowserWindow, type IpcMainInvokeEvent } from 'electron';
 import { stat } from 'node:fs/promises';
 import path from 'node:path';
-import type { AddonWatchSnapshot, AppConfig, ClientUpdateState, FlavorInfo, InstalledRecord, LocalState, OpResult, ProfileInfo, SearchQuery, SortOrder, TaskEvent, TaskPhase } from '../shared/types';
+import type { ActivitySnapshot, AddonWatchSnapshot, AppConfig, ClientUpdateState, ExpectedRecord, FlavorInfo, InstalledRecord, LocalState, OpResult, ProfileInfo, SearchQuery, SortOrder, TaskEvent, TaskPhase } from '../shared/types';
+import { ActivityRegistry } from '../core/activity';
 import { AddonUpdateWatch, type WatchClock } from '../core/addon-watch';
 import { errorMessage, UserError } from '../core/errors';
 import { DEFAULT_FLAVOR_ID, FLAVORS, getFlavor, interfaceFromVersion } from '../core/flavors';
 import { runUpdateAll } from '../core/batch';
 import { BUILD_RE, type ClientUpdater } from '../core/client-update';
 import { guardHandler, type MutationGate } from '../core/gate';
-import { AddonManager, type InstallResult, type ManagerOptions } from '../core/manager';
+import { AddonManager, type InstallExpect, type InstallResult, type ManagerOptions } from '../core/manager';
 import { isValidModuleName } from '../core/paths';
 import { inspectPickedRoot, SettingsStore } from '../core/profiles';
 import { NewBeeBoxProvider } from '../core/provider';
@@ -47,6 +48,14 @@ function buildArg(v: unknown): string {
   if (typeof v !== 'string' || !BUILD_RE.test(v)) throw new UserError('版本参数无效');
   return v;
 }
+/** 更新 / 重装时界面看到的安装记录 */
+function expectedArg(v: unknown): ExpectedRecord {
+  if (typeof v !== 'object' || v === null) throw new UserError('安装记录参数无效');
+  const r = v as Record<string, unknown>;
+  if (typeof r.fileId !== 'string' || !/^\d{1,15}$/.test(r.fileId)) throw new UserError('安装记录参数无效');
+  if (typeof r.installedAt !== 'number' || !Number.isSafeInteger(r.installedAt) || r.installedAt < 0) throw new UserError('安装记录参数无效');
+  return { fileId: r.fileId, installedAt: r.installedAt };
+}
 function installedView(p: ProjectRecord): InstalledRecord {
   return { flavorId: p.flavorId, fileId: p.fileId, version: p.version, name: p.name, logo: p.logo, folders: [...p.folders], installedAt: p.installedAt };
 }
@@ -73,7 +82,7 @@ export interface ServiceDeps {
   clock?: WatchClock;
 }
 
-/** 完成后要让该目录已有的检查结果按新清单重校验的写通道（flavorId 为第 2 个参数、全部更新为第 1 个；期望目录为最后一个参数） */
+/** 完成后要让该目录已有的检查结果按新清单重校验的写通道（flavorId 为第 2 个参数、全部更新为第 1 个；期望目录为最后一个参数，新增参数只能加在它之前） */
 const ROOT_WRITE_CHANNELS: ReadonlySet<string> = new Set(['addon:install', 'addon:update', 'addon:updateAll', 'addon:uninstall', 'addon:uninstallFolder', 'trash:restore', 'trash:purge']);
 const BINDING_CHANNELS: ReadonlySet<string> = new Set(['profile:bind', 'profile:unbind']);
 
@@ -84,6 +93,8 @@ export class AppService {
   private readonly names = new Map<string, string>();
   private readonly tasks = new Map<string, AbortController>();
   private taskSeq = 0;
+  /** 插件写操作的占用与进度（界面重新载入后据此恢复）；冲突判断在这里，不依赖界面 */
+  readonly activity: ActivityRegistry;
   private clientUpdater: ClientUpdater | null = null;
 
   constructor(private readonly deps: ServiceDeps) {
@@ -97,6 +108,7 @@ export class AppService {
         return r.response === 0;
       },
     });
+    this.activity = new ActivityRegistry((s) => this.pushActivity(s));
     this.watch = new AddonUpdateWatch({
       settings: deps.settings,
       checker: this.manager,
@@ -104,6 +116,11 @@ export class AppService {
       clock: deps.clock,
       onChange: (s) => this.pushWatch(s),
     });
+  }
+
+  private pushActivity(s: ActivitySnapshot): void {
+    const win = this.deps.getWindow();
+    if (win && !win.isDestroyed()) win.webContents.send('addon:activity', s);
   }
 
   private pushWatch(s: AddonWatchSnapshot): void {
@@ -210,32 +227,70 @@ export class AppService {
     return this.manager.localState({ ...profile, root: profile.root }, flavorId);
   }
 
+  /** 任务编号：带上本次运行的活动状态标识，不同运行（例如测试中的多个主进程实例）的编号不会重复 */
   private newTaskId(): string {
-    return `t${++this.taskSeq}`;
+    return `${this.activity.instance.slice(0, 8)}-t${++this.taskSeq}`;
+  }
+
+  /**
+   * 单个插件的写操作：目标目录已解析，在下一个 await 之前同步占用（与全部更新、同一插件的其他写操作互斥），
+   * 由这一次调用在 finally 中释放。
+   */
+  private async single<T>(flavorId: number, root: string, modId: string, kind: 'install' | 'update' | 'uninstall', fn: () => Promise<T>): Promise<T> {
+    const release = this.activity.reserveProject(flavorId, root, modId, kind);
+    try {
+      return await fn();
+    } finally {
+      release();
+    }
   }
 
   /**
    * 以任务形式执行安装/更新，向界面推送进度，可取消；root 在受理时已确定，之后即使换绑也只写入它。
-   * 每个任务只发一个终态，在安装返回（目录锁已释放）之后发送；done 带上本次提交到清单的记录。
+   * 任务从受理到终态都登记在活动状态中（界面重新载入后可恢复）；每个任务只发一个终态，在安装返回（目录锁已释放）之后发送，
+   * 先发终态（done 带上本次提交到清单的记录）再推送移除了该任务的快照。
+   * expect：目录锁内核对的条件（首次安装必须尚未安装；更新 / 重装必须仍是受理时的记录）。
    * syncWatch：发终态之前先把这次写入同步到更新检查结果（只读清单，不扫描目录），全部更新据此在进入下一项之前完成同步；
    * 单项操作由写通道结束后的 afterMutation 同步。
+   * batch：全部更新中已在计划时登记（排队中）的任务。
    */
-  private async runInstall(modId: string, flavorId: number, force: boolean, root: string, o: { taskId?: string; syncWatch?: boolean } = {}): Promise<OpResult> {
-    const taskId = o.taskId ?? this.newTaskId();
+  private async runInstall(
+    modId: string,
+    flavorId: number,
+    force: boolean,
+    root: string,
+    o: { expect: InstallExpect; batch?: { taskId: string; batchId: string }; syncWatch?: boolean },
+  ): Promise<OpResult> {
+    const taskId = o.batch?.taskId ?? this.newTaskId();
     const label = this.names.get(modId) ?? `插件 ${modId}`;
     const ac = new AbortController();
     this.tasks.set(taskId, ac);
-    const send = (phase: TaskPhase, extra: Partial<TaskEvent> = {}) => this.emit({ taskId, label, phase, flavorId, root, modId, ...extra });
-    send('queued');
+    const send = (phase: TaskPhase, rev: number, extra: Partial<TaskEvent> = {}) => this.emit({ taskId, label, phase, flavorId, root, modId, rev, ...extra });
+    if (!o.batch) {
+      const rev = this.activity.startTask({ taskId, label, flavorId, root, modId, batchId: null });
+      this.activity.publish();
+      send('queued', rev);
+    }
+    let phaseNow: TaskPhase = 'queued';
     let r: InstallResult | null = null;
     let failure: unknown = null;
     try {
-      // 终态统一在下面发送，这里只转发进行中的阶段
+      // 终态统一在下面发送，这里只转发进行中的阶段；阶段变化推送快照，下载字节数只随事件发送
       r = await this.manager.install(root, flavorId, modId, {
         force,
         signal: ac.signal,
+        expect: o.expect,
         onPhase: (phase, received, total) => {
-          if (!FINAL_PHASES.has(phase)) send(phase, { received, total });
+          if (FINAL_PHASES.has(phase)) return;
+          const bytes = { received: received ?? null, total: total ?? null };
+          if (phase === phaseNow) {
+            send(phase, this.activity.progress(taskId, bytes.received, bytes.total), { received, total });
+            return;
+          }
+          phaseNow = phase;
+          const rev = this.activity.setPhase(taskId, phase as Exclude<TaskPhase, 'done' | 'failed' | 'cancelled'>, bytes.received, bytes.total);
+          this.activity.publish();
+          send(phase, rev, { received, total });
         },
       });
     } catch (err) {
@@ -245,20 +300,34 @@ export class AppService {
     }
     // 同步失败（例如清单暂时无法读回）由检查协调器标为无法确认，不影响这次安装的结果
     if (o.syncWatch) await this.watch.afterWrite(flavorId, root).catch(() => undefined);
+    const end = (phase: TaskPhase, extra: Partial<TaskEvent>) => {
+      send(phase, this.activity.endTask(taskId), extra);
+      this.activity.publish();
+    };
     if (r) {
       const { installed, ...result } = r;
-      send(result.ok ? 'done' : 'cancelled', { message: result.message, ...(installed ? { installed: installedView(installed) } : {}) });
+      end(result.ok ? 'done' : 'cancelled', { message: result.message, ...(installed ? { installed: installedView(installed) } : {}) });
       return result;
     }
     const cancelled = ac.signal.aborted;
     const message = cancelled ? '已取消' : errorMessage(failure);
-    send(cancelled ? 'cancelled' : 'failed', { message });
-    throw cancelled ? new UserError(message, 'cancelled') : new Error(message);
+    // 前置条件不满足：没有做任何改动，行内显示为未处理（不是失败）
+    const changed = !cancelled && failure instanceof UserError && failure.code === 'changed';
+    end(cancelled || changed ? 'cancelled' : 'failed', { message });
+    // 保留错误码：全部更新据此区分取消、排队期间变化与失败
+    if (cancelled) throw new UserError(message, 'cancelled');
+    if (failure instanceof UserError) throw new UserError(message, failure.code);
+    throw new Error(message);
   }
 
-  /** 全部更新：批次固定在开始时绑定的目录，绑定变化即停止；只更新来源版本与当前版本一致的插件 */
+  /**
+   * 全部更新：批次固定在开始时绑定的目录，绑定变化即停止（当前项在原目录完成，之后的项目不再处理）；
+   * 只更新来源版本与当前版本一致的插件。目标解析后同步占用该目录（与单项写操作双向互斥），finally 中释放。
+   * 每一项在目录锁内核对计划时的安装记录，排队期间被改动的项目不处理。
+   */
   async updateAll(flavorId: number, expected: string): Promise<OpResult> {
     const root = await this.targetRoot(flavorId, expected);
+    const batch = this.activity.reserveBatch(flavorId, root);
     /** 已排入计划、尚未开始的项目 */
     const waiting = new Map<string, { taskId: string; label: string }>();
     try {
@@ -269,24 +338,34 @@ export class AppService {
         isStillBound: async () => (await this.deps.settings.profile(flavorId)).root === root,
         // 批次已在写入闸门内：强制新检查排在自动检查之前、不等待闸门，避免与自动检查叠加并发
         check: (r, f) => this.watch.check(f, r, { fresh: true }),
-        // 计划确定后为每一项发出“排队中”，开始处理时沿用同一个任务编号
+        // 计划确定后登记每一项（排队中，推送一次快照），开始处理时沿用同一个任务编号
         plan: (projects) => {
-          for (const p of projects) {
+          const items = projects.map((p) => {
             this.names.set(p.modId, p.name);
             const t = { taskId: this.newTaskId(), label: p.name };
             waiting.set(p.modId, t);
-            this.emit({ ...t, phase: 'queued', flavorId, root, modId: p.modId });
-          }
+            return { ...t, modId: p.modId };
+          });
+          const rev = this.activity.planBatch(batch, items);
+          for (const it of items) this.emit({ taskId: it.taskId, label: it.label, phase: 'queued', flavorId, root, modId: it.modId, rev });
         },
         installOne: (p, fixedRoot) => {
           const t = waiting.get(p.modId);
           waiting.delete(p.modId);
-          return this.runInstall(p.modId, flavorId, false, fixedRoot, { taskId: t?.taskId, syncWatch: true });
+          if (!t) throw new Error(`计划中没有 ${p.modId}`);
+          return this.runInstall(p.modId, flavorId, false, fixedRoot, {
+            batch: { taskId: t.taskId, batchId: batch.batchId },
+            syncWatch: true,
+            expect: { kind: 'record', fileId: p.fileId, installedAt: p.installedAt },
+          });
         },
       });
     } finally {
       // 批次停止（绑定变更）或中止：尚未开始的项目结束等待，它们没有执行任何操作
-      for (const [modId, t] of waiting) this.emit({ ...t, phase: 'cancelled', flavorId, root, modId, message: '全部更新已停止，这一项未处理' });
+      for (const [modId, t] of waiting) {
+        this.emit({ ...t, phase: 'cancelled', flavorId, root, modId, message: '全部更新已停止，这一项未处理', rev: this.activity.endTask(t.taskId) });
+      }
+      batch.release();
     }
   }
 
@@ -335,6 +414,7 @@ export class AppService {
       return this.clientUpdater?.ackNotice(build) ?? this.clientState();
     });
     handle('addon:watchState', async () => this.watch.snapshot());
+    handle('addon:activityState', async () => this.activity.snapshot());
     handle('config:get', () => this.config());
     handle('mods:search', async (q) => {
       const r = await this.deps.provider.search(queryArg(q));
@@ -361,17 +441,28 @@ export class AppService {
       await this.watch.check(flavorId, await this.targetRoot(flavorId, expectedRootArg(root)));
       return this.watch.snapshot();
     });
+    // 安装 / 更新 / 卸载：目标解析之后同步占用，再开始远端请求与等待目录锁
     handle('addon:install', async (m, f, root) => {
+      const modId = modArg(m);
       const flavorId = flavorArg(f);
-      return this.runInstall(modArg(m), flavorId, false, await this.targetRoot(flavorId, expectedRootArg(root)));
+      const target = await this.targetRoot(flavorId, expectedRootArg(root));
+      return this.single(flavorId, target, modId, 'install', () => this.runInstall(modId, flavorId, false, target, { expect: { kind: 'absent' } }));
     });
-    handle('addon:update', async (m, f, force, root) => {
+    handle('addon:update', async (m, f, force, expected, root) => {
       if (typeof force !== 'boolean') throw new UserError('参数无效');
+      const modId = modArg(m);
       const flavorId = flavorArg(f);
-      return this.runInstall(modArg(m), flavorId, force, await this.targetRoot(flavorId, expectedRootArg(root)));
+      const record = expectedArg(expected);
+      const target = await this.targetRoot(flavorId, expectedRootArg(root));
+      return this.single(flavorId, target, modId, 'update', () => this.runInstall(modId, flavorId, force, target, { expect: { kind: 'record', ...record } }));
     });
     handle('addon:updateAll', (f, root) => this.updateAll(flavorArg(f), expectedRootArg(root)));
-    handle('addon:uninstall', async (m, f, root) => this.manager.uninstallProject(await this.targetRoot(flavorArg(f), expectedRootArg(root)), modArg(m)));
+    handle('addon:uninstall', async (m, f, root) => {
+      const modId = modArg(m);
+      const flavorId = flavorArg(f);
+      const target = await this.targetRoot(flavorId, expectedRootArg(root));
+      return this.single(flavorId, target, modId, 'uninstall', () => this.manager.uninstallProject(target, modId));
+    });
     handle('addon:uninstallFolder', async (name, f, root) => this.manager.uninstallFolder(await this.targetRoot(flavorArg(f), expectedRootArg(root)), folderArg(name)));
     handle('trash:restore', async (id, f, root) => this.manager.restore(await this.targetRoot(flavorArg(f), expectedRootArg(root)), entryArg(id)));
     handle('trash:purge', async (id, f, root) => this.manager.purge(await this.targetRoot(flavorArg(f), expectedRootArg(root)), entryArg(id)));

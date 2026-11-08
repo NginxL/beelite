@@ -1,9 +1,10 @@
-// 右下角任务面板：显示下载 / 安装进度
+// 右下角任务面板：显示下载 / 安装进度。卡片按任务编号，来自任务事件与主进程活动状态（界面重新载入后据此恢复），
+// 两者按同一序列的 rev 取较新的一方；进入终态后不再被任何快照或事件改变，到期自动移除。
 
-import type { TaskEvent, TaskPhase } from '../shared/types';
+import type { ActivitySnapshot, TaskEvent, TaskPhase } from '../shared/types';
 import { byId, h, mount } from './dom.js';
 import { errMsg, formatSize } from './format.js';
-import { api } from './state.js';
+import { api, taskBytes } from './state.js';
 
 const PHASE_TEXT: Record<TaskPhase, string> = {
   queued: '排队中',
@@ -22,25 +23,45 @@ interface TaskView {
   el: HTMLElement;
   timer: number;
   cancelling: boolean;
+  /** 卡片当前内容对应的 rev */
+  rev: number;
+  final: boolean;
 }
+
+/** 卡片显示的内容（任务事件或快照中的任务） */
+type CardData = Pick<TaskEvent, 'taskId' | 'label' | 'phase' | 'received' | 'total' | 'message'>;
 
 const views = new Map<string, TaskView>();
 
+function createView(taskId: string): TaskView {
+  const v: TaskView = { el: h('div', { class: 'task' }), timer: 0, cancelling: false, rev: -1, final: false };
+  views.set(taskId, v);
+  byId('task-panel').appendChild(v.el);
+  return v;
+}
+
+function removeView(taskId: string, v: TaskView): void {
+  window.clearTimeout(v.timer);
+  v.el.remove();
+  views.delete(taskId);
+}
+
 export function handleTask(e: TaskEvent): void {
-  const panel = byId('task-panel');
   let v = views.get(e.taskId);
   if (!v) {
     // 排队中的任务（例如全部更新中尚未开始的项目）不占卡片，开始处理时才出现；从未开始就结束的也不新建卡片
     if (e.phase === 'queued' || FINAL.includes(e.phase)) return;
-    v = { el: h('div', { class: 'task' }), timer: 0, cancelling: false };
-    views.set(e.taskId, v);
-    panel.appendChild(v.el);
+    v = createView(e.taskId);
   }
+  // 已结束的卡片不再变化（重复的终态不会重置移除时间）；比卡片当前内容旧的事件忽略
+  if (v.final || e.rev <= v.rev) return;
+  v.rev = e.rev;
   window.clearTimeout(v.timer);
   v.el.classList.remove('task-fade');
   render(e, v);
 
   if (FINAL.includes(e.phase)) {
+    v.final = true;
     const view = v;
     const delay = e.phase === 'failed' ? 8000 : 3500;
     view.timer = window.setTimeout(() => {
@@ -53,7 +74,27 @@ export function handleTask(e: TaskEvent): void {
   }
 }
 
-function render(e: TaskEvent, v: TaskView): void {
+/**
+ * 按主进程活动状态恢复与校正卡片（只在界面接受了这个快照时调用）：进行中、已开始处理的任务没有卡片时补建
+ * （沿用同一个任务编号，取消按钮作用于同一个后台任务），内容比快照旧的卡片更新为快照；
+ * 快照中已没有、也没有收到终态的卡片移除（不会留下永远“进行中”的卡片）。已结束的卡片不受影响。
+ */
+export function syncTasks(s: ActivitySnapshot): void {
+  const live = new Set<string>();
+  for (const t of s.tasks) {
+    live.add(t.taskId);
+    if (t.phase === 'queued') continue;
+    let v = views.get(t.taskId);
+    if (v?.final || (v && v.rev >= s.rev)) continue;
+    if (!v) v = createView(t.taskId);
+    v.rev = s.rev;
+    const { received, total } = taskBytes(t, s.rev);
+    render({ taskId: t.taskId, label: t.label, phase: t.phase, received: received ?? undefined, total: total ?? undefined }, v);
+  }
+  for (const [id, v] of [...views]) if (!v.final && !live.has(id) && v.rev < s.rev) removeView(id, v);
+}
+
+function render(e: CardData, v: TaskView): void {
   const total = e.total ?? 0;
   const received = e.received ?? 0;
   const pct = total > 0 ? Math.min(100, Math.round((received / total) * 100)) : null;

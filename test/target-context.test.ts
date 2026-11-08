@@ -6,7 +6,7 @@ import assert from 'node:assert/strict';
 import { mkdir, realpath, rename, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { addonEntries, cleanup, FakeSource, listAddOns, makeGameRoot, makeManager, makeZip, readAddonFile, tmpDir } from './helpers';
-import { createHarness, ipcCalls, readManifestJson, snapshot } from './ipc-harness';
+import { createHarness, ipcCalls, readManifestJson, recordOf, snapshot } from './ipc-harness';
 import type { AddonWatchSnapshot } from '../src/shared/types';
 
 const SRC = 6; // 插件记录的来源版本
@@ -68,10 +68,10 @@ test('异来源插件：更新、重装被拒绝；按旧来源版本发起的�
     src.set('100', VIEW, { name: 'M', fileId: '9', zip: zipOf('ModM', 'm9-view'), versions: ['12.1.5'] });
     const a0 = await snapshot(A);
     const b0 = await snapshot(B);
-    await assert.rejects(h.api.update('100', VIEW, false, A), /不会用当前版本的文件更新或重装/);
-    await assert.rejects(h.api.update('100', VIEW, true, A), /不会用当前版本的文件更新或重装/);
+    await assert.rejects(h.api.update('100', VIEW, false, await recordOf(A, '100'), A), /不会用当前版本的文件更新或重装/);
+    await assert.rejects(h.api.update('100', VIEW, true, await recordOf(A, '100'), A), /不会用当前版本的文件更新或重装/);
     // 0.1.1 的界面会按插件记录的来源版本发送（100, 6），现在因期望目录 A 与 6 的绑定目录 B 不符而被拒绝
-    await assert.rejects(h.api.update('100', SRC, true, A), /绑定已变更/);
+    await assert.rejects(h.api.update('100', SRC, true, await recordOf(A, '100'), A), /绑定已变更/);
     await assert.rejects(h.api.uninstallProject('100', SRC, A), /绑定已变更/);
     assert.deepEqual(await snapshot(A), a0);
     assert.deepEqual(await snapshot(B), b0);
@@ -123,7 +123,7 @@ test('同一版本换绑：带旧期望目录的请求全部拒绝，不写入�
     const ma = await readManifestJson(A);
     await assert.rejects(h.api.uninstallProject('200', VIEW, A), /绑定已变更/);
     await assert.rejects(h.api.uninstallFolder('ModN', VIEW, A), /绑定已变更/);
-    await assert.rejects(h.api.update('200', VIEW, true, A), /绑定已变更/);
+    await assert.rejects(h.api.update('200', VIEW, true, await recordOf(A, '200'), A), /绑定已变更/);
     await assert.rejects(h.api.updateAll(VIEW, A), /绑定已变更/);
     await assert.rejects(h.api.install('300', VIEW, A), /绑定已变更/);
     await assert.rejects(h.api.checkUpdates(VIEW, A), /绑定已变更/);
@@ -169,9 +169,9 @@ test('正常来源：经 IPC 安装、更新、重装、卸载、恢复都作用
     src.set('300', VIEW, { name: 'P', fileId: '2', zip: zipOf('ModP', 'p2'), versions: ['12.1.5'] });
     const items = itemsOf(await h.api.checkUpdates(VIEW, A), VIEW, A);
     assert.equal(items.find((i) => i.modId === '300')?.hasUpdate, true);
-    assert.match(((await h.api.update('300', VIEW, false, A)) as { message: string }).message, /已更新到/);
+    assert.match(((await h.api.update('300', VIEW, false, await recordOf(A, '300'), A)) as { message: string }).message, /已更新到/);
     assert.match(await readAddonFile(A, 'ModP', 'ModP.toc'), /p2/);
-    assert.match(((await h.api.update('300', VIEW, true, A)) as { message: string }).message, /已重新安装/);
+    assert.match(((await h.api.update('300', VIEW, true, await recordOf(A, '300'), A)) as { message: string }).message, /已重新安装/);
 
     await h.api.uninstallProject('300', VIEW, A);
     assert.ok(!(await listAddOns(A)).includes('ModP'));

@@ -7,7 +7,7 @@ import { ClientUpdater, type SparkleBridge } from '../src/core/client-update';
 import { MUTATING_CHANNELS } from '../src/core/gate';
 import type { AddonWatchSnapshot, UpdateCheckItem } from '../src/shared/types';
 import { addonEntries, cleanup, FakeSource, makeGameRoot, makeManager, makeZip, tmpDir } from './helpers';
-import { createHarness, ipcCalls } from './ipc-harness';
+import { createHarness, ipcCalls, recordOf } from './ipc-harness';
 
 const F = 9;
 const zipOf = (folder: string, v: string) => makeZip(addonEntries(folder, v));
@@ -75,7 +75,7 @@ test('写后失效：经 IPC 更新插件后该目录结果按新清单重校验
   try {
     src.set('1', F, { name: 'M1', fileId: '2', zip: zipOf('M1', 'v2') });
     await h.api.checkUpdates(F, A);
-    await h.api.update('1', F, false, A);
+    await h.api.update('1', F, false, await recordOf(A, '1'), A);
     const latestCalls = src.calls.filter((c) => c.startsWith('latest:')).length;
     const e = await waitFor(async () => {
       const x = entryOf(await h.api.watchState(), A);
@@ -293,8 +293,8 @@ test('写后失效钩子：install、update(force=false / true) 按实际参数�
     const origInvalidate = w.invalidateFlavor.bind(w);
     w.afterWrite = (f, r) => (writes.push([f, r]), origWrite(f, r));
     w.invalidateFlavor = (f) => (invalidations.push(f), origInvalidate(f));
-    await h.api.update('1', F, false, A);
-    await h.api.update('1', F, true, A);
+    await h.api.update('1', F, false, await recordOf(A, '1'), A);
+    await h.api.update('1', F, true, await recordOf(A, '1'), A);
     await assert.rejects(h.api.install('9', F, A));
     assert.deepEqual(writes, [[F, A], [F, A], [F, A]]);
     h.stub.pick = null; // 取消选择

@@ -141,11 +141,16 @@ async function setup({ updatable, current = [], withB = false, source = new Fake
     T.handleTask(e);
   });
   h.api.onAddonWatch((s) => S.applyWatch(s));
+  // 0.1.5：进行中的状态来自主进程活动快照（先订阅推送再获取），任务面板按接受的快照恢复卡片
+  h.api.onActivity((s) => S.applyActivity(s));
+  S.onActivityAccepted(T.syncTasks);
   dom.modalRoot().replaceChildren();
   dom.toastRoot().replaceChildren();
   panel().replaceChildren();
   S.state.busy.clear();
-  S.state.tasks.clear();
+  S.state.notes.clear();
+  S.state.activity = null;
+  await S.syncActivity();
   S.state.watch = null;
   S.state.localError = null;
   S.state.config = { flavors: [{ id: F, name: '无限', versions: ['1.60.1'], interfaceNumber: 16001, online: true }], categories: [], defaultFlavorId: F, configError: null };
@@ -348,7 +353,7 @@ test('全部更新中途换绑 A→B：B 中同一插件不显示 A 的进度、
     assert.equal(leftovers.length, 2);
     assert.ok(leftovers.every((e) => e.root === A && e.message === '全部更新已停止，这一项未处理'));
     assert.equal(cards().length, 1, '未开始的项目不新建“已取消”卡片');
-    assert.ok([...S.state.tasks.values()].every((r) => S.isFinalPhase(r.phase)), '没有残留的等待状态');
+    assert.deepEqual([S.state.activity.tasks, S.state.activity.batches], [[], []], '没有残留的等待状态');
     assert.deepEqual(await H.snapshot(B), b0, 'B 没有被写入');
 
     // 换回 A：第一项是提交的新版本；未开始的两项保持旧版本、显示未处理且可以操作
@@ -372,8 +377,9 @@ test('全部更新：计划确定之前（批次正在重新检查）该目标�
   try {
     source.pause();
     const run = L.doUpdateAll();
-    await until(() => H.ipcCalls.some((c) => c.channel === 'addon:updateAll'), '已发起全部更新');
-    assert.deepEqual([...S.state.tasks.keys()], [], '计划尚未确定');
+    await until(() => H.ipcCalls.some((c) => c.channel === 'addon:updateAll') && S.state.activity.batches.length === 1, '已发起全部更新、主进程已登记批次');
+    assert.deepEqual(S.state.activity.tasks, [], '计划尚未确定');
+    assert.deepEqual(S.state.activity.batches.map((b) => [b.root, b.stage]), [[S.currentTarget().root, 'checking']], '主进程已登记批次（检查中）');
     const ipc0 = H.ipcCalls.length;
     for (const id of ['100', '200', '300']) {
       assert.ok(buttons(id).every((b) => b.disabled));
@@ -473,8 +479,9 @@ test('列表尚未就绪时收到提交（A→其他版本→A）：提交之前
     assert.equal(reads(), reads0, '列表未就绪时收到完成不重启读取（不会排到第二项的目录锁之后）');
     // 其他版本同一插件编号的完成：不重启读取，也不套用到 A
     const other = { label: 'x', flavorId: OTHER, root: '/other/root', modId: first };
-    S.applyTask({ ...other, taskId: 'o1', phase: 'queued' });
-    S.applyTask({ ...other, taskId: 'o1', phase: 'done', installed: { flavorId: OTHER, fileId: '9', version: 'v9', name: 'x', logo: null, folders: ['X'], installedAt: 1 } });
+    const rev = S.state.activity.rev;
+    S.applyTask({ ...other, taskId: 'o1', phase: 'queued', rev: rev + 1000 });
+    S.applyTask({ ...other, taskId: 'o1', phase: 'done', rev: rev + 1001, installed: { flavorId: OTHER, fileId: '9', version: 'v9', name: 'x', logo: null, folders: ['X'], installedAt: 1 } });
     assert.equal(reads(), reads0);
 
     held.release();
@@ -568,9 +575,14 @@ test('提交成功后只读同步失败：不算安装失败、不猜测状态�
 test('任务事件只按 目标 + 插件编号 关联：其他目录 / 其他版本的事件、旧任务或重复的终态都不影响当前行', async () => {
   const { base, A, B, h, p } = await setup({ updatable: ['200'], withB: true });
   try {
-    const ev = (o) => ({ label: 'openmap', flavorId: F, root: A, modId: '200', ...o });
+    // 0.1.5：是否进行中来自主进程活动快照，事件带来下载字节数与终态；两者共用一个 rev 序列
+    const instance = S.state.activity.instance;
+    let rev = S.state.activity.rev;
+    const task = (o = {}) => ({ taskId: 'x2', label: 'openmap', flavorId: F, root: A, modId: '200', phase: 'downloading', received: 10, total: 100, batchId: null, ...o });
+    const snap = (tasks, at = ++rev) => ({ instance, rev: at, batches: [], tasks, reservations: [] });
+    const ev = (o) => ({ label: 'openmap', flavorId: F, root: A, modId: '200', rev: ++rev, ...o });
     const rec = (fileId) => ({ flavorId: F, fileId, version: `v${fileId}`, name: 'openmap', logo: null, folders: ['OpenMap'], installedAt: 1 });
-    S.applyTask(ev({ taskId: 'x2', phase: 'downloading', received: 10, total: 100 }));
+    assert.equal(S.applyActivity(snap([task()])), true);
     S.applyTask(ev({ taskId: 'x1', phase: 'failed', message: '旧任务' }));
     assert.equal(S.rowTask('200').taskId, 'x2', '旧任务的终态不清除更晚的任务');
     assert.match(rowText('200'), /下载中 10%/);
@@ -583,9 +595,12 @@ test('任务事件只按 目标 + 插件编号 关联：其他目录 / 其他版
     assert.ok(buttons('200').includes(btn), '按钮节点不变');
     assert.equal(btn.textContent, '下载中 47%');
     assert.equal(btn.disabled, true);
+    // 迟到的旧快照（10%）被丢弃，进度不倒退；比快照旧的事件也不覆盖快照
+    assert.equal(S.applyActivity(snap([task()], rev - 3)), false);
+    assert.equal(S.rowTask('200').percent, 47);
 
     S.applyTask(ev({ taskId: 'y1', phase: 'done', root: '/other/root', installed: rec('9') }));
-    S.applyTask(ev({ taskId: 'y2', phase: 'queued', flavorId: OTHER }));
+    S.applyActivity(snap([task({ received: 47 }), task({ taskId: 'y2', flavorId: OTHER, phase: 'queued' })]));
     assert.equal(p('200').fileId, '1', '其他目录的完成结果不写到当前行');
     assert.equal(S.rowTask('200').taskId, 'x2', '其他版本的同一插件不影响当前行');
 
@@ -593,7 +608,7 @@ test('任务事件只按 目标 + 插件编号 关联：其他目录 / 其他版
     assert.equal(p('200').fileId, '2');
     S.applyTask(ev({ taskId: 'x2', phase: 'done', installed: rec('3') }));
     assert.equal(p('200').fileId, '2', '同一任务只结算一次');
-    assert.equal(S.rowTask('200'), undefined);
+    assert.equal(S.rowTask('200'), undefined, '收到终态后即使快照尚未追上也不再显示进行中');
 
     // 列表尚未就绪时目录已改绑到 B：A 的提交记录不会套用到 B 中同一插件
     await h.settings.bind(F, B);

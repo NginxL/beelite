@@ -44,7 +44,12 @@ const reset = () => {
   dom.toastRoot().replaceChildren();
   calls.length = 0;
   S.state.busy.clear();
+  // 0.1.5：主进程插件操作状态已取得且没有进行中的操作（真实启动时界面先取得这个状态）
+  S.state.activity = idle();
+  S.state.activityError = null;
 };
+let activityRev = 0;
+const idle = (o = {}) => ({ instance: 'notes-test', rev: ++activityRev, batches: [], tasks: [], reservations: [], ...o });
 const show = async (o) => {
   latest = stateOf(o);
   push(latest);
@@ -209,4 +214,67 @@ test('手动打开更新说明同样不叠在已有确认框上，也不插进�
   clickModalButton(dom, '稍后');
   await tick();
   assert.ok(!calls.some((c) => c[0] === 'update'));
+});
+
+// 0.1.5 的用例使用新的界面模块实例（上面的重新载入用例已让另一个实例接管侧栏与状态推送）
+let Cn = null;
+async function freshNotes() {
+  if (!Cn) {
+    Cn = await import(path.join(web, 'client-update.js') + '?reload=activity');
+    Cn.initClientUpdate();
+    await tick();
+  }
+  return Cn;
+}
+
+test('0.1.5 重新载入后本界面没有本地占用、但主进程有进行中的批次 / 下载任务 / 卸载时：不自动弹出说明、不回执、不更新；结束后才弹出，只回执', async () => {
+  const root = '/fixture/A/_forever_';
+  const busyStates = [
+    { batches: [{ batchId: 'b1', flavorId: 9, root, stage: 'checking' }] },
+    { tasks: [{ taskId: 't1', label: 'x', flavorId: 9, root, modId: '1', phase: 'downloading', received: 35, total: 100, batchId: null }] },
+    { reservations: [{ flavorId: 6, root: '/fixture/B/_classic_', modId: '2', kind: 'uninstall' }] },
+  ];
+  const Cn = await freshNotes();
+  let n = 0;
+  for (const busy of busyStates) {
+    reset();
+    await show({ availableVersion: `0.6.${n}`, availableBuild: `0.6.${n++}` });
+    assert.equal(S.state.busy.size, 0, '本界面没有本地占用（重新载入后的情形）');
+    assert.equal(S.applyActivity(idle(busy)), true);
+    Cn.maybePromptNotes();
+    assert.equal(openModals(dom).length, 0, `后台有进行中的操作时不弹出：${Object.keys(busy)[0]}`);
+    sideButton('更新说明').click();
+    assert.equal(openModals(dom).length, 0, '手动打开说明同样等待');
+    await tick();
+    assert.deepEqual(calls, [], '没有回执，也没有更新');
+    // 后台操作结束（推送空状态）
+    assert.equal(S.applyActivity(idle()), true);
+    Cn.maybePromptNotes();
+    assert.equal(openModals(dom).length, 1);
+    clickModalButton(dom, '稍后');
+    await tick();
+    assert.deepEqual(calls.map((c) => c[0]), ['ack'], '只回执，不更新');
+  }
+});
+
+test('0.1.5 主进程插件操作状态：首次同步尚未完成时推迟自动说明；获取失败时不因此无限推迟；侧栏“下载并更新”不受影响', async () => {
+  const Cn = await freshNotes();
+  reset();
+  S.state.activity = null;
+  await show({ availableVersion: '0.7.0', availableBuild: '0.7.0' });
+  Cn.maybePromptNotes();
+  assert.equal(openModals(dom).length, 0, '同步中：推迟');
+  S.state.activityError = '读取失败（测试）';
+  Cn.maybePromptNotes();
+  assert.equal(openModals(dom).length, 1, '获取失败：照常展示说明');
+  clickModalButton(dom, '稍后');
+  await tick();
+  assert.deepEqual(calls.map((c) => c[0]), ['ack']);
+  // 后台有进行中的操作时，用户明确点击侧栏“下载并更新”仍按原流程授权该构建（安装前的等待由主进程的写入闸门负责）
+  reset();
+  S.applyActivity(idle({ reservations: [{ flavorId: 9, root: '/fixture/A/_forever_', modId: '1', kind: 'update' }] }));
+  await show({ notice: false, availableVersion: '0.7.1', availableBuild: '0.7.1' });
+  sideButton('下载并更新').click();
+  await tick();
+  assert.deepEqual(calls, [['update', '0.7.1']]);
 });

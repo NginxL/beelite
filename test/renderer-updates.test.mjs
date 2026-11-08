@@ -73,6 +73,9 @@ async function setup() {
   const h = H.createHarness({ settingsFile: path.join(base, 'settings.json'), source: src });
   await h.settings.bind(F, A);
   globalThis.window.beelite = h.api;
+  // 0.1.5：插件写入口在取得主进程活动状态之后才可用（与真实启动顺序一致：先订阅推送再获取快照）
+  h.api.onActivity((s) => S.applyActivity(s));
+  await S.syncActivity();
   dom.modalRoot().replaceChildren();
   dom.toastRoot().replaceChildren();
   S.state.busy.clear();

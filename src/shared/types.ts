@@ -212,6 +212,58 @@ export interface TaskEvent {
   message?: string;
   /** 只出现在 done 中，且仅当这次确实提交了新的清单记录（“已是最新”等未改动的情况没有） */
   installed?: InstalledRecord;
+  /** 发送时主进程活动状态的版本（与 ActivitySnapshot.rev 同一序列）：界面据此判断事件与快照谁更新 */
+  rev: number;
+}
+
+/** 更新或重装时界面看到的安装记录：主进程在目录锁内核对，与当前清单不一致时不写入 */
+export interface ExpectedRecord {
+  fileId: string;
+  installedAt: number;
+}
+
+export type ActivePhase = 'queued' | 'checking' | 'downloading' | 'verifying' | 'installing';
+
+/** 进行中的安装 / 更新任务（批次中排队的项目也在内） */
+export interface ActivityTask {
+  taskId: string;
+  label: string;
+  flavorId: number;
+  root: string;
+  modId: string;
+  phase: ActivePhase;
+  received: number | null;
+  total: number | null;
+  /** 所属的全部更新；单项操作为 null */
+  batchId: string | null;
+}
+
+/** 进行中的全部更新；checking：正在重新检查（计划未定），running：计划已确定、逐项处理 */
+export interface ActivityBatch {
+  batchId: string;
+  flavorId: number;
+  root: string;
+  stage: 'checking' | 'running';
+}
+
+/** 已受理、尚未结束的单个插件写操作（安装、更新、重装、卸载） */
+export interface ActivityReservation {
+  flavorId: number;
+  root: string;
+  modId: string;
+  kind: 'install' | 'update' | 'uninstall';
+}
+
+/**
+ * 主进程的插件写操作状态（界面重新载入后据此恢复占用与进度）。同一次运行内 rev 单调递增，
+ * 任务事件携带同一序列的 rev；界面先订阅推送再获取快照，按 rev 丢弃过时的一方。
+ */
+export interface ActivitySnapshot {
+  instance: string;
+  rev: number;
+  batches: ActivityBatch[];
+  tasks: ActivityTask[];
+  reservations: ActivityReservation[];
 }
 
 export interface OpResult {
@@ -281,8 +333,10 @@ export interface BeeLiteApi {
   localState(flavorId: number): Promise<LocalState>;
   /** 手动检查：完成一次有效检查后返回主进程的权威快照（含合并后的结果与 rev）；结果作废时报错 */
   checkUpdates(flavorId: number, root: string): Promise<AddonWatchSnapshot>;
+  /** 首次安装：插件已在该目录中托管时不做改动 */
   install(modId: string, flavorId: number, root: string): Promise<OpResult>;
-  update(modId: string, flavorId: number, force: boolean, root: string): Promise<OpResult>;
+  /** 更新或重装（force）：expected 是界面看到的安装记录，与目录锁内读到的不一致时不做改动 */
+  update(modId: string, flavorId: number, force: boolean, expected: ExpectedRecord, root: string): Promise<OpResult>;
   updateAll(flavorId: number, root: string): Promise<OpResult>;
   uninstallProject(modId: string, flavorId: number, root: string): Promise<OpResult>;
   uninstallFolder(folder: string, flavorId: number, root: string): Promise<OpResult>;
@@ -290,4 +344,7 @@ export interface BeeLiteApi {
   purge(entryId: string, flavorId: number, root: string): Promise<OpResult>;
   cancelTask(taskId: string): Promise<void>;
   onTask(cb: (e: TaskEvent) => void): () => void;
+  /** 主进程当前的插件写操作状态（只读） */
+  activityState(): Promise<ActivitySnapshot>;
+  onActivity(cb: (s: ActivitySnapshot) => void): () => void;
 }

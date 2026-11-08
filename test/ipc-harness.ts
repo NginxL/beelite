@@ -4,7 +4,7 @@
 import { createHash } from 'node:crypto';
 import { lstat, readdir, readFile } from 'node:fs/promises';
 import path from 'node:path';
-import type { BeeLiteApi } from '../src/shared/types';
+import type { BeeLiteApi, ExpectedRecord } from '../src/shared/types';
 import type { ManagerOptions } from '../src/core/manager';
 import { MutationGate } from '../src/core/gate';
 import { SettingsStore } from '../src/core/profiles';
@@ -141,6 +141,13 @@ export async function snapshot(dir: string): Promise<Record<string, string>> {
   return out;
 }
 
-export async function readManifestJson(root: string): Promise<{ projects: Record<string, { flavorId: number; fileId: string; folders: string[] }>; recovery: { id: string; kind: string; folders: string[] }[] }> {
+export async function readManifestJson(root: string): Promise<{ projects: Record<string, { flavorId: number; fileId: string; folders: string[]; installedAt: number }>; recovery: { id: string; kind: string; folders: string[] }[] }> {
   return JSON.parse(await readFile(path.join(root, 'Interface', '.beelite', 'manifest.json'), 'utf8'));
+}
+
+/** 清单中某个插件当前的安装记录（更新 / 重装请求需要带上界面看到的记录） */
+export async function recordOf(root: string, modId: string): Promise<ExpectedRecord> {
+  const p = (await readManifestJson(root)).projects[modId];
+  if (!p) throw new Error(`清单中没有 ${modId}`);
+  return { fileId: p.fileId, installedAt: p.installedAt };
 }

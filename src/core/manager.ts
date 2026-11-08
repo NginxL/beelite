@@ -37,10 +37,20 @@ export interface ManagerOptions {
 /** 安装结果；installed 是本次提交到清单的记录，没有提交（已是最新、用户取消）时缺省 */
 export type InstallResult = OpResult & { installed?: ProjectRecord };
 
+/**
+ * 安装前在目录锁内核对的条件（读到当前清单之后、下载之前）。不满足时以 UserError('changed') 结束，不写入任何东西。
+ * - absent：首次安装，插件尚未在该目录托管；
+ * - record：更新或重装，插件仍托管、且安装记录（文件编号 + 安装时间）与受理时一致。
+ * 缺省时不核对（只供内部与测试使用）。
+ */
+export type InstallExpect = { kind: 'absent' } | { kind: 'record'; fileId: string; installedAt: number };
+
 export interface InstallOptions {
+  /** 即使已是最新文件也重新下载安装（重装）；仍须满足 expect */
   force?: boolean;
   signal?: AbortSignal;
   onPhase?: (phase: TaskPhase, received?: number, total?: number) => void;
+  expect?: InstallExpect;
 }
 
 const BLOCKED_PREFIX = '该游戏目录有一个未完成且无法自动判定的操作，已暂停写入以保护插件。';
@@ -292,6 +302,16 @@ export class AddonManager {
           `「${existing.name}」已以「${getFlavor(existing.flavorId)?.name ?? existing.flavorId}」版本安装在这个目录，与当前游戏版本不同，蜂简不会用当前版本的文件更新或重装它。如需改用当前版本，请先卸载再安装。`,
           'flavor-mismatch',
         );
+      }
+      const expect = o.expect;
+      if (expect?.kind === 'absent' && existing) {
+        throw new UserError(`「${existing.name}」已经安装在这个目录，未做任何改动`, 'changed');
+      }
+      if (expect?.kind === 'record') {
+        if (!existing) throw new UserError(`「${detail.name}」已不在这个目录的蜂简管理列表中（可能已被卸载），未做任何改动`, 'changed');
+        if (existing.fileId !== expect.fileId || existing.installedAt !== expect.installedAt) {
+          throw new UserError(`「${existing.name}」在操作受理后已被重新安装、更新或恢复，未做任何改动，请刷新后重试`, 'changed');
+        }
       }
       if (existing && !o.force && existing.fileId === latest.fileId) {
         return { ok: true, message: `「${existing.name}」已是最新版本` };

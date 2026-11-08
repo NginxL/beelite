@@ -40,6 +40,9 @@ async function setup() {
   await h.settings.bind(VIEW, A);
   await h.settings.bind(SRC, B);
   globalThis.window.beelite = h.api;
+  // 0.1.5：插件写入口在取得主进程活动状态之后才可用（与真实启动顺序一致：先订阅推送再获取快照）
+  h.api.onActivity((s) => S.applyActivity(s));
+  await S.syncActivity();
   dom.modalRoot().replaceChildren();
   dom.toastRoot().replaceChildren();
   S.state.busy.clear();
@@ -163,13 +166,17 @@ test('异来源插件：更新与重装在渲染层即被拒绝；发现页/详�
     assert.equal(A_.modActionButton({ id: '200', accessible: true }).textContent, '更新');
 
     H.ipcCalls.length = 0;
+    // 0.1.5：更新 / 重装带上界面看到的安装记录（目录锁内核对），期望目录仍是最后一个参数
+    const r1 = { fileId: p('200').fileId, installedAt: p('200').installedAt };
     await A_.updateProject(p('200'), false);
     await L.doUpdateAll();
+    const r2 = { fileId: p('200').fileId, installedAt: p('200').installedAt };
+    assert.equal(r2.fileId, '2');
     await A_.updateProject(p('200'), true);
     assert.deepEqual(writes(), [
-      ['addon:update', '200', VIEW, false, A],
+      ['addon:update', '200', VIEW, false, r1, A],
       ['addon:updateAll', VIEW, A],
-      ['addon:update', '200', VIEW, true, A],
+      ['addon:update', '200', VIEW, true, r2, A],
     ]);
     const manifest = await H.readManifestJson(A);
     assert.equal(manifest.projects['200'].fileId, '2');

@@ -13,7 +13,10 @@ export interface UpdateAllOptions {
   flavorId: number;
   /** 每项开始前调用：该根目录是否仍是用户当前绑定的目录 */
   isStillBound: () => Promise<boolean>;
-  /** 对固定根目录执行一项更新 */
+  /**
+   * 对固定根目录执行一项更新；project 是计划时清单中的记录，实现应在目录锁内核对它仍是当前记录，
+   * 不一致时以 UserError('changed') 结束（计为“排队期间已变化”，不计为成功、失败或取消）
+   */
   installOne: (project: ProjectRecord, root: string) => Promise<OpResult>;
   /**
    * 批次开始时的更新检查（必须是新的检查，不使用缓存结果）。默认直接调用 manager.checkUpdates；
@@ -56,6 +59,8 @@ export async function runUpdateAll(o: UpdateAllOptions): Promise<OpResult> {
   let updated = 0;
   let cancelled = 0;
   const failed: string[] = [];
+  /** 排队期间被卸载、重装或恢复，未处理 */
+  const stale: string[] = [];
   let stopped = false;
   o.plan?.(todo.map((c) => manifest.projects[c.modId]));
   for (const c of todo) {
@@ -71,6 +76,7 @@ export async function runUpdateAll(o: UpdateAllOptions): Promise<OpResult> {
     } catch (err) {
       // 用户在任务中取消的这一项计为取消，不计为失败；批次继续处理下一项
       if (err instanceof UserError && err.code === 'cancelled') cancelled++;
+      else if (err instanceof UserError && err.code === 'changed') stale.push(`${p.name}：排队期间已变化，未处理。${errorMessage(err)}`);
       else failed.push(`${p.name}：${errorMessage(err)}`);
     }
   }
@@ -78,12 +84,13 @@ export async function runUpdateAll(o: UpdateAllOptions): Promise<OpResult> {
   const parts = [`已更新 ${updated} 个插件`];
   if (cancelled) parts.push(`取消 ${cancelled} 个`);
   if (failed.length) parts.push(`失败 ${failed.length} 个`);
+  if (stale.length) parts.push(`排队期间已变化未处理 ${stale.length} 个`);
   if (checkFailed.length) parts.push(`检查失败 ${checkFailed.length} 个`);
   if (changed.length) parts.push(`检查后发生变化未处理 ${changed.length} 个`);
   if (skipped.length) parts.push(`跳过其他游戏版本来源的 ${skipped.length} 个`);
-  const warnings = [...failed, ...checkFailed, ...changedNotes, ...skipped];
+  const warnings = [...failed, ...stale, ...checkFailed, ...changedNotes, ...skipped];
   if (stopped) {
-    const rest = todo.length - updated - cancelled - failed.length;
+    const rest = todo.length - updated - cancelled - failed.length - stale.length;
     parts.push(`游戏目录绑定已变更，剩余 ${rest} 个未处理`);
   }
   return { ok: updated === todo.length && checkFailed.length === 0 && changed.length === 0, message: parts.join('，'), warnings };
