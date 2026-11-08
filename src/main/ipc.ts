@@ -8,7 +8,7 @@ import { DEFAULT_FLAVOR_ID, FLAVORS, getFlavor, interfaceFromVersion } from '../
 import { runUpdateAll } from '../core/batch';
 import type { ClientUpdater } from '../core/client-update';
 import { guardHandler, type MutationGate } from '../core/gate';
-import { AddonManager } from '../core/manager';
+import { AddonManager, type ManagerOptions } from '../core/manager';
 import { isValidModuleName } from '../core/paths';
 import { inspectPickedRoot, SettingsStore } from '../core/profiles';
 import { NewBeeBoxProvider } from '../core/provider';
@@ -35,6 +35,11 @@ function folderArg(v: unknown): string {
   if (typeof v !== 'string' || !isValidModuleName(v)) throw new UserError('目录名无效');
   return v;
 }
+/** 界面期望的目标目录：只用于与主进程解析出的绑定目录比对，绝不作为写入路径 */
+function expectedRootArg(v: unknown): string {
+  if (typeof v !== 'string' || v.length === 0 || v.length > 4096 || v.includes('\0') || !path.isAbsolute(v)) throw new UserError('目标目录参数无效');
+  return v;
+}
 function queryArg(v: unknown): SearchQuery {
   if (typeof v !== 'object' || v === null) throw new UserError('搜索参数无效');
   const q = v as Record<string, unknown>;
@@ -52,6 +57,8 @@ export interface ServiceDeps {
   settings: SettingsStore;
   provider: NewBeeBoxProvider;
   gate: MutationGate;
+  /** 测试注入：替换插件下载实现，避免访问真实接口 */
+  download?: ManagerOptions['download'];
 }
 
 export class AppService {
@@ -64,6 +71,7 @@ export class AppService {
   constructor(private readonly deps: ServiceDeps) {
     this.manager = new AddonManager({
       source: deps.provider,
+      download: deps.download,
       confirm: async (req) => {
         const win = deps.getWindow();
         const opts = { type: 'warning' as const, title: req.title, message: req.message, detail: req.detail, buttons: ['继续', '取消'], defaultId: 1, cancelId: 1 };
@@ -98,8 +106,20 @@ export class AppService {
     return p.root;
   }
 
+  /**
+   * 操作目标：写入路径只取自设置中该版本当前绑定的目录；expected 是界面在操作前（含确认前）记录的目录，
+   * 两者不一致说明绑定已变更，拒绝操作而不是转向新目录
+   */
+  private async targetRoot(flavorId: number, expected: string): Promise<string> {
+    const root = await this.boundRoot(flavorId);
+    if (root !== expected) throw new UserError('游戏目录绑定已变更，未做任何改动，请刷新后重试', 'target');
+    return root;
+  }
+
   async bind(flavorId: number): Promise<ProfileInfo | null> {
     const flavor = getFlavor(flavorId)!;
+    // 先确认设置文件可读取，避免选完目录才报错
+    await this.deps.settings.load();
     const win = this.deps.getWindow();
     let defaultPath = WOW_APP_DIR;
     if (flavor.expectedDir) {
@@ -140,9 +160,8 @@ export class AppService {
     return this.manager.localState({ ...profile, root: profile.root }, flavorId);
   }
 
-  /** 以任务形式执行安装/更新，向界面推送进度，可取消 */
-  private async runInstall(modId: string, flavorId: number, force: boolean, fixedRoot?: string): Promise<OpResult> {
-    const root = fixedRoot ?? (await this.boundRoot(flavorId));
+  /** 以任务形式执行安装/更新，向界面推送进度，可取消；root 在受理时已确定，之后即使换绑也只写入它 */
+  private async runInstall(modId: string, flavorId: number, force: boolean, root: string): Promise<OpResult> {
     const taskId = `t${++this.taskSeq}`;
     const label = this.names.get(modId) ?? `插件 ${modId}`;
     const ac = new AbortController();
@@ -162,16 +181,17 @@ export class AppService {
     }
   }
 
-  /** 全部更新：批次固定在开始时绑定的目录，绑定变化即停止 */
-  async updateAll(flavorId: number): Promise<OpResult> {
-    const root = await this.boundRoot(flavorId);
+  /** 全部更新：批次固定在开始时绑定的目录，绑定变化即停止；只更新来源版本与当前版本一致的插件 */
+  async updateAll(flavorId: number, expected: string): Promise<OpResult> {
+    const root = await this.targetRoot(flavorId, expected);
     return runUpdateAll({
       manager: this.manager,
       root,
+      flavorId,
       isStillBound: async () => (await this.deps.settings.profile(flavorId)).root === root,
       installOne: (p, fixedRoot) => {
         this.names.set(p.modId, p.name);
-        return this.runInstall(p.modId, p.flavorId, false, fixedRoot);
+        return this.runInstall(p.modId, flavorId, false, fixedRoot);
       },
     });
   }
@@ -225,19 +245,27 @@ export class AppService {
     });
     handle('profile:list', async () => Promise.all(FLAVORS.map((f) => this.deps.settings.profile(f.id))));
     handle('profile:bind', (f) => this.bind(flavorArg(f)));
-    handle('profile:unbind', (f) => this.deps.settings.bind(flavorArg(f), null));
+    // 以下作用于某个游戏目录的操作：flavorId 是界面当前显示的版本，root 是界面记录的期望目录（只做比对）
+    handle('profile:unbind', (f, root) => this.deps.settings.bind(flavorArg(f), null, expectedRootArg(root)));
     handle('local:state', (f) => this.localState(flavorArg(f)));
-    handle('addon:check', async (f) => this.manager.checkUpdates(await this.boundRoot(flavorArg(f))));
-    handle('addon:install', (m, f) => this.runInstall(modArg(m), flavorArg(f), false));
-    handle('addon:update', (m, f, force) => {
-      if (typeof force !== 'boolean') throw new UserError('参数无效');
-      return this.runInstall(modArg(m), flavorArg(f), force);
+    handle('addon:check', async (f, root) => {
+      const flavorId = flavorArg(f);
+      return this.manager.checkUpdates(await this.targetRoot(flavorId, expectedRootArg(root)), flavorId);
     });
-    handle('addon:updateAll', (f) => this.updateAll(flavorArg(f)));
-    handle('addon:uninstall', async (m, f) => this.manager.uninstallProject(await this.boundRoot(flavorArg(f)), modArg(m)));
-    handle('addon:uninstallFolder', async (name, f) => this.manager.uninstallFolder(await this.boundRoot(flavorArg(f)), folderArg(name)));
-    handle('trash:restore', async (id, f) => this.manager.restore(await this.boundRoot(flavorArg(f)), entryArg(id)));
-    handle('trash:purge', async (id, f) => this.manager.purge(await this.boundRoot(flavorArg(f)), entryArg(id)));
+    handle('addon:install', async (m, f, root) => {
+      const flavorId = flavorArg(f);
+      return this.runInstall(modArg(m), flavorId, false, await this.targetRoot(flavorId, expectedRootArg(root)));
+    });
+    handle('addon:update', async (m, f, force, root) => {
+      if (typeof force !== 'boolean') throw new UserError('参数无效');
+      const flavorId = flavorArg(f);
+      return this.runInstall(modArg(m), flavorId, force, await this.targetRoot(flavorId, expectedRootArg(root)));
+    });
+    handle('addon:updateAll', (f, root) => this.updateAll(flavorArg(f), expectedRootArg(root)));
+    handle('addon:uninstall', async (m, f, root) => this.manager.uninstallProject(await this.targetRoot(flavorArg(f), expectedRootArg(root)), modArg(m)));
+    handle('addon:uninstallFolder', async (name, f, root) => this.manager.uninstallFolder(await this.targetRoot(flavorArg(f), expectedRootArg(root)), folderArg(name)));
+    handle('trash:restore', async (id, f, root) => this.manager.restore(await this.targetRoot(flavorArg(f), expectedRootArg(root)), entryArg(id)));
+    handle('trash:purge', async (id, f, root) => this.manager.purge(await this.targetRoot(flavorArg(f), expectedRootArg(root)), entryArg(id)));
     handle('task:cancel', async (id) => {
       if (typeof id === 'string') this.tasks.get(id)?.abort();
     });

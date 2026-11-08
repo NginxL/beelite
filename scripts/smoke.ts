@@ -104,7 +104,7 @@ async function main() {
   assert.deepEqual(st1.unmanaged.map((u) => u.name), ['ManualAddon']);
 
   step('检查更新与强制重装');
-  const checks = await manager.checkUpdates(root);
+  const checks = await manager.checkUpdates(root, FOREVER);
   console.log(`  ${checks.map((c) => `${c.modId}: ${c.hasUpdate ? '有更新' : '最新'}${c.error ? ` (${c.error})` : ''}`).join('，')}`);
   const re = await manager.install(root, FOREVER, SMALL, { force: true });
   assert.ok(re.ok);

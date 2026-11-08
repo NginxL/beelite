@@ -5,8 +5,8 @@ import { modKey, updateProject } from './actions.js';
 import { confirmDialog, h, modIcon, mount, spinner } from './dom.js';
 import { cleanTocText, formatDateTime } from './format.js';
 import {
-  api, bindDirectory, checkUpdates, currentFlavor, flavorName, isBlocked, isBusy,
-  on, projectHasUpdate, refreshLocal, runWrite, state, updateCount,
+  api, bindDirectory, checkUpdates, currentFlavor, flavorName, isBlocked, isBusy, isOtherFlavor,
+  on, projectHasUpdate, refreshLocal, requireTarget, runWrite, state, stillTarget, updateCount,
 } from './state.js';
 
 type Tab = 'managed' | 'unmanaged' | 'recovery';
@@ -86,9 +86,10 @@ function renderToolbar(): void {
   );
 }
 
-async function doUpdateAll(): Promise<void> {
-  const fid = state.flavorId;
-  await runWrite('updateAll', () => api().updateAll(fid));
+export async function doUpdateAll(): Promise<void> {
+  const t = requireTarget();
+  if (!t) return;
+  await runWrite('updateAll', () => api().updateAll(t.flavorId, t.root));
 }
 
 function renderBody(): void {
@@ -167,10 +168,12 @@ function managedRow(p: ManagedProjectView): HTMLElement {
   const hasUpdate = projectHasUpdate(p);
   const u = state.updates.get(p.modId);
   const missing = p.folders.filter((f) => !f.present).length;
-  const otherFlavor = p.flavorId !== state.flavorId;
+  const otherFlavor = isOtherFlavor(p);
+  const otherTitle = `该插件按「${flavorName(p.flavorId)}」版本安装，与当前游戏版本不同：可以卸载（卸载后可恢复），但不会检查更新、更新或重装。如需改用当前版本，请先卸载再安装。`;
 
   let status: HTMLElement | null = null;
   if (hasUpdate) status = h('span', { class: 'tag tag-accent', text: `可更新到 ${u?.latestVersion ?? '新版本'}` });
+  else if (u?.skipped) status = h('span', { class: 'tag tag-muted', text: '不检查更新', title: u.skipped });
   else if (u?.error) status = h('span', { class: 'small-error', text: u.error, title: u.error });
   else if (state.updatesChecked && u) status = h('span', { class: 'tag tag-muted', text: '已是最新' });
 
@@ -192,7 +195,7 @@ function managedRow(p: ManagedProjectView): HTMLElement {
     h('div', { class: 'row-main' },
       h('div', { class: 'row-title' },
         h('span', { class: 'row-name', text: p.name }),
-        h('span', { class: otherFlavor ? 'tag tag-warn' : 'tag', text: flavorName(p.flavorId), title: otherFlavor ? '该插件安装时选择的游戏版本与当前不同' : '' }),
+        h('span', { class: otherFlavor ? 'tag tag-warn' : 'tag', text: flavorName(p.flavorId), title: otherFlavor ? otherTitle : '' }),
         status,
       ),
       h('div', { class: 'row-meta' },
@@ -203,12 +206,12 @@ function managedRow(p: ManagedProjectView): HTMLElement {
     ),
     h('div', { class: 'row-actions' },
       busy ? h('span', { class: 'busy-text' }, spinner(true), '处理中') : null,
-      hasUpdate ? h('button', {
+      hasUpdate && !otherFlavor ? h('button', {
         class: 'btn btn-sm btn-primary', disabled: blocked || busy, title: disabledTitle,
         on: { click: () => void updateProject(p, false) },
       }, '更新') : null,
       h('button', {
-        class: 'btn btn-sm', disabled: blocked || busy, title: disabledTitle || '重新下载并安装最新文件',
+        class: 'btn btn-sm', disabled: blocked || busy || otherFlavor, title: disabledTitle || (otherFlavor ? otherTitle : '重新下载并安装最新文件'),
         on: { click: () => void updateProject(p, true) },
       }, '重装'),
       h('button', {
@@ -219,7 +222,10 @@ function managedRow(p: ManagedProjectView): HTMLElement {
   );
 }
 
-async function uninstallProject(p: ManagedProjectView): Promise<void> {
+/** 卸载：作用于当前显示的目录（包括来源版本不同的插件）；确认前记录目标，确认后复核 */
+export async function uninstallProject(p: ManagedProjectView): Promise<void> {
+  const t = requireTarget();
+  if (!t) return;
   const present = p.folders.filter((f) => f.present).map((f) => f.name);
   const ok = await confirmDialog({
     title: `卸载「${p.name}」？`,
@@ -228,8 +234,8 @@ async function uninstallProject(p: ManagedProjectView): Promise<void> {
     confirmText: '卸载',
     danger: true,
   });
-  if (!ok) return;
-  await runWrite(modKey(p.modId), () => api().uninstallProject(p.modId, p.flavorId));
+  if (!ok || !stillTarget(t)) return;
+  await runWrite(modKey(p.modId), () => api().uninstallProject(p.modId, t.flavorId, t.root));
 }
 
 // ---------- 未托管 ----------
@@ -296,8 +302,9 @@ function folderRow(f: LocalFolder): HTMLElement {
   );
 }
 
-async function trashFolder(f: LocalFolder): Promise<void> {
-  const fid = state.flavorId;
+export async function trashFolder(f: LocalFolder): Promise<void> {
+  const t = requireTarget();
+  if (!t) return;
   const ok = await confirmDialog({
     title: `移入回收站：${f.name}`,
     message: f.symlink
@@ -306,8 +313,8 @@ async function trashFolder(f: LocalFolder): Promise<void> {
     confirmText: '移入回收站',
     danger: true,
   });
-  if (!ok || fid !== state.flavorId) return;
-  await runWrite(`folder:${f.name}`, () => api().uninstallFolder(f.name, fid));
+  if (!ok || !stillTarget(t)) return;
+  await runWrite(`folder:${f.name}`, () => api().uninstallFolder(f.name, t.flavorId, t.root));
 }
 
 // ---------- 回收站 ----------
@@ -351,13 +358,15 @@ function recoveryRow(r: RecoveryEntryView): HTMLElement {
   );
 }
 
-async function restore(r: RecoveryEntryView): Promise<void> {
-  const fid = state.flavorId;
-  await runWrite(`recovery:${r.id}`, () => api().restore(r.id, fid));
+export async function restore(r: RecoveryEntryView): Promise<void> {
+  const t = requireTarget();
+  if (!t) return;
+  await runWrite(`recovery:${r.id}`, () => api().restore(r.id, t.flavorId, t.root));
 }
 
-async function purge(r: RecoveryEntryView): Promise<void> {
-  const fid = state.flavorId;
+export async function purge(r: RecoveryEntryView): Promise<void> {
+  const t = requireTarget();
+  if (!t) return;
   const first = await confirmDialog({
     title: '永久删除回收站条目？',
     message: `「${r.label}」中的目录将被彻底删除，无法再恢复。`,
@@ -372,8 +381,8 @@ async function purge(r: RecoveryEntryView): Promise<void> {
     confirmText: '永久删除',
     danger: true,
   });
-  if (!second || fid !== state.flavorId) return;
-  await runWrite(`recovery:${r.id}`, () => api().purge(r.id, fid));
+  if (!second || !stillTarget(t)) return;
+  await runWrite(`recovery:${r.id}`, () => api().purge(r.id, t.flavorId, t.root));
 }
 
 function emptyState(title: string, msg: string): HTMLElement {

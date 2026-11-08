@@ -2,7 +2,8 @@
 
 import type { ManagedProjectView } from '../shared/types';
 import { h, spinner } from './dom.js';
-import { api, ensureBound, findManaged, isBlocked, isBusy, projectHasUpdate, runWrite, state } from './state.js';
+import { toast } from './dom.js';
+import { api, ensureBound, findManaged, isBlocked, isBusy, isOtherFlavor, projectHasUpdate, requireTarget, runWrite, state } from './state.js';
 
 export const modKey = (modId: string): string => `mod:${modId}`;
 
@@ -11,11 +12,20 @@ export async function installMod(modId: string): Promise<void> {
   if (isBusy(modKey(modId))) return;
   if (!(await ensureBound())) return;
   if (fid !== state.flavorId) return; // 选目录期间切换了版本，放弃
-  await runWrite(modKey(modId), () => api().install(modId, fid));
+  const t = requireTarget();
+  if (!t || t.flavorId !== fid) return;
+  await runWrite(modKey(modId), () => api().install(modId, t.flavorId, t.root));
 }
 
+/** 更新或重装：目标是当前显示的版本与目录，而不是插件记录的来源版本；来源版本不同时拒绝（主进程同样拒绝） */
 export async function updateProject(p: ManagedProjectView, force: boolean): Promise<void> {
-  await runWrite(modKey(p.modId), () => api().update(p.modId, p.flavorId, force));
+  const t = requireTarget();
+  if (!t) return;
+  if (p.flavorId !== t.flavorId) {
+    toast(`「${p.name}」按其他游戏版本安装，不能用当前版本的文件更新或重装。如需改用当前版本，请先卸载再安装。`, 'error');
+    return;
+  }
+  await runWrite(modKey(p.modId), () => api().update(p.modId, t.flavorId, force, t.root));
 }
 
 /**
@@ -32,6 +42,9 @@ export function modActionButton(mod: { id: string; accessible: boolean }, block:
   }
   const blocked = isBlocked() ? '游戏目录当前不可写入' : null;
   const p = findManaged(mod.id);
+  if (p && isOtherFlavor(p)) {
+    return h('button', { class: 'btn btn-sm', disabled: true, title: '该插件在这个目录中按其他游戏版本安装，不能用当前版本更新；可在「我的插件」中卸载后再安装' }, '其他版本已安装');
+  }
   if (p) {
     if (projectHasUpdate(p)) {
       const reason = blocked ?? block;

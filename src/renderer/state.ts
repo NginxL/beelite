@@ -1,7 +1,7 @@
 // 全局状态：当前 flavor、本地状态、更新检查结果、进行中的写操作。各页面通过 on() 订阅变化。
 
 import type { AppConfig, BeeLiteApi, FlavorInfo, LocalState, ManagedProjectView, OpResult, UpdateCheckItem } from '../shared/types';
-import { toast } from './dom.js';
+import { confirmDialog, toast } from './dom.js';
 import { errMsg } from './format.js';
 
 declare global {
@@ -62,6 +62,41 @@ export function isBlocked(): boolean {
 
 export function findManaged(modId: string): ManagedProjectView | undefined {
   return state.local?.managed.find((p) => p.modId === modId);
+}
+
+// ---------- 操作目标（操作前记录，确认后复核） ----------
+
+/** 一次写操作的目标：当前显示的游戏版本及其绑定目录。主进程只把 root 当作期望值比对，不当作写入路径 */
+export interface Target {
+  flavorId: number;
+  root: string;
+}
+
+/** 当前显示的目标；本地状态未加载、刷新失败（显示的是旧结果）或与当前版本不一致时返回 null */
+export function currentTarget(): Target | null {
+  const local = state.local;
+  if (!local || state.localError || local.flavorId !== state.flavorId || !local.profile.root) return null;
+  return { flavorId: local.flavorId, root: local.profile.root };
+}
+
+/** 取当前目标；取不到时提示并返回 null */
+export function requireTarget(): Target | null {
+  const t = currentTarget();
+  if (!t) toast(state.localError ? '本地插件状态未能刷新，请先点击“刷新”重试' : '请先为当前游戏版本选择游戏目录', 'error');
+  return t;
+}
+
+/** 确认等异步步骤之后复核：目标未变才继续，否则提示并放弃 */
+export function stillTarget(t: Target): boolean {
+  const now = currentTarget();
+  if (now && now.flavorId === t.flavorId && now.root === t.root) return true;
+  toast('游戏版本或目录已变更，已取消本次操作，未做任何改动', 'warn');
+  return false;
+}
+
+/** 插件是否按当前显示的游戏版本安装（来源版本不同的只能卸载与恢复，不检查、不更新、不重装） */
+export function isOtherFlavor(p: ManagedProjectView): boolean {
+  return p.flavorId !== (state.local?.flavorId ?? state.flavorId);
 }
 
 /** 有更新：检查结果说有更新，且本地文件还不是最新文件（更新完成后自动失效） */
@@ -139,13 +174,23 @@ export async function bindDirectory(): Promise<boolean> {
   }
 }
 
+/** 解除当前版本的目录绑定：确认前记录目标，确认后复核，主进程再按期望目录比对 */
 export async function unbindDirectory(): Promise<void> {
-  const fid = state.flavorId;
   if (isBusy('bind')) return;
+  const t = requireTarget();
+  if (!t) return;
+  const ok = await confirmDialog({
+    title: '解除游戏目录绑定？',
+    message: '只会让蜂简忘记这个目录，不会删除或修改任何插件文件。之后可以重新选择。',
+    detail: [t.root],
+    confirmText: '解除绑定',
+  });
+  if (!ok || isBusy('bind') || !stillTarget(t)) return;
+  const fid = t.flavorId;
   state.busy.add('bind');
   emit('local');
   try {
-    await api().unbindProfile(fid);
+    await api().unbindProfile(fid, t.root);
     toast('已解除游戏目录绑定（不会删除任何文件）', 'success');
   } catch (err) {
     toast(errMsg(err), 'error');
@@ -194,21 +239,27 @@ let updateSeq = 0;
 
 export async function checkUpdates(silent = false): Promise<void> {
   if (isBusy('check')) return;
+  const t = requireTarget();
+  if (!t) return;
   const seq = ++updateSeq;
-  const fid = state.flavorId;
   state.busy.add('check');
   emit('local');
   try {
-    const items = await api().checkUpdates(fid);
-    if (seq !== updateSeq || fid !== state.flavorId) return;
+    const items = await api().checkUpdates(t.flavorId, t.root);
+    // 结果只属于发起时的版本与目录
+    const now = currentTarget();
+    if (seq !== updateSeq || !now || now.flavorId !== t.flavorId || now.root !== t.root) return;
     state.updates = new Map(items.map((i) => [i.modId, i]));
     state.updatesChecked = true;
     if (!silent) {
       const n = updateCount();
-      const errors = items.filter((i) => i.error).length;
-      if (errors === 0) toast(n > 0 ? `发现 ${n} 个插件可更新` : '所有插件均为最新', 'success');
-      else if (errors === items.length) toast(`检查更新失败（${errors} 个插件），请检查网络后重试`, 'error');
-      else toast(`${n > 0 ? `发现 ${n} 个插件可更新，` : ''}${errors} 个插件检查失败，其余已是最新`, 'warn');
+      const checked = items.filter((i) => !i.skipped);
+      const errors = checked.filter((i) => i.error).length;
+      const skipped = items.length - checked.length;
+      const skipNote = skipped ? `；${skipped} 个其他游戏版本来源的插件未检查` : '';
+      if (errors === 0) toast(`${n > 0 ? `发现 ${n} 个插件可更新` : checked.length ? '所有插件均为最新' : '没有可检查的插件'}${skipNote}`, 'success');
+      else if (errors === checked.length) toast(`检查更新失败（${errors} 个插件），请检查网络后重试${skipNote}`, 'error');
+      else toast(`${n > 0 ? `发现 ${n} 个插件可更新，` : ''}${errors} 个插件检查失败，其余已是最新${skipNote}`, 'warn');
     }
   } catch (err) {
     if (seq === updateSeq) toast(errMsg(err), 'error');

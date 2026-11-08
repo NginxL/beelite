@@ -2,7 +2,7 @@
 import { lstat, readFile, realpath } from 'node:fs/promises';
 import path from 'node:path';
 import type { ProfileInfo } from '../shared/types';
-import { UserError } from './errors';
+import { errorMessage, UserError } from './errors';
 import { FLAVORS, getFlavor } from './flavors';
 import { pathExists, writeFileAtomic } from './layout';
 
@@ -10,34 +10,62 @@ export interface Settings {
   schema: 1;
   bindings: Record<string, string>;
   lastFlavorId: number | null;
+  /** 不认识的顶层字段原样保留，保存时一并写回 */
+  [key: string]: unknown;
 }
 
-export class SettingsStore {
-  private cache: Settings | null = null;
+function isPlainObject(v: unknown): v is Record<string, unknown> {
+  return typeof v === 'object' && v !== null && !Array.isArray(v);
+}
 
+function settingsError(file: string, reason: string): UserError {
+  return new UserError(`无法读取蜂简设置文件（${file}）：${reason}。为避免覆盖已有的目录绑定，已暂停读取和修改绑定；请修复该文件或恢复备份后点击重试。`, 'settings');
+}
+
+/** 严格校验设置内容：任何不合法之处都报错，不丢弃条目（否则保存时会悄悄删掉它们） */
+function parseSettings(text: string, file: string): Settings {
+  let raw: unknown;
+  try {
+    raw = JSON.parse(text);
+  } catch {
+    throw settingsError(file, '内容不是有效的 JSON');
+  }
+  if (!isPlainObject(raw)) throw settingsError(file, '内容格式不正确');
+  if (raw.schema !== 1) throw settingsError(file, '版本标记不正确');
+  if (!isPlainObject(raw.bindings)) throw settingsError(file, '目录绑定格式不正确');
+  const bindings: Record<string, string> = {};
+  for (const [k, v] of Object.entries(raw.bindings)) {
+    if (!/^\d+$/.test(k) || typeof v !== 'string' || !path.isAbsolute(v)) throw settingsError(file, `目录绑定 ${JSON.stringify(k)} 不合法`);
+    bindings[k] = v;
+  }
+  const last = raw.lastFlavorId;
+  if (last !== undefined && last !== null && !(typeof last === 'number' && Number.isInteger(last))) throw settingsError(file, '上次选择的游戏版本不合法');
+  return { ...raw, schema: 1, bindings, lastFlavorId: last ?? null };
+}
+
+/**
+ * 不缓存：每次都从磁盘读取并校验。只有文件不存在才视为首次运行的空配置；
+ * 读取失败或内容不合法时一律报错，写入前也会先复核，保证不会覆盖用户原有的配置文件。
+ */
+export class SettingsStore {
   constructor(private readonly file: string) {}
 
   async load(): Promise<Settings> {
-    if (this.cache) return this.cache;
-    let s: Settings = { schema: 1, bindings: {}, lastFlavorId: null };
+    let text: string;
     try {
-      const raw = JSON.parse(await readFile(this.file, 'utf8')) as Partial<Settings>;
-      if (raw && typeof raw.bindings === 'object' && raw.bindings) {
-        for (const [k, v] of Object.entries(raw.bindings)) {
-          if (/^\d+$/.test(k) && typeof v === 'string' && path.isAbsolute(v)) s.bindings[k] = v;
-        }
-      }
-      if (typeof raw.lastFlavorId === 'number') s.lastFlavorId = raw.lastFlavorId;
-    } catch {
-      s = { schema: 1, bindings: {}, lastFlavorId: null };
+      text = await readFile(this.file, 'utf8');
+    } catch (err) {
+      const e = err as NodeJS.ErrnoException;
+      if (e.code === 'ENOENT') return { schema: 1, bindings: {}, lastFlavorId: null };
+      throw settingsError(this.file, e.code ? `读取失败（${e.code}）` : errorMessage(err));
     }
-    this.cache = s;
-    return s;
+    return parseSettings(text, this.file);
   }
 
+  /** 写入前复核磁盘上的当前配置仍可读取且合法，否则拒绝写入 */
   async save(next: Settings): Promise<void> {
+    await this.load();
     await writeFileAtomic(this.file, JSON.stringify(next, null, 1));
-    this.cache = next;
   }
 
   async profile(flavorId: number): Promise<ProfileInfo> {
@@ -46,8 +74,15 @@ export class SettingsStore {
     return { flavorId, root, addonsPath: root ? path.join(root, 'Interface', 'AddOns') : null };
   }
 
-  async bind(flavorId: number, root: string | null): Promise<ProfileInfo> {
-    const s = structuredClone(await this.load());
+  /**
+   * 绑定或解除绑定。expectCurrent 给出时，只有该版本当前绑定的目录（未绑定为 null）与之相同才写入，
+   * 用来防止界面确认期间绑定已被改变。
+   */
+  async bind(flavorId: number, root: string | null, expectCurrent?: string | null): Promise<ProfileInfo> {
+    const s = await this.load();
+    if (expectCurrent !== undefined && (s.bindings[String(flavorId)] ?? null) !== expectCurrent) {
+      throw new UserError('游戏目录绑定已变更，未做任何改动，请刷新后重试', 'target');
+    }
     if (root) {
       const other = Object.entries(s.bindings).find(([fid, r]) => Number(fid) !== flavorId && r === root);
       if (other) throw new UserError(`该目录已绑定给「${getFlavor(Number(other[0]))?.name ?? other[0]}」，同一目录不能用于两个游戏版本`);

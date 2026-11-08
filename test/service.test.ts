@@ -28,7 +28,7 @@ test('全部更新：检查全部失败时不得声称“全部最新”', async
   const src = new FakeSource();
   const m = await twoOutdated(root, src);
   src.mods.clear(); // 远端全部查询失败
-  const r = await runUpdateAll({ manager: m, root, isStillBound: async () => true, installOne: (p, r0) => m.install(r0, p.flavorId, p.modId) });
+  const r = await runUpdateAll({ manager: m, root, flavorId: F, isStillBound: async () => true, installOne: (p, r0) => m.install(r0, p.flavorId, p.modId) });
   assert.equal(r.ok, false);
   assert.doesNotMatch(r.message, /最新版本/);
   assert.match(r.message, /检查更新失败/);
@@ -41,7 +41,7 @@ test('全部更新：用户取消的项目不计为成功', async () => {
   const root = await makeGameRoot(base);
   const src = new FakeSource();
   const m = await twoOutdated(root, src);
-  const r = await runUpdateAll({ manager: m, root, isStillBound: async () => true, installOne: async () => ({ ok: false, message: '已取消安装，未做任何改动' }) });
+  const r = await runUpdateAll({ manager: m, root, flavorId: F, isStillBound: async () => true, installOne: async () => ({ ok: false, message: '已取消安装，未做任何改动' }) });
   assert.equal(r.ok, false);
   assert.match(r.message, /已更新 0 个插件/);
   assert.match(r.message, /取消 2 个/);
@@ -62,6 +62,7 @@ test('全部更新：批次中途换绑或解绑时停止，所有写入只发�
     const r = await runUpdateAll({
       manager: m,
       root: rootA,
+      flavorId: F,
       isStillBound: async () => (await settings.profile(F)).root === rootA,
       installOne: async (p, fixedRoot) => {
         writtenTo.push(fixedRoot);
@@ -85,7 +86,7 @@ test('全部更新：正常情况下全部更新成功', async () => {
   const root = await makeGameRoot(base);
   const src = new FakeSource();
   const m = await twoOutdated(root, src);
-  const r = await runUpdateAll({ manager: m, root, isStillBound: async () => true, installOne: (p, r0) => m.install(r0, p.flavorId, p.modId) });
+  const r = await runUpdateAll({ manager: m, root, flavorId: F, isStillBound: async () => true, installOne: (p, r0) => m.install(r0, p.flavorId, p.modId) });
   assert.equal(r.ok, true);
   assert.match(r.message, /已更新 2 个插件/);
   assert.match(await readFile(path.join(root, 'Interface', 'AddOns', 'M2', 'M2.toc'), 'utf8'), /v2/);

@@ -140,6 +140,8 @@ export interface UpdateCheckItem {
   latestFileId: string | null;
   latestVersion: string | null;
   error: string | null;
+  /** 来源游戏版本与目录当前绑定的版本不同：未检查，不会更新（说明文字） */
+  skipped?: string;
 }
 
 export type TaskPhase = 'queued' | 'checking' | 'downloading' | 'verifying' | 'installing' | 'done' | 'failed' | 'cancelled';
@@ -196,16 +198,17 @@ export interface BeeLiteApi {
   latestFile(modId: string, flavorId: number): Promise<ModFileInfo>;
   listProfiles(): Promise<ProfileInfo[]>;
   bindProfile(flavorId: number): Promise<ProfileInfo | null>;
-  unbindProfile(flavorId: number): Promise<ProfileInfo>;
+  // 以下作用于游戏目录的操作：flavorId 为界面当前显示的版本，root 为操作前记录的期望目录（主进程只做比对）
+  unbindProfile(flavorId: number, root: string): Promise<ProfileInfo>;
   localState(flavorId: number): Promise<LocalState>;
-  checkUpdates(flavorId: number): Promise<UpdateCheckItem[]>;
-  install(modId: string, flavorId: number): Promise<OpResult>;
-  update(modId: string, flavorId: number, force: boolean): Promise<OpResult>;
-  updateAll(flavorId: number): Promise<OpResult>;
-  uninstallProject(modId: string, flavorId: number): Promise<OpResult>;
-  uninstallFolder(folder: string, flavorId: number): Promise<OpResult>;
-  restore(entryId: string, flavorId: number): Promise<OpResult>;
-  purge(entryId: string, flavorId: number): Promise<OpResult>;
+  checkUpdates(flavorId: number, root: string): Promise<UpdateCheckItem[]>;
+  install(modId: string, flavorId: number, root: string): Promise<OpResult>;
+  update(modId: string, flavorId: number, force: boolean, root: string): Promise<OpResult>;
+  updateAll(flavorId: number, root: string): Promise<OpResult>;
+  uninstallProject(modId: string, flavorId: number, root: string): Promise<OpResult>;
+  uninstallFolder(folder: string, flavorId: number, root: string): Promise<OpResult>;
+  restore(entryId: string, flavorId: number, root: string): Promise<OpResult>;
+  purge(entryId: string, flavorId: number, root: string): Promise<OpResult>;
   cancelTask(taskId: string): Promise<void>;
   onTask(cb: (e: TaskEvent) => void): () => void;
 }

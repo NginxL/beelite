@@ -284,7 +284,10 @@ export class AddonManager {
       const { l, manifest } = await this.openForWrite(root);
       const existing = manifest.projects[modId];
       if (existing && existing.flavorId !== flavorId) {
-        throw new UserError(`该插件已以「${getFlavor(existing.flavorId)?.name ?? existing.flavorId}」版本安装在这个目录，请先卸载`);
+        throw new UserError(
+          `「${existing.name}」已以「${getFlavor(existing.flavorId)?.name ?? existing.flavorId}」版本安装在这个目录，与当前游戏版本不同，蜂简不会用当前版本的文件更新或重装它。如需改用当前版本，请先卸载再安装。`,
+          'flavor-mismatch',
+        );
       }
       if (existing && !o.force && existing.fileId === latest.fileId) {
         return { ok: true, message: `「${existing.name}」已是最新版本` };
@@ -496,12 +499,20 @@ export class AddonManager {
 
   // ---------- 更新检查 ----------
 
-  async checkUpdates(root: string, signal?: AbortSignal): Promise<UpdateCheckItem[]> {
+  /** 检查 root 中托管插件的更新；flavorId 是该目录当前绑定的游戏版本，来源版本不同的项目不查询、不视为可更新 */
+  async checkUpdates(root: string, flavorId: number, signal?: AbortSignal): Promise<UpdateCheckItem[]> {
     const info = await inspectLayout(root, false);
     if (!info.hasMeta) return [];
     const { manifest } = await readManifest(info.l);
-    const projects = Object.values(manifest.projects);
     const out: UpdateCheckItem[] = [];
+    const projects: ProjectRecord[] = [];
+    for (const p of Object.values(manifest.projects)) {
+      if (p.flavorId === flavorId) projects.push(p);
+      else {
+        const from = getFlavor(p.flavorId)?.name ?? String(p.flavorId);
+        out.push({ modId: p.modId, hasUpdate: false, latestFileId: null, latestVersion: null, error: null, skipped: `按「${from}」版本安装，与当前游戏版本不同，不检查更新` });
+      }
+    }
     let next = 0;
     const worker = async () => {
       while (next < projects.length) {

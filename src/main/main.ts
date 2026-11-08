@@ -8,6 +8,7 @@ import { displayName, resolveUserData } from '../core/identity';
 import { inspectPickedRoot, SettingsStore } from '../core/profiles';
 import { NewBeeBoxProvider } from '../core/provider';
 import { FLAVORS } from '../core/flavors';
+import { recoverBoundRoots } from '../core/startup';
 import { loadSparkleBridge } from './client-update';
 import { APP_ORIGIN, AppService } from './ipc';
 
@@ -161,17 +162,15 @@ async function start(): Promise<void> {
   const service = new AppService({ getWindow: () => mainWindow, settings, provider: new NewBeeBoxProvider(), gate });
   service.register();
 
-  // 测试绑定与启动恢复（残留的未完成事务）也计入写操作；全部完成后才启用客户端更新
-  const release = gate.enter();
-  try {
-    await applyTestBindings(settings);
-    const s = await settings.load();
-    for (const root of new Set(Object.values(s.bindings))) {
-      await service.manager.recover(root).catch((err) => console.warn('[BeeLite] 恢复检查失败：', err));
-    }
-  } finally {
-    release();
-  }
+  // 测试绑定与启动恢复（残留的未完成事务）也计入写操作；全部完成后才启用客户端更新。
+  // 设置无法读取时跳过恢复但不中断启动，窗口与客户端更新照常可用
+  await recoverBoundRoots({
+    gate,
+    settings,
+    recover: (root) => service.manager.recover(root),
+    prepare: () => applyTestBindings(settings),
+    warn: (...args) => console.warn(...args),
+  });
 
   const loaded = loadSparkleBridge();
   clientUpdater = new ClientUpdater({

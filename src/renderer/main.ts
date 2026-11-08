@@ -3,7 +3,7 @@
 import { initClientUpdate } from './client-update.js';
 import { initDetail } from './detail.js';
 import { initDiscover, focusSearch } from './discover.js';
-import { byId, confirmDialog, h, mount, spinner } from './dom.js';
+import { byId, h, mount, spinner } from './dom.js';
 import { errMsg } from './format.js';
 import { initLocal } from './local.js';
 import { handleTask } from './tasks.js';
@@ -72,14 +72,8 @@ function bindUi(): void {
     if (Number.isFinite(id) && id !== state.flavorId) setFlavor(id);
   });
   bindBtn.addEventListener('click', () => void bindDirectory());
-  unbindBtn.addEventListener('click', async () => {
-    const ok = await confirmDialog({
-      title: '解除游戏目录绑定？',
-      message: '只会让蜂简忘记这个目录，不会删除或修改任何插件文件。之后可以重新选择。',
-      confirmText: '解除绑定',
-    });
-    if (ok) await unbindDirectory();
-  });
+  // 确认对话框在 unbindDirectory 内：确认前记录目标，确认后复核
+  unbindBtn.addEventListener('click', () => void unbindDirectory());
   on('local', renderTopbar);
   on('flavor', renderTopbar);
 }

@@ -4,5 +4,5 @@
     "rootDir": ".",
     "outDir": "build-test"
   },
-  "include": ["src/core/**/*", "src/shared/**/*", "test/**/*", "scripts/**/*.ts"]
+  "include": ["src/core/**/*", "src/shared/**/*", "src/main/ipc.ts", "src/preload/preload.ts", "test/**/*", "scripts/**/*.ts"]
 }
