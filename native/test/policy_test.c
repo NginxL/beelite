@@ -54,6 +54,47 @@ int main(void) {
   EXPECT(bl_cancel_action(false, false, true) == BL_CANCEL_CHECK, "检查中取消检查");
   EXPECT(bl_cancel_action(false, false, false) == BL_CANCEL_NONE, "解压中无取消手段");
 
+  // 只检查（probe 意图）永远不在授权范围：即使残留了授权标记且构建一致，也只 Dismiss / Skip，任何阶段都不 Install、不持有
+  for (int a = 0; a <= 1; a++)
+    for (int m = 0; m <= 1; m++) EXPECT(bl_session_authorized(BL_INTENT_PROBE, a, m) == false, "probe 意图不授权");
+  EXPECT(bl_session_authorized(BL_INTENT_NONE, true, true) == false, "没有本方会话时不授权");
+  EXPECT(bl_session_authorized(BL_INTENT_UPDATE, true, true) == true, "update 意图、已授权且构建一致才授权");
+  EXPECT(bl_session_authorized(BL_INTENT_UPDATE, true, false) == false, "update 意图但构建不同不授权");
+  EXPECT(bl_session_authorized(BL_INTENT_UPDATE, false, true) == false, "update 意图但授权已作废");
+  for (int a = 0; a <= 1; a++)
+    for (int i = 0; i <= 1; i++)
+      for (int s = 0; s <= 2; s++) {
+        bl_action act = bl_update_found_action(bl_session_authorized(BL_INTENT_PROBE, a, true), i, (bl_stage)s);
+        EXPECT(act != BL_REPLY_INSTALL && act != BL_HOLD, "probe 意图任何阶段都不得 Install 或持有回复");
+      }
+  EXPECT(bl_update_found_action(bl_session_authorized(BL_INTENT_PROBE, false, false), false, BL_STAGE_NOT_DOWNLOADED) == BL_REPLY_DISMISS, "probe+未下载应 Dismiss");
+  EXPECT(bl_update_found_action(bl_session_authorized(BL_INTENT_PROBE, false, false), false, BL_STAGE_DOWNLOADED) == BL_REPLY_DISMISS, "probe+已下载应 Dismiss");
+  EXPECT(bl_update_found_action(bl_session_authorized(BL_INTENT_PROBE, false, false), false, BL_STAGE_INSTALLING) == BL_REPLY_SKIP, "probe+Installing 应 Skip（Dismiss 会在退出时安装）");
+  EXPECT(bl_ready_action(bl_session_authorized(BL_INTENT_PROBE, true, true)) == BL_REPLY_SKIP, "probe 意图的准备安装应 Skip");
+  // 授权更新会话的 Installing 阶段仍然持有回复
+  EXPECT(bl_update_found_action(bl_session_authorized(BL_INTENT_UPDATE, true, true), false, BL_STAGE_INSTALLING) == BL_HOLD, "update 意图+Installing 仍持有回复");
+
+  // 更新会话的取消只作用于 update 意图，不会取消只检查会话
+  EXPECT(bl_update_cancel_action(BL_INTENT_PROBE, false, false, true) == BL_CANCEL_NONE, "cancel 不作用于 probe 会话");
+  EXPECT(bl_update_cancel_action(BL_INTENT_NONE, true, true, true) == BL_CANCEL_NONE, "没有本方会话时 cancel 不生效");
+  EXPECT(bl_update_cancel_action(BL_INTENT_UPDATE, false, false, true) == BL_CANCEL_CHECK, "update 意图检查中取消检查");
+  EXPECT(bl_update_cancel_action(BL_INTENT_UPDATE, false, false, false) == BL_CANCEL_NONE, "update 意图解压中无取消手段");
+
+  // 只检查会话的取消：编号与意图都匹配才生效；取消块未到达（或已失效）时记下请求
+  EXPECT(bl_probe_cancel_action(BL_INTENT_PROBE, true, true) == BL_PROBE_CANCEL_NOW, "匹配且有取消块：立即调用");
+  EXPECT(bl_probe_cancel_action(BL_INTENT_PROBE, true, false) == BL_PROBE_CANCEL_DEFER, "匹配但取消块未到：记下请求");
+  EXPECT(bl_probe_cancel_action(BL_INTENT_PROBE, false, true) == BL_PROBE_CANCEL_NONE, "编号不匹配：不影响当前会话");
+  EXPECT(bl_probe_cancel_action(BL_INTENT_UPDATE, true, true) == BL_PROBE_CANCEL_NONE, "不取消授权更新会话");
+  EXPECT(bl_probe_cancel_action(BL_INTENT_NONE, true, false) == BL_PROBE_CANCEL_NONE, "会话已结束：none");
+
+  // 会话编号：正整数、严格递增、不超过 2^53 - 1
+  EXPECT(bl_session_id_ok(1, 0) == true, "第一个会话编号 1");
+  EXPECT(bl_session_id_ok(0, 0) == false, "0 不是有效编号");
+  EXPECT(bl_session_id_ok(5, 5) == false, "不能重复使用编号");
+  EXPECT(bl_session_id_ok(4, 5) == false, "不能回退编号");
+  EXPECT(bl_session_id_ok(BL_SESSION_MAX, 1) == true, "上限可用");
+  EXPECT(bl_session_id_ok(BL_SESSION_MAX + 1, 1) == false, "超过 JS 可精确表示的范围");
+
   printf("policy checks: %d, failures: %d\n", checks, failures);
   return failures == 0 ? 0 : 1;
 }

@@ -1,5 +1,9 @@
 // 客户端自身更新的状态机（不依赖 Electron，原生桥通过接口注入）。
-// - check()：只探测（Sparkle checkForUpdateInformation），不会下载。
+// - check()：只检查是否有新版本，不会下载（原生以未授权的用户发起检查实现，见 beelite_sparkle.mm）。
+// - 每个原生会话使用严格递增的会话编号；原生事件带有所属会话的编号与意图，只接受当前会话的事件，其余一律丢弃。
+// - 检查有固定预算（CHECK_TIMEOUT_MS）：到期仍未结束则请求原生取消，本次检查作废（之后到达的结果一律不采用），
+//   进入 ending 屏障，直到该会话的周期真正结束（cycle-finished）才报告超时并允许重试；不会仅凭计时器或取消的返回值就允许重试。
+//   停止宽限（STOP_GRACE_MS）到期仍未结束时如实提示退出并重新打开蜂简，此后若该周期结束仍会解除屏障。不自动重试。
 // - update()：用户点击“下载并更新”时唯一的授权入口；原生侧只在本次授权内才同意下载与安装。
 // - 下载、验签、解压完成（ready）后：同步冻结写操作 → 等待已受理的写操作全部结束 → 复核本次尝试仍有效 → 才通知原生安装并重启。
 // - 取消只在原生确认确有取消手段时生效（下载中、等待插件操作完成时）；解压阶段不提供取消。
@@ -19,9 +23,12 @@ export interface NotesFields {
   notesTruncated?: boolean;
 }
 
-export type BridgeEvent =
+/** 原生事件的内容（不含会话标记） */
+export type BridgeEventBody =
   | ({ type: 'valid-update'; version: string; displayVersion: string } & NotesFields)
   | { type: 'no-update' }
+  /** appcast 已下载并解析（恢复已下载或安装中的更新时没有这个事件）；只用于诊断，不改变状态 */
+  | { type: 'appcast-loaded' }
   | { type: 'cycle-finished'; check: 'probe' | 'user' | 'background'; errorCode?: number; error?: string }
   | ({ type: 'update-found'; authorized: boolean; version: string; displayVersion: string } & NotesFields)
   /** 授权会话中服务器给出的构建与用户确认的不同：原生未下载，本次会话结束 */
@@ -35,15 +42,52 @@ export type BridgeEvent =
   | { type: 'error'; message: string; code?: number }
   | { type: 'dismissed' };
 
+/** 原生会话的意图：只检查 / 授权更新；none 表示不属于本方会话 */
+export type BridgeIntent = 'probe' | 'update' | 'none';
+
+/** 原生事件：带有原生回调发生时所属会话的编号与意图；不属于本方会话的事件 session 为 0 */
+export type BridgeEvent = BridgeEventBody & { session: number; intent: BridgeIntent };
+
+/** cancelProbe 的结果：已调用取消块 / 已记下请求（取消块到达时调用）/ 没有匹配的只检查会话。都不代表周期已经结束 */
+export type ProbeCancelResult = 'cancelled' | 'pending' | 'none';
+
 /** 原生桥接口（由 beelite_sparkle.node 实现）；所有方法都必须在主线程调用 */
 export interface SparkleBridge {
   init(onEvent: (json: string) => void): { ok: boolean; error?: string };
-  probe(): boolean;
-  /** expectedBuild：本次授权只对这个构建号有效 */
-  beginUpdate(expectedBuild: string): boolean;
+  /** 只检查；session 为严格递增的正整数会话编号 */
+  probe(session: number): boolean;
+  /** expectedBuild：本次授权只对这个构建号有效；session 为严格递增的正整数会话编号 */
+  beginUpdate(expectedBuild: string, session: number): boolean;
   installNow(): boolean;
   cancel(): boolean;
+  /** 请求取消编号为 session 的只检查会话 */
+  cancelProbe(session: number): ProbeCancelResult;
 }
+
+/** 一次检查的预算：到期仍未结束则请求取消，本次检查作废 */
+export const CHECK_TIMEOUT_MS = 30_000;
+/** 请求取消后等待原生周期结束的宽限；到期仍未结束则提示退出并重新打开 */
+export const STOP_GRACE_MS = 15_000;
+
+/** 计时器（测试可注入假时钟） */
+export interface UpdateTimers {
+  setTimeout(fn: () => void, ms: number): unknown;
+  clearTimeout(handle: unknown): void;
+}
+
+const SYSTEM_TIMERS: UpdateTimers = {
+  setTimeout: (fn, ms) => {
+    const t = setTimeout(fn, ms);
+    // 计时器本身不阻止进程退出
+    t.unref?.();
+    return t;
+  },
+  clearTimeout: (h) => clearTimeout(h as ReturnType<typeof setTimeout>),
+};
+
+const MSG_TIMEOUT_STOPPING = '检查蜂简新版本超时，正在停止本次检查…';
+const MSG_TIMEOUT = '检查蜂简新版本超时，请稍后重试';
+const MSG_STUCK = '本次检查未能停止，请退出并重新打开蜂简后再检查';
 
 /** Sparkle 的 SUNoUpdateError */
 const SU_NO_UPDATE_ERROR = 1001;
@@ -97,6 +141,8 @@ export interface ClientUpdaterOptions {
   /** 不支持时展示给用户的原因 */
   unsupportedReason?: string;
   onState?: (s: ClientUpdateState) => void;
+  /** 计时器；默认使用系统计时器 */
+  timers?: UpdateTimers;
 }
 
 export class ClientUpdater {
@@ -111,16 +157,29 @@ export class ClientUpdater {
   /** 当前授权更新的代次；取消、出错、完成都会递增使旧延续失效 */
   private attempt = 0;
   /**
-   * none：没有进行中的原生会话；probe：探测中；update：已授权的更新会话；
-   * ending：本方已结束（取消、出错、无新版本），等待原生的用户检查周期结束
+   * none：没有进行中的原生会话；probe：检查中；update：已授权的更新会话；
+   * ending：本方已结束（取消、出错、无新版本、检查超时），等待该原生会话的周期结束
    */
   private session: 'none' | 'probe' | 'update' | 'ending' = 'none';
+  /** 已使用的最大会话编号；每次 probe / beginUpdate 使用新的编号 */
+  private lastSession = 0;
+  /** 当前跟踪的原生会话的编号与意图（session 为 none 时不接受任何事件） */
+  private sessionId = 0;
+  private sessionIntent: 'probe' | 'update' = 'probe';
+  /** 当前检查已超时作废：它的结果不再采用，只等它的周期结束 */
+  private expired = false;
+  /** 最近一次检查失败、超时或正在因超时停止（只在状态为 error 时上报；停止中 canCheck 为 false，界面不显示“重试”） */
+  private checkFailed = false;
+  private checkTimer: unknown = null;
+  private graceTimer: unknown = null;
+  private readonly timers: UpdateTimers;
   private probeFound: Offer | null = null;
   private probeNone = false;
   private token: FreezeToken | null = null;
   private bridge: SparkleBridge | null;
 
   constructor(private readonly opts: ClientUpdaterOptions) {
+    this.timers = opts.timers ?? SYSTEM_TIMERS;
     this.bridge = opts.bridge;
     if (!this.bridge) {
       this.status = 'unsupported';
@@ -160,6 +219,7 @@ export class ClientUpdater {
       rev: this.rev,
       percent: this.percent,
       message: this.message,
+      checkFailed: this.status === 'error' && this.checkFailed,
       canCheck: idle,
       canUpdate: idle && o !== null && (this.status === 'available' || this.status === 'error'),
       canCancel: supported && this.session === 'update' && (this.status === 'downloading' || this.status === 'waiting'),
@@ -190,13 +250,69 @@ export class ClientUpdater {
     if (!this.bridge || !s.canCheck) return s;
     this.probeFound = null;
     this.probeNone = false;
-    if (!this.bridge.probe()) {
-      this.set('error', { message: '暂时无法检查更新，请稍后重试' });
+    this.checkFailed = false;
+    const id = ++this.lastSession;
+    if (!this.bridge.probe(id)) {
+      this.checkFailed = true;
+      this.set('error', { message: '暂时无法检查蜂简新版本，请稍后重试' });
       return this.getState();
     }
-    this.session = 'probe';
+    this.track(id, 'probe');
+    this.checkTimer = this.timers.setTimeout(() => this.onCheckTimeout(id), CHECK_TIMEOUT_MS);
     this.set('checking', { message: null });
     return this.getState();
+  }
+
+  /** 开始跟踪一个已被原生接受的会话 */
+  private track(id: number, intent: 'probe' | 'update'): void {
+    this.clearTimers();
+    this.expired = false;
+    this.sessionId = id;
+    this.sessionIntent = intent;
+    this.session = intent;
+  }
+
+  /** 检查预算到期：本次检查作废并进入停止屏障，然后请求原生取消；是否真正结束仍以该会话的 cycle-finished 为准 */
+  private onCheckTimeout(id: number): void {
+    // 先核对会话再动计时器句柄：已排队的旧会话回调不能清掉新会话的句柄
+    if (this.session !== 'probe' || this.sessionId !== id || !this.bridge) return;
+    this.checkTimer = null;
+    // 先建立作废、屏障、停止宽限与“正在停止”的状态，再请求取消：取消失败或期间同步收到周期结束都不会被之后的代码覆盖
+    this.expired = true;
+    this.checkFailed = true;
+    this.session = 'ending';
+    this.graceTimer = this.timers.setTimeout(() => this.onStopGraceExpired(id), STOP_GRACE_MS);
+    this.set('error', { message: MSG_TIMEOUT_STOPPING });
+    try {
+      // 返回值（cancelled / pending / none）只说明请求是否发出；none 通常表示原生已结束、cycle-finished 尚在投递途中
+      this.bridge.cancelProbe(id);
+    } catch (err) {
+      // 只记录会话编号与异常类型；屏障保持，仍只由该会话的 cycle-finished 解除，或由停止宽限给出重新打开的提示
+      console.warn('[BeeLite] 请求停止客户端检查失败：', { session: id, error: err instanceof Error ? err.name : typeof err });
+    }
+  }
+
+  /** 停止宽限到期仍未结束：保持屏障，如实提示；之后该周期若结束仍会解除屏障 */
+  private onStopGraceExpired(id: number): void {
+    if (this.session !== 'ending' || this.sessionId !== id || !this.expired) return;
+    this.graceTimer = null;
+    this.set('error', { message: MSG_STUCK });
+  }
+
+  private clearTimers(): void {
+    if (this.checkTimer !== null) {
+      this.timers.clearTimeout(this.checkTimer);
+      this.checkTimer = null;
+    }
+    if (this.graceTimer !== null) {
+      this.timers.clearTimeout(this.graceTimer);
+      this.graceTimer = null;
+    }
+  }
+
+  /** 检查未完成时的提示：之前已验证的可更新条目仍然保留，并说明仍可更新 */
+  private withOffer(message: string): string {
+    return this.offer ? `${message}；之前发现的 v${this.offer.display} 仍可更新` : message;
   }
 
   /**
@@ -213,12 +329,14 @@ export class ClientUpdater {
     const build = this.offer.build;
     this.announced.add(build);
     this.notice = false;
+    this.checkFailed = false;
     this.attempt++;
-    if (!this.bridge.beginUpdate(build)) {
+    const id = ++this.lastSession;
+    if (!this.bridge.beginUpdate(build, id)) {
       this.set('error', { percent: null, message: '暂时无法开始更新，请稍后重试' });
       return this.getState();
     }
-    this.session = 'update';
+    this.track(id, 'update');
     this.set('downloading', { percent: 0, message: null });
     return this.getState();
   }
@@ -242,17 +360,17 @@ export class ClientUpdater {
     } catch {
       return;
     }
+    if (ev === null || typeof ev !== 'object') return;
     this.handle(ev);
   }
 
   /** 处理原生事件（测试可直接调用） */
   handle(ev: BridgeEvent): void {
+    // 只接受当前会话的事件：编号与意图都必须一致；没有标记、标记为 0 或属于其他会话的一律丢弃
+    if (this.session === 'none' || ev.session !== this.sessionId || ev.intent !== this.sessionIntent) return;
     if (this.session === 'ending') {
-      // 屏障：忽略旧会话的残余事件，直到它的用户检查周期结束
-      if (ev.type === 'cycle-finished' && ev.check === 'user') {
-        this.session = 'none';
-        this.emit();
-      }
+      // 屏障：忽略本会话的残余事件（包括已超时检查的结果），直到它的用户检查周期结束
+      if (ev.type === 'cycle-finished' && ev.check === 'user') this.onEndingFinished();
       return;
     }
     switch (ev.type) {
@@ -308,12 +426,29 @@ export class ClientUpdater {
         if (this.session === 'update') this.fail(`更新失败：${ev.message}`, 'ending');
         return;
       case 'dismissed':
+      case 'appcast-loaded':
+        // 不授权下载，也不改变检查期限与状态
         return;
     }
   }
 
+  /** ending 屏障解除：该会话的周期已结束 */
+  private onEndingFinished(): void {
+    this.clearTimers();
+    this.session = 'none';
+    if (this.expired) {
+      // 已超时的检查作废：不采用它的结果（不形成新的可更新条目，也不报告“已是最新”），只报告超时并允许重试
+      this.expired = false;
+      this.set('error', { message: this.withOffer(MSG_TIMEOUT) });
+    } else {
+      this.emit();
+    }
+  }
+
   private onCycleFinished(ev: Extract<BridgeEvent, { type: 'cycle-finished' }>): void {
-    if (ev.check === 'probe' && this.session === 'probe') {
+    if (ev.check === 'user' && this.session === 'probe') {
+      // 预算内结束：正常结果生效
+      this.clearTimers();
       this.session = 'none';
       if (this.probeFound) {
         this.setOffer(this.probeFound);
@@ -322,7 +457,8 @@ export class ClientUpdater {
         this.setOffer(null);
         this.set('up-to-date', { message: null });
       } else {
-        this.set('error', { message: `检查更新失败：${ev.error ?? '未知错误'}` });
+        this.checkFailed = true;
+        this.set('error', { message: this.withOffer(`检查蜂简新版本失败：${ev.error ?? '未知错误'}`) });
       }
       return;
     }

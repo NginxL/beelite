@@ -8,7 +8,7 @@ import { cleanup, tmpDir } from './helpers';
 const SRC = path.join(__dirname, '..', '..', 'native', 'test', 'policy_test.c');
 const hasCc = process.platform === 'darwin' && spawnSync('/usr/bin/xcrun', ['--find', 'clang'], { encoding: 'utf8' }).status === 0;
 
-test('原生回复策略：Installing 阶段持有回复、未授权不下载不安装、解压中无法取消', { skip: hasCc ? false : '需要 macOS 与 Xcode 命令行工具' }, async () => {
+test('原生回复策略：Installing 阶段持有回复、未授权与只检查不下载不安装、解压中无法取消、只检查的取消与会话编号',{ skip: hasCc ? false : '需要 macOS 与 Xcode 命令行工具' }, async () => {
   const dir = await tmpDir();
   try {
     const bin = path.join(dir, 'policy_test');

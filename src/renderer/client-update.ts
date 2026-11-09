@@ -121,9 +121,9 @@ function statusText(s: ClientUpdateState): string {
     case 'idle':
       return '';
     case 'checking':
-      return '正在检查更新…';
+      return '正在检查蜂简新版本…';
     case 'up-to-date':
-      return '已是最新版本';
+      return '蜂简已是最新版本';
     case 'available':
       return s.message ? `${s.message}，${v} 可用` : `发现新版本 ${v}`;
     case 'downloading':
@@ -185,7 +185,8 @@ function render(): void {
   setShown(view.update, s.canUpdate);
   // 请求进行中由 act() 的 pending 防重入；不在此禁用按钮，避免已获得焦点的按钮失去焦点
   setEnabled(view.update, s.canUpdate);
-  setShown(view.check, !s.canUpdate && s.canCheck);
+  // 检查失败或超时并已结束后显示“重试”，即使之前发现的新版本仍可更新
+  setShown(view.check, s.canCheck && (!s.canUpdate || s.checkFailed === true));
   setEnabled(view.check, s.canCheck);
   if (view.check.textContent !== (s.status === 'error' ? '重试' : '检查更新')) view.check.textContent = s.status === 'error' ? '重试' : '检查更新';
   setShown(view.cancel, s.canCancel);

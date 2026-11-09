@@ -306,6 +306,11 @@ export interface ClientUpdateState {
   /** 下载或解压进度，0–100；未知时为 null */
   percent: number | null;
   message: string | null;
+  /**
+   * 最近一次检查新版本失败、超时，或正在因超时停止。它本身不表示原生检查已结束：
+   * 界面只在同时 canCheck 时显示“重试”（停止期间 canCheck 为 false），即使之前发现的新版本仍可更新
+   */
+  checkFailed?: boolean;
   canCheck: boolean;
   canUpdate: boolean;
   canCancel: boolean;

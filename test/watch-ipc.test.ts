@@ -3,9 +3,10 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { realpath, writeFile } from 'node:fs/promises';
 import path from 'node:path';
-import { ClientUpdater, type SparkleBridge } from '../src/core/client-update';
+import { ClientUpdater, type BridgeIntent, type ProbeCancelResult, type SparkleBridge } from '../src/core/client-update';
 import { MUTATING_CHANNELS } from '../src/core/gate';
 import type { AddonWatchSnapshot, UpdateCheckItem } from '../src/shared/types';
+import { bindBridge, send } from './client-fakes';
 import { addonEntries, cleanup, FakeSource, makeGameRoot, makeManager, makeZip, tmpDir } from './helpers';
 import { createHarness, ipcCalls, recordOf } from './ipc-harness';
 
@@ -114,15 +115,21 @@ test('全部更新：批次内的检查经协调器强制重新查询（不使�
 
 class FakeBridge implements SparkleBridge {
   calls: string[] = [];
+  session = 0;
+  intent: BridgeIntent = 'none';
   init() {
     return { ok: true };
   }
-  probe() {
+  probe(session: number) {
     this.calls.push('probe');
+    this.session = session;
+    this.intent = 'probe';
     return true;
   }
-  beginUpdate(build: string) {
+  beginUpdate(build: string, session: number) {
     this.calls.push(`beginUpdate:${build}`);
+    this.session = session;
+    this.intent = 'update';
     return true;
   }
   installNow() {
@@ -133,6 +140,10 @@ class FakeBridge implements SparkleBridge {
     this.calls.push('cancel');
     return true;
   }
+  cancelProbe(): ProbeCancelResult {
+    this.calls.push('cancelProbe');
+    return 'cancelled';
+  }
 }
 
 test('客户端更新 IPC：更新必须带上与当前一致的构建号；参数无效时拒绝；已读提醒不调用原生、不跳过版本', async () => {
@@ -140,11 +151,12 @@ test('客户端更新 IPC：更新必须带上与当前一致的构建号；参�
   try {
     const bridge = new FakeBridge();
     const u = new ClientUpdater({ bridge, gate: h.gate, currentVersion: '0.1.3', onState: (s) => h.service.pushClientState(s) });
+    bindBridge(u, bridge);
     u.start();
     h.service.attachClientUpdater(u);
     u.check();
-    u.handle({ type: 'valid-update', version: '0.1.4', displayVersion: '0.1.4', notes: '修复若干问题', notesState: 'ok' });
-    u.handle({ type: 'cycle-finished', check: 'probe' });
+    send(u, { type: 'valid-update', version: '0.1.4', displayVersion: '0.1.4', notes: '修复若干问题', notesState: 'ok' });
+    send(u, { type: 'cycle-finished', check: 'user' });
     let s = await h.api.clientState();
     assert.equal(s.availableBuild, '0.1.4');
     assert.equal(s.releaseNotes, '修复若干问题');

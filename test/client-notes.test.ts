@@ -3,21 +3,28 @@
 // 授权绑定构建号，原生上报 build-changed 时不下载、不安装，旧周期结束后展示新构建的说明并等待用户重新点击。
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { ClientUpdater, MAX_NOTES_CHARS, normalizeNotes, type BridgeEvent, type SparkleBridge } from '../src/core/client-update';
+import { ClientUpdater, MAX_NOTES_CHARS, normalizeNotes, type BridgeEvent, type BridgeIntent, type ProbeCancelResult, type SparkleBridge } from '../src/core/client-update';
 import { MutationGate } from '../src/core/gate';
+import { bindBridge, send } from './client-fakes';
 
 class FakeBridge implements SparkleBridge {
   calls: string[] = [];
+  session = 0;
+  intent: BridgeIntent = 'none';
   init() {
     this.calls.push('init');
     return { ok: true };
   }
-  probe() {
+  probe(session: number) {
     this.calls.push('probe');
+    this.session = session;
+    this.intent = 'probe';
     return true;
   }
-  beginUpdate(build: string) {
+  beginUpdate(build: string, session: number) {
     this.calls.push(`beginUpdate:${build}`);
+    this.session = session;
+    this.intent = 'update';
     return true;
   }
   installNow() {
@@ -28,6 +35,10 @@ class FakeBridge implements SparkleBridge {
     this.calls.push('cancel');
     return true;
   }
+  cancelProbe(): ProbeCancelResult {
+    this.calls.push('cancelProbe');
+    return 'cancelled';
+  }
 }
 
 const tick = () => new Promise((r) => setImmediate(r));
@@ -35,16 +46,16 @@ const tick = () => new Promise((r) => setImmediate(r));
 function setup() {
   const bridge = new FakeBridge();
   const gate = new MutationGate();
-  const u = new ClientUpdater({ bridge, gate, currentVersion: '0.1.3' });
+  const u = bindBridge(new ClientUpdater({ bridge, gate, currentVersion: '0.1.3' }), bridge);
   u.start();
   return { bridge, gate, u };
 }
 
 function probe(u: ClientUpdater, ev: Partial<Extract<BridgeEvent, { type: 'valid-update' }>> | null) {
   u.check();
-  if (ev) u.handle({ type: 'valid-update', version: '0.1.4', displayVersion: '0.1.4', ...ev });
-  else u.handle({ type: 'no-update' });
-  u.handle({ type: 'cycle-finished', check: 'probe', errorCode: ev ? undefined : 1001 });
+  if (ev) send(u, { type: 'valid-update', version: '0.1.4', displayVersion: '0.1.4', ...ev });
+  else send(u, { type: 'no-update' });
+  send(u, { type: 'cycle-finished', check: 'user', errorCode: ev ? undefined : 1001 });
 }
 
 test('说明与版本来自同一条目：新构建整体替换，缺说明时不沿用旧说明', () => {
@@ -121,8 +132,8 @@ test('授权会话中服务器变为另一个构建：不下载、不安装，�
   u.ackNotice('0.1.4');
   u.update('0.1.4');
   // 原生：发现 0.1.5，与授权的 0.1.4 不同 → build-changed，随后 update-found(authorized=false) 并回复 Dismiss
-  u.handle({ type: 'build-changed', version: '0.1.5', displayVersion: '0.1.5', notes: 'B 版说明', notesState: 'ok' });
-  u.handle({ type: 'update-found', authorized: false, version: '0.1.5', displayVersion: '0.1.5' });
+  send(u, { type: 'build-changed', version: '0.1.5', displayVersion: '0.1.5', notes: 'B 版说明', notesState: 'ok' });
+  send(u, { type: 'update-found', authorized: false, version: '0.1.5', displayVersion: '0.1.5' });
   let s = u.getState();
   assert.equal(s.status, 'available');
   assert.equal(s.availableBuild, '0.1.5');
@@ -130,12 +141,12 @@ test('授权会话中服务器变为另一个构建：不下载、不安装，�
   assert.match(s.message ?? '', /已变为 v0\.1\.5，未下载/);
   assert.equal(s.canUpdate, false, '旧周期结束前不能重新更新');
   // 旧周期的残余事件不会触发安装
-  u.handle({ type: 'download-start' });
-  u.handle({ type: 'ready' });
+  send(u, { type: 'download-start' });
+  send(u, { type: 'ready' });
   await tick();
   assert.equal(gate.frozen, false);
   assert.ok(!bridge.calls.includes('installNow'));
-  u.handle({ type: 'cycle-finished', check: 'user' });
+  send(u, { type: 'cycle-finished', check: 'user' });
   s = u.getState();
   assert.equal(s.canUpdate, true);
   assert.equal(s.notice, true, '新构建需要重新提醒');

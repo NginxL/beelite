@@ -10,7 +10,7 @@ export function loadSparkleBridge(): { bridge: SparkleBridge | null; reason?: st
   try {
     // eslint-disable-next-line @typescript-eslint/no-require-imports
     const mod = require(addon) as SparkleBridge;
-    for (const k of ['init', 'probe', 'beginUpdate', 'installNow', 'cancel'] as const) {
+    for (const k of ['init', 'probe', 'beginUpdate', 'installNow', 'cancel', 'cancelProbe'] as const) {
       if (typeof mod[k] !== 'function') return { bridge: null, reason: '客户端更新组件不完整' };
     }
     return { bridge: mod };

@@ -9,10 +9,14 @@
 // - 授权只对用户确认的构建号有效（bl_authorized_for）：授权会话中服务器给出另一个构建时按未授权处理——
 //   未下载 / 已下载回复 Dismiss（不下载、不跳过）；Installing 阶段回复 Skip 取消安装。
 //   Sparkle 的用户发起检查会先清除跳过记录（SPUUIBasedUpdateDriver.m _clearSkippedUpdatesIfUserInitiated），用户再次点击更新时不受影响。
+// - 只检查（probe 意图）同样走用户发起检查（为了有取消手段），但永远按未授权处理：未下载 / 已下载 Dismiss；
+//   遇到此前遗留、已处于 Installing 阶段的安装时回复 Skip——这会取消那次安装并记下跳过记录（之后的用户发起检查会清除），
+//   不用 Dismiss，因为 Dismiss 会让它在应用退出时照样安装。
 #ifndef BL_POLICY_H
 #define BL_POLICY_H
 
 #include <stdbool.h>
+#include <stdint.h>
 
 typedef enum { BL_STAGE_NOT_DOWNLOADED = 0, BL_STAGE_DOWNLOADED = 1, BL_STAGE_INSTALLING = 2 } bl_stage;
 
@@ -54,6 +58,40 @@ static inline bl_cancel bl_cancel_action(bool has_pending_reply, bool has_downlo
   if (has_download_cancel) return BL_CANCEL_DOWNLOAD;
   if (has_check_cancel) return BL_CANCEL_CHECK;
   return BL_CANCEL_NONE;
+}
+
+/** 本方发起的原生会话的意图：只检查，或用户授权的更新 */
+typedef enum { BL_INTENT_NONE = 0, BL_INTENT_PROBE = 1, BL_INTENT_UPDATE = 2 } bl_intent;
+
+/** 会话中发现的条目是否在授权范围：只有 update 意图、已授权且构建一致；probe 意图永远不是 */
+static inline bool bl_session_authorized(bl_intent intent, bool authorized, bool build_matches) {
+  return intent == BL_INTENT_UPDATE && bl_authorized_for(authorized, build_matches);
+}
+
+/** 更新会话的取消只作用于 update 意图；只检查的会话由 bl_probe_cancel_action 处理 */
+static inline bl_cancel bl_update_cancel_action(bl_intent intent, bool has_pending_reply, bool has_download_cancel, bool has_check_cancel) {
+  if (intent != BL_INTENT_UPDATE) return BL_CANCEL_NONE;
+  return bl_cancel_action(has_pending_reply, has_download_cancel, has_check_cancel);
+}
+
+/** JS 可精确表示的最大整数（2^53 - 1） */
+#define BL_SESSION_MAX 9007199254740991ULL
+
+/** 会话编号必须是正整数、严格大于上一次接受的编号，且在 JS 可精确表示的范围内 */
+static inline bool bl_session_id_ok(uint64_t candidate, uint64_t last) {
+  return candidate > 0 && candidate > last && candidate <= BL_SESSION_MAX;
+}
+
+typedef enum {
+  BL_PROBE_CANCEL_NONE = 0,  /* 没有与之匹配、仍在进行的只检查会话：不做任何事 */
+  BL_PROBE_CANCEL_NOW = 1,   /* 调用用户检查取消块（只是请求，周期结束仍以 cycle-finished 为准） */
+  BL_PROBE_CANCEL_DEFER = 2  /* 取消块尚未到达（或 appcast 已加载、取消块已失效）：记下请求，取消块到达时立即调用 */
+} bl_probe_cancel;
+
+/** 只检查会话的取消：会话编号与意图都匹配才生效 */
+static inline bl_probe_cancel bl_probe_cancel_action(bl_intent intent, bool session_matches, bool has_check_cancel) {
+  if (intent != BL_INTENT_PROBE || !session_matches) return BL_PROBE_CANCEL_NONE;
+  return has_check_cancel ? BL_PROBE_CANCEL_NOW : BL_PROBE_CANCEL_DEFER;
 }
 
 #endif
