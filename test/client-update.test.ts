@@ -368,9 +368,9 @@ for (const [label, end] of [
 
 // ---------- 0.1.6：检查预算、会话编号与超时后的重试 ----------
 
-const STOPPING = /检查蜂简新版本超时，正在停止本次检查/;
-const TIMED_OUT = /检查蜂简新版本超时，请稍后重试/;
-const STUCK = /本次检查未能停止，请退出并重新打开蜂简后再检查/;
+const STOPPING = /检查艾泽魔方新版本超时，正在停止本次检查/;
+const TIMED_OUT = /检查艾泽魔方新版本超时，请稍后重试/;
+const STUCK = /本次检查未能停止，请退出并重新打开艾泽魔方后再检查/;
 
 test('检查在预算内结束：正常结果生效，计时器清除，之后不会再请求取消', () => {
   const { bridge, clock, u } = setup();
@@ -532,7 +532,7 @@ test('已有新版本时检查失败或超时：保留之前已验证的版本�
   u.check();
   send(u, { type: 'cycle-finished', check: 'user', errorCode: 2001, error: '网络不可用' });
   s = u.getState();
-  assert.match(s.message ?? '', /检查蜂简新版本失败：网络不可用；之前发现的 v0\.1\.2 仍可更新/);
+  assert.match(s.message ?? '', /检查艾泽魔方新版本失败：网络不可用；之前发现的 v0\.1\.2 仍可更新/);
   assert.equal(s.checkFailed, true);
   assert.equal(s.canUpdate, true);
   // 仍可按之前的版本更新；更新失败（不是检查失败）不显示检查的“重试”
@@ -580,7 +580,7 @@ test('原生拒绝检查：报错并可重试；会话编号在检查与更新�
   bridge.probeOk = false;
   let s = u.check();
   assert.equal(s.status, 'error');
-  assert.match(s.message ?? '', /暂时无法检查蜂简新版本/);
+  assert.match(s.message ?? '', /暂时无法检查艾泽魔方新版本/);
   assert.equal(s.canCheck, true);
   assert.equal(s.checkFailed, true);
   bridge.probeOk = true;
@@ -716,7 +716,7 @@ test('检查周期结束但没有结果也没有错误：显示失败，不报�
   send(u, { type: 'cycle-finished', check: 'user' });
   const s = u.getState();
   assert.equal(s.status, 'error');
-  assert.match(s.message ?? '', /检查蜂简新版本失败：未知错误/);
+  assert.match(s.message ?? '', /检查艾泽魔方新版本失败：未知错误/);
   assert.equal(s.checkFailed, true);
   assert.equal(s.canCheck, true);
 });

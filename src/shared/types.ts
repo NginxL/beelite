@@ -287,7 +287,7 @@ export type ClientUpdateStatus =
 /** 更新说明的来源状态：ok 有纯文本说明；missing 未提供；unsupported 不是纯文本格式；unverified 更新信息签名未通过 */
 export type ReleaseNotesState = 'ok' | 'missing' | 'unsupported' | 'unverified';
 
-/** 客户端（蜂简自身）更新状态，由主进程维护 */
+/** 客户端（艾泽魔方自身）更新状态，由主进程维护 */
 export interface ClientUpdateState {
   status: ClientUpdateStatus;
   currentVersion: string;

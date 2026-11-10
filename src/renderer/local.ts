@@ -150,10 +150,10 @@ function checkInfo(): { text: string; title: string; error: boolean } | null {
   if (settingsError) return { text: '无法确认更新：设置文件无法读取', title: `${settingsError}；自动检查已暂停。修复设置文件后点「检查更新」恢复检查`, error: true };
   if (e.status === 'checking') return { text: '正在检查更新…', title: '', error: false };
   if (e.error) return { text: '无法确认更新状态', title: `${e.error}${next}`, error: true };
-  if (e.checkedAt === null) return { text: '尚未检查更新', title: '蜂简运行期间会自动检查已托管插件的更新', error: false };
+  if (e.checkedAt === null) return { text: '尚未检查更新', title: '艾泽魔方运行期间会自动检查已托管插件的更新', error: false };
   const at = `上次检查 ${formatDateTime(e.checkedAt)}`;
   if (e.failed > 0) return { text: `${at} · ${e.failed} 个检查失败`, title: `失败的插件不会显示为“已是最新”${next}`, error: true };
-  return { text: at, title: `蜂简运行期间每小时自动检查一次${next}`, error: false };
+  return { text: at, title: `艾泽魔方运行期间每小时自动检查一次${next}`, error: false };
 }
 
 /** 从更新提醒跳转过来时显示“已托管”标签页 */
@@ -190,7 +190,7 @@ function renderBody(): void {
     mount(bodyEl, h('div', { class: 'state-box' },
       h('div', { class: 'empty-hex' }),
       h('div', { class: 'state-title', text: `尚未设置「${flavorName(local.flavorId)}」的游戏目录` }),
-      h('div', { class: 'state-msg', text: '请选择魔兽世界对应版本的目录（例如 _retail_、_classic_ 等），蜂简只会管理其中 Interface/AddOns 下的插件。' }),
+      h('div', { class: 'state-msg', text: '请选择魔兽世界对应版本的目录（例如 _retail_、_classic_ 等），艾泽魔方只会管理其中 Interface/AddOns 下的插件。' }),
       h('button', { class: 'btn btn-primary', disabled: isBusy('bind'), on: { click: () => void bindDirectory() } }, '选择游戏目录'),
     ));
     return;
@@ -238,7 +238,7 @@ function renderBody(): void {
 function renderManaged(local: LocalState): HTMLElement {
   const box = h('div', { class: 'tab-content scroll' });
   if (local.managed.length === 0) {
-    mount(box, emptyState('还没有通过蜂简安装的插件', '到「发现插件」中搜索并安装，蜂简会记录来源并支持一键更新。'));
+    mount(box, emptyState('还没有通过艾泽魔方安装的插件', '到「发现插件」中搜索并安装，艾泽魔方会记录来源并支持一键更新。'));
     return box;
   }
   const list = [...local.managed].sort((a, b) => Number(projectHasUpdate(b)) - Number(projectHasUpdate(a)) || a.name.localeCompare(b.name, 'zh'));
@@ -337,7 +337,7 @@ export async function uninstallProject(p: ManagedProjectView): Promise<void> {
   const present = p.folders.filter((f) => f.present).map((f) => f.name);
   const ok = await confirmDialog({
     title: `卸载「${p.name}」？`,
-    message: '以下目录会被移入蜂简回收站，可随时在「回收站」中恢复；不会删除 WTF 中保存的插件设置。',
+    message: '以下目录会被移入艾泽魔方回收站，可随时在「回收站」中恢复；不会删除 WTF 中保存的插件设置。',
     detail: present.length ? present : ['（没有现存目录，仅移除托管记录）'],
     confirmText: '卸载',
     danger: true,
@@ -350,9 +350,9 @@ export async function uninstallProject(p: ManagedProjectView): Promise<void> {
 
 function renderUnmanaged(local: LocalState): HTMLElement {
   const box = h('div', { class: 'tab-content scroll' });
-  const note = h('div', { class: 'note', text: '这些目录不是由蜂简安装的，蜂简不会自动更新它们，也不会按名称猜测来源。' });
+  const note = h('div', { class: 'note', text: '这些目录不是由艾泽魔方安装的，艾泽魔方不会自动更新它们，也不会按名称猜测来源。' });
   if (local.unmanaged.length === 0) {
-    mount(box, note, emptyState('没有未托管的目录', 'AddOns 目录中的插件都由蜂简管理。'));
+    mount(box, note, emptyState('没有未托管的目录', 'AddOns 目录中的插件都由艾泽魔方管理。'));
     return box;
   }
   renderUnmanagedList(local);
@@ -417,7 +417,7 @@ export async function trashFolder(f: LocalFolder): Promise<void> {
     title: `移入回收站：${f.name}`,
     message: f.symlink
       ? '这是一个符号链接，只会移除链接本身，不会影响链接指向的内容。之后可在「回收站」中恢复。'
-      : '该目录会被移入蜂简回收站，之后可在「回收站」中恢复；不会删除 WTF 中保存的插件设置。',
+      : '该目录会被移入艾泽魔方回收站，之后可在「回收站」中恢复；不会删除 WTF 中保存的插件设置。',
     confirmText: '移入回收站',
     danger: true,
   });

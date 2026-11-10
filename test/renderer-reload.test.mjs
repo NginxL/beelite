@@ -452,7 +452,7 @@ test('R5 排队期间被改动：绕过防护卸载计划中的后项，旧批�
     const ev200 = h.stub.sent.filter((x) => x.channel === 'task:event' && x.payload.modId === '200' && ['done', 'failed', 'cancelled'].includes(x.payload.phase)).map((x) => x.payload);
     assert.equal(ev200.length, 1);
     assert.equal(ev200[0].phase, 'cancelled', '未处理，不是失败');
-    assert.match(ev200[0].message, /已不在这个目录的蜂简管理列表中/);
+    assert.match(ev200[0].message, /已不在这个目录的艾泽魔方管理列表中/);
   } finally {
     h.service.watch.stop();
     await cleanup(base);

@@ -285,9 +285,9 @@ test('发布前重新核对设置：绕过界面把绑定改到 B 时旧结果�
     await waitFor(async () => (src.waiting > 0 ? true : undefined), '挂起');
     await writeFile(path.join(base, 'settings.json'), '{ broken');
     src.resume();
-    await assert.rejects(p2, /无法读取蜂简设置文件/);
+    await assert.rejects(p2, /无法读取艾泽魔方设置文件/);
     const s = await h.api.watchState();
-    assert.match(s.settingsError ?? '', /无法读取蜂简设置文件/);
+    assert.match(s.settingsError ?? '', /无法读取艾泽魔方设置文件/);
     assert.ok(!s.entries.some((e) => e.status === 'ok'), '没有发布任何结论');
   } finally {
     h.service.watch.stop();

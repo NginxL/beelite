@@ -1,8 +1,8 @@
 {
   "name": "beelite",
   "productName": "BeeLite",
-  "version": "0.1.6",
-  "description": "蜂简 BeeLite：精简的魔兽世界插件搜索、安装与管理工具（macOS）",
+  "version": "0.1.7",
+  "description": "艾泽魔方 · AzerCube：精简的魔兽世界插件搜索、安装与管理工具（macOS）",
   "private": true,
   "main": "dist/app/main/main.js",
   "license": "UNLICENSED",
@@ -32,6 +32,7 @@
   "build": {
     "appId": "app.beelite.addons",
     "productName": "BeeLite",
+    "copyright": "Copyright © 2026 AzerCube",
     "directories": {
       "output": "release",
       "buildResources": "build"
@@ -64,6 +65,7 @@
       "gatekeeperAssess": false,
       "minimumSystemVersion": "13.0",
       "extendInfo": {
+        "CFBundleDisplayName": "艾泽魔方",
         "SUFeedURL": "https://github.com/NginxL/beelite/releases/latest/download/appcast.xml",
         "SUPublicEDKey": "1QVzcH29FNZEGtdtqFiWCYM5a51IpLd6CsanZIcXXTI=",
         "SUEnableAutomaticChecks": false,
@@ -80,5 +82,5 @@
     ],
     "afterPack": "scripts/after-pack.cjs"
   },
-  "author": "BeeLite"
+  "author": "AzerCube"
 }

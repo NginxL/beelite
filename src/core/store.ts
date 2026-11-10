@@ -1,5 +1,6 @@
 // 每个游戏目录一份 manifest（按目录记账，flavor 只是项目属性）与事务 journal 的读写和严格校验。
 import { UserError } from './errors';
+import { FILE_ID_RE } from './file-id';
 import { readFileNoFollow, type Layout } from './layout';
 import { foldKey, isValidModuleName } from './paths';
 
@@ -62,7 +63,7 @@ export function emptyManifest(): Manifest {
 export const ID_RE = /^[0-9a-z]{1,20}-[0-9a-f]{6}(-[bt])?$/;
 
 function bad(what: string): never {
-  throw new UserError(`蜂简数据文件已损坏（${what}），为保护插件已暂停写入。`, 'manifest');
+  throw new UserError(`艾泽魔方数据文件已损坏（${what}），为保护插件已暂停写入。`, 'manifest');
 }
 
 function folderList(v: unknown, what: string): string[] {
@@ -76,7 +77,7 @@ function parseProject(p: unknown): ProjectRecord {
   if (typeof p !== 'object' || p === null) bad('项目记录');
   const r = p as Record<string, unknown>;
   if (typeof r.modId !== 'string' || !/^\d{1,12}$/.test(r.modId)) bad('项目编号');
-  if (typeof r.flavorId !== 'number' || !Number.isInteger(r.flavorId) || typeof r.fileId !== 'string' || !/^\d{1,15}$/.test(r.fileId)) bad('项目版本');
+  if (typeof r.flavorId !== 'number' || !Number.isInteger(r.flavorId) || typeof r.fileId !== 'string' || !FILE_ID_RE.test(r.fileId)) bad('项目版本');
   return {
     modId: r.modId,
     flavorId: r.flavorId,
@@ -177,7 +178,7 @@ export function parseJournal(text: string): Journal {
     if (!x || typeof x.from !== 'string' || typeof x.to !== 'string' || typeof x.id !== 'string' || !/^\d+:\d+$/.test(x.id)) bad('事务步骤');
     const a = checkOpPath(x.from, r.txId as string, trashIds);
     const b = checkOpPath(x.to, r.txId as string, trashIds);
-    // 每一步必须恰好一端在 AddOns，一端在蜂简数据目录
+    // 每一步必须恰好一端在 AddOns，一端在艾泽魔方数据目录
     if (a === b) bad('事务步骤方向');
     return { from: x.from, to: x.to, id: x.id };
   });

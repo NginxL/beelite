@@ -6,6 +6,7 @@ import type { ActivitySnapshot, AddonWatchSnapshot, AppConfig, ClientUpdateState
 import { ActivityRegistry } from '../core/activity';
 import { AddonUpdateWatch, type WatchClock } from '../core/addon-watch';
 import { errorMessage, UserError } from '../core/errors';
+import { FILE_ID_RE } from '../core/file-id';
 import { DEFAULT_FLAVOR_ID, FLAVORS, getFlavor, interfaceFromVersion } from '../core/flavors';
 import { runUpdateAll } from '../core/batch';
 import { BUILD_RE, type ClientUpdater } from '../core/client-update';
@@ -52,7 +53,7 @@ function buildArg(v: unknown): string {
 function expectedArg(v: unknown): ExpectedRecord {
   if (typeof v !== 'object' || v === null) throw new UserError('安装记录参数无效');
   const r = v as Record<string, unknown>;
-  if (typeof r.fileId !== 'string' || !/^\d{1,15}$/.test(r.fileId)) throw new UserError('安装记录参数无效');
+  if (typeof r.fileId !== 'string' || !FILE_ID_RE.test(r.fileId)) throw new UserError('安装记录参数无效');
   if (typeof r.installedAt !== 'number' || !Number.isSafeInteger(r.installedAt) || r.installedAt < 0) throw new UserError('安装记录参数无效');
   return { fileId: r.fileId, installedAt: r.installedAt };
 }
@@ -209,7 +210,7 @@ export class AppService {
       type: (insp.warnings.length ? 'warning' : 'question') as 'warning' | 'question',
       title: '确认游戏目录',
       message: `将「${flavor.name}」绑定到以下插件目录？`,
-      detail: [`插件目录：${addons}`, ...insp.warnings, '蜂简只会在你执行安装、更新、卸载等操作时写入该目录，不会改动 WTF 设置。'].join('\n\n'),
+      detail: [`插件目录：${addons}`, ...insp.warnings, '艾泽魔方只会在你执行安装、更新、卸载等操作时写入该目录，不会改动 WTF 设置。'].join('\n\n'),
       buttons: ['绑定', '取消'],
       defaultId: 0,
       cancelId: 1,

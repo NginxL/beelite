@@ -107,7 +107,7 @@ interface NoticeKey {
 
 const keyOf = (flavorId: number, root: string): string => `${flavorId}\n${root}`;
 const boundChanged = (): UserError => new UserError('游戏目录绑定已变更，未做任何改动，请刷新后重试', 'target');
-const stoppedError = (): UserError => new UserError('蜂简正在退出或更新，已停止检查插件更新', 'frozen');
+const stoppedError = (): UserError => new UserError('艾泽魔方正在退出或更新，已停止检查插件更新', 'frozen');
 const staleError = (): UserError => new UserError('检查期间插件发生了变化，这次的检查结果已作废，请重新检查', 'stale');
 
 export class AddonUpdateWatch {
@@ -246,13 +246,15 @@ export class AddonUpdateWatch {
     const key = keyOf(flavorId, root);
     const entry = this.entries.get(key);
     if (!entry || this.stopped) return;
-    entry.epoch++;
+    // 两次写入的回读可能重叠：只有最近一次写入的回读可以发布（epoch），期间已有更新的结果时让路（rev）
+    const epoch = ++entry.epoch;
     const rev = entry.rev;
+    const current = () => !this.stopped && this.entries.get(key) === entry && entry.epoch === epoch && entry.rev === rev;
     let next: { manifest: Manifest; fingerprint: string };
     try {
       next = await this.o.checker.readCheckedManifest(root);
     } catch (err) {
-      if (this.stopped || this.entries.get(key) !== entry || entry.rev !== rev) return;
+      if (!current()) return;
       entry.status = 'error';
       entry.error = `暂时无法读取插件清单，无法确认更新状态：${errorMessage(err)}`;
       entry.items = [];
@@ -262,7 +264,7 @@ export class AddonUpdateWatch {
       this.emit();
       return;
     }
-    if (this.stopped || this.entries.get(key) !== entry || entry.rev !== rev || next.fingerprint === entry.fingerprint) return;
+    if (!current() || next.fingerprint === entry.fingerprint) return;
     entry.items = revalidate(entry.items, next.manifest, flavorId);
     entry.fingerprint = next.fingerprint;
     this.touch(entry);
@@ -417,7 +419,7 @@ export class AddonUpdateWatch {
       if (e.unconfirmed && e.items.length === 0) continue;
       e.unconfirmed = true;
       e.status = 'error';
-      e.error = `无法读取蜂简设置文件，暂时无法确认这个目录的插件更新：${msg}`;
+      e.error = `无法读取艾泽魔方设置文件，暂时无法确认这个目录的插件更新：${msg}`;
       e.items = [];
       e.fingerprint = null;
       this.touch(e);

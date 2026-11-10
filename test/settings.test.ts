@@ -10,7 +10,7 @@ import { recoverBoundRoots } from '../src/core/startup';
 import { cleanup, FakeSource, makeGameRoot, tmpDir } from './helpers';
 import { createHarness } from './ipc-harness';
 
-const SETTINGS_ERR = /无法读取蜂简设置文件.*请修复该文件或恢复备份后点击重试/s;
+const SETTINGS_ERR = /无法读取艾泽魔方设置文件.*请修复该文件或恢复备份后点击重试/s;
 
 async function setup() {
   const base = await realpath(await tmpDir());

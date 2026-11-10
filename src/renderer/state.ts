@@ -547,7 +547,7 @@ export async function unbindDirectory(): Promise<void> {
   if (!t) return;
   const ok = await confirmDialog({
     title: '解除游戏目录绑定？',
-    message: '只会让蜂简忘记这个目录，不会删除或修改任何插件文件。之后可以重新选择。',
+    message: '只会让艾泽魔方忘记这个目录，不会删除或修改任何插件文件。之后可以重新选择。',
     detail: [t.root],
     confirmText: '解除绑定',
   });

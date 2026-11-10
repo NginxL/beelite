@@ -1,11 +1,13 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdir, readdir, readFile, rm, symlink, writeFile, lstat } from 'node:fs/promises';
+import { chmod, mkdir, readdir, readFile, rename, rm, symlink, writeFile, lstat } from 'node:fs/promises';
 import path from 'node:path';
+import { runUpdateAll } from '../src/core/batch';
 import { SimulatedCrash } from '../src/core/errors';
 import { identityOf } from '../src/core/layout';
 import { parseManifest } from '../src/core/store';
 import { addUnmanaged, addonEntries, cleanup, exists, FakeSource, makeGameRoot, makeManager, makeZip, tmpDir } from './helpers';
+import { snapshot as bytes } from './ipc-harness';
 
 const F = 9;
 
@@ -392,4 +394,165 @@ test('同一目录并发操作串行执行，manifest 完整', async () => {
   assert.deepEqual((await readdir(path.join(root, 'Interface', 'AddOns'))).sort(), ['M1', 'M2', 'M3']);
   await assertClean(root);
   await cleanup(base);
+});
+
+// ---------- 0.1.7 回归 ----------
+
+test('F2 只读检查：数据目录缺少 trash 或 staging 时仍按实际清单检查，不补目录；全部更新照常完成并由写操作补齐', async () => {
+  for (const aux of ['trash', 'staging']) {
+    const { base, root, src } = await setup();
+    try {
+      const m = makeManager(src);
+      src.set('1', F, { name: 'M1', fileId: '1', zip: zipOf(['M1'], 'v1') });
+      await m.install(root, F, '1');
+      src.set('1', F, { name: 'M1', fileId: '2', zip: zipOf(['M1'], 'v2') });
+      const meta = path.join(root, 'Interface', '.beelite');
+      await rm(path.join(meta, aux), { recursive: true });
+      const before = await bytes(root);
+      src.calls.length = 0;
+
+      const checked = await m.checkUpdatesDetailed(root, F);
+      assert.deepEqual(checked.items.map((i) => [i.modId, i.hasUpdate, i.installedFileId, i.latestFileId]), [['1', true, '1', '2']], aux);
+      assert.deepEqual(src.calls, [`latest:1:${F}`], '查询了上游');
+      const readback = await m.readCheckedManifest(root);
+      assert.equal(readback.fingerprint, checked.fingerprint, '检查与读回依据同一份清单');
+      assert.deepEqual(Object.keys(readback.manifest.projects), ['1']);
+      assert.deepEqual(Object.keys((await m.readManifestFor(root)).projects), ['1']);
+      assert.deepEqual(await bytes(root), before, '只读：没有补目录或写入任何文件');
+      assert.equal(await exists(path.join(meta, aux)), false);
+
+      const r = await runUpdateAll({ manager: m, root, flavorId: F, isStillBound: async () => true, installOne: (p, r0) => m.install(r0, p.flavorId, p.modId) });
+      assert.equal(r.ok, true, r.message);
+      assert.equal((await m.readManifestFor(root)).projects['1'].fileId, '2');
+      assert.equal(await exists(path.join(meta, aux)), true, '写操作补齐了辅助目录');
+    } finally {
+      await cleanup(base);
+    }
+  }
+});
+
+test('F2 只读检查：真正首次使用（没有 Interface、没有 .beelite、只有空 .beelite）返回空结果且不创建任何东西', async () => {
+  const { base, root, src } = await setup();
+  try {
+    const m = makeManager(src);
+    const empty = await m.checkUpdatesDetailed(root, F);
+    assert.deepEqual(empty.items, []);
+    assert.equal(await exists(path.join(root, 'Interface', '.beelite')), false);
+
+    const meta = path.join(root, 'Interface', '.beelite');
+    await mkdir(meta);
+    const before = await bytes(root);
+    assert.deepEqual((await m.checkUpdatesDetailed(root, F)).items, []);
+    assert.equal((await m.readCheckedManifest(root)).fingerprint, empty.fingerprint);
+    assert.deepEqual(await bytes(root), before, '空数据目录中没有创建 staging/trash/manifest');
+
+    const bare = path.join(base, 'bare');
+    await mkdir(bare);
+    assert.deepEqual((await m.checkUpdatesDetailed(bare, F)).items, []);
+    assert.deepEqual(await readdir(bare), [], '没有 Interface 时不创建任何东西');
+    assert.deepEqual(src.calls, []);
+  } finally {
+    await cleanup(base);
+  }
+});
+
+test('F2 只读检查：符号链接与无权限如实报错，不当作没有插件；外部文件不变', async () => {
+  const { base, root, src } = await setup();
+  try {
+    const m = makeManager(src);
+    src.set('1', F, { name: 'M1', fileId: '1', zip: zipOf(['M1'], 'v1') });
+    await m.install(root, F, '1');
+    const meta = path.join(root, 'Interface', '.beelite');
+    const outside = path.join(base, 'outside');
+    await mkdir(outside);
+    await writeFile(path.join(outside, 'manifest.json'), '{"schema":1,"lastTxId":null,"projects":{},"recovery":[],"purgeQueue":[]}');
+    const outsideBefore = await tree(outside);
+
+    // 缺失的辅助目录被替换为指向外部的符号链接
+    await rm(path.join(meta, 'trash'), { recursive: true });
+    await symlink(outside, path.join(meta, 'trash'));
+    await assert.rejects(m.checkUpdatesDetailed(root, F), /符号链接/);
+    await assert.rejects(m.readCheckedManifest(root), /符号链接/);
+    await rm(path.join(meta, 'trash'));
+
+    // 清单本身是符号链接
+    await rename(path.join(meta, 'manifest.json'), path.join(base, 'manifest.saved'));
+    await symlink(path.join(outside, 'manifest.json'), path.join(meta, 'manifest.json'));
+    await assert.rejects(m.checkUpdatesDetailed(root, F), /符号链接/);
+    await assert.rejects(m.readManifestFor(root), /符号链接/);
+    await rm(path.join(meta, 'manifest.json'));
+    await rename(path.join(base, 'manifest.saved'), path.join(meta, 'manifest.json'));
+    assert.deepEqual(await tree(outside), outsideBefore);
+
+    // 数据目录不可读：报错而不是空结果（以 root 运行时权限不生效，跳过这一段）
+    if (process.getuid?.() !== 0) {
+      await chmod(meta, 0o000);
+      try {
+        await assert.rejects(m.checkUpdatesDetailed(root, F), /EACCES|权限|permission/i);
+        await assert.rejects(m.readCheckedManifest(root), /EACCES|权限|permission/i);
+      } finally {
+        await chmod(meta, 0o755);
+      }
+    }
+    assert.equal((await m.checkUpdatesDetailed(root, F)).items.length, 1, '恢复后照常检查');
+  } finally {
+    await cleanup(base);
+  }
+});
+
+test('F4 备份提示：只把实际移入备份的目录说成已备份；更新前已缺失的旧目录单独说明', async () => {
+  const { base, root, src } = await setup();
+  try {
+    const m = makeManager(src);
+    const addons = path.join(root, 'Interface', 'AddOns');
+    src.set('1', F, { name: 'P', fileId: '1', zip: zipOf(['Alpha', 'Beta'], 'v1'), folders: ['Alpha', 'Beta'] });
+    await m.install(root, F, '1');
+    await rm(path.join(addons, 'Beta'), { recursive: true });
+    src.set('1', F, { name: 'P', fileId: '2', zip: zipOf(['Alpha'], 'v2'), folders: ['Alpha'] });
+    const r = await m.install(root, F, '1');
+    assert.ok(r.ok);
+    assert.ok(!r.warnings?.some((w) => w.includes('已随旧版本一起移入备份')), '没有承诺不存在的 Beta 可从备份找回');
+    assert.deepEqual(r.warnings?.filter((w) => w.includes('Beta')), ['新版本不再包含 Beta；它们在更新前已不在 AddOns 中，没有可备份的内容']);
+    const backup = (await m.readManifestFor(root)).recovery.find((e) => e.kind === 'update-backup')!;
+    assert.deepEqual(backup.folders, ['Alpha']);
+    assert.deepEqual(await readdir(path.join(root, 'Interface', '.beelite', 'trash', backup.id)), ['Alpha']);
+    assert.deepEqual(await readdir(addons), ['Alpha']);
+  } finally {
+    await cleanup(base);
+  }
+});
+
+test('F4 备份提示：旧目录全部缺失时不创建备份也不提示已备份；大小写不同的目录按实际名称计入', async () => {
+  const { base, root, src } = await setup();
+  try {
+    const m = makeManager(src);
+    const addons = path.join(root, 'Interface', 'AddOns');
+    // 1. 全部缺失
+    src.set('1', F, { name: 'P', fileId: '1', zip: zipOf(['Alpha', 'Beta'], 'v1'), folders: ['Alpha', 'Beta'] });
+    await m.install(root, F, '1');
+    await rm(path.join(addons, 'Alpha'), { recursive: true });
+    await rm(path.join(addons, 'Beta'), { recursive: true });
+    src.set('1', F, { name: 'P', fileId: '2', zip: zipOf(['Alpha'], 'v2'), folders: ['Alpha'] });
+    let r = await m.install(root, F, '1');
+    assert.ok(r.ok);
+    assert.deepEqual(r.warnings?.filter((w) => /Alpha|Beta/.test(w)), ['新版本不再包含 Beta；它们在更新前已不在 AddOns 中，没有可备份的内容']);
+    assert.equal((await m.readManifestFor(root)).recovery.filter((e) => e.kind === 'update-backup').length, 0, '没有内容可备份时不建立备份条目');
+
+    // 2. 大小写：清单记录 Alpha、Beta，磁盘上是 alpha、beta；新版本目录写作 ALPHA
+    const m2 = makeManager(src);
+    await m2.uninstallProject(root, '1');
+    src.set('2', F, { name: 'Q', fileId: '1', zip: zipOf(['Alpha', 'Beta'], 'v1'), folders: ['Alpha', 'Beta'] });
+    await m2.install(root, F, '2');
+    await rename(path.join(addons, 'Alpha'), path.join(addons, 'alpha'));
+    await rename(path.join(addons, 'Beta'), path.join(addons, 'beta'));
+    src.set('2', F, { name: 'Q', fileId: '2', zip: zipOf(['ALPHA'], 'v2'), folders: ['ALPHA'] });
+    r = await m2.install(root, F, '2');
+    assert.ok(r.ok);
+    assert.deepEqual(r.warnings?.filter((w) => /alpha|beta/i.test(w)), ['新版本不再包含 beta，已随旧版本一起移入备份'], '只提一次 beta，使用磁盘上的实际名称；ALPHA 与 alpha 视为同一目录');
+    const backup = (await m2.readManifestFor(root)).recovery.find((e) => e.kind === 'update-backup' && e.project?.modId === '2')!;
+    assert.deepEqual([...backup.folders].sort(), ['alpha', 'beta']);
+    assert.deepEqual(await readdir(addons), ['ALPHA']);
+  } finally {
+    await cleanup(base);
+  }
 });

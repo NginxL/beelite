@@ -168,22 +168,22 @@ test('进度刷新不重建按钮：取消按钮在多次进度事件中保持�
 
 const statusEl = () => root.all().find((e) => e.className.includes('client-status'));
 
-test('检查状态：文案说明是检查蜂简新版本；最新时明确是蜂简本身', () => {
+test('检查状态：文案说明是检查艾泽魔方新版本；最新时明确是艾泽魔方本身', () => {
   stateListener({ ...base, availableVersion: null, status: 'checking' });
-  assert.equal(statusEl().textContent, '正在检查蜂简新版本…');
+  assert.equal(statusEl().textContent, '正在检查艾泽魔方新版本…');
   assert.equal(shown(button('检查更新')), false, '检查中不显示检查按钮');
   stateListener({ ...base, availableVersion: null, status: 'up-to-date', canCheck: true });
-  assert.equal(statusEl().textContent, '蜂简已是最新版本');
+  assert.equal(statusEl().textContent, '艾泽魔方已是最新版本');
   assert.equal(shown(button('检查更新')), true);
 });
 
 test('超时停止中与停止宽限到期：显示主进程给出的原因（不用“正在检查”掩盖），不提供任何按钮', () => {
-  const stopping = '检查蜂简新版本超时，正在停止本次检查…';
+  const stopping = '检查艾泽魔方新版本超时，正在停止本次检查…';
   stateListener({ ...base, availableVersion: null, status: 'error', message: stopping, checkFailed: true });
   assert.equal(statusEl().textContent, stopping);
   assert.equal(shown(button('重试')), false, '周期结束前不能重试');
   assert.equal(shown(button('下载并更新')), false);
-  const stuck = '本次检查未能停止，请退出并重新打开蜂简后再检查';
+  const stuck = '本次检查未能停止，请退出并重新打开艾泽魔方后再检查';
   stateListener({ ...base, status: 'error', message: stuck, checkFailed: true });
   assert.equal(statusEl().textContent, stuck);
   assert.equal(shown(button('重试')), false);
@@ -191,7 +191,7 @@ test('超时停止中与停止宽限到期：显示主进程给出的原因（�
 });
 
 test('检查失败或超时并已结束：显示“重试”，之前发现的新版本仍显示“下载并更新”；点击重试只发起检查', async () => {
-  const msg = '检查蜂简新版本超时，请稍后重试；之前发现的 v0.9.2 仍可更新';
+  const msg = '检查艾泽魔方新版本超时，请稍后重试；之前发现的 v0.9.2 仍可更新';
   stateListener({ ...base, status: 'error', message: msg, checkFailed: true, canCheck: true, canUpdate: true });
   assert.equal(statusEl().textContent, msg);
   const retry = button('重试');
@@ -209,8 +209,8 @@ test('检查失败或超时并已结束：显示“重试”，之前发现的�
 
 test('界面重新载入：检查中与超时停止中的状态从主进程恢复，周期结束后出现“重试”', async () => {
   for (const [label, initial, text] of [
-    ['检查中', { ...base, availableVersion: null, status: 'checking' }, '正在检查蜂简新版本…'],
-    ['停止中', { ...base, availableVersion: null, status: 'error', message: '检查蜂简新版本超时，正在停止本次检查…', checkFailed: true }, '检查蜂简新版本超时，正在停止本次检查…'],
+    ['检查中', { ...base, availableVersion: null, status: 'checking' }, '正在检查艾泽魔方新版本…'],
+    ['停止中', { ...base, availableVersion: null, status: 'error', message: '检查艾泽魔方新版本超时，正在停止本次检查…', checkFailed: true }, '检查艾泽魔方新版本超时，正在停止本次检查…'],
   ]) {
     const page = new FakeElement('div');
     globalThis.document.getElementById = (id) => (id === 'client-update' ? page : new FakeElement('div'));
@@ -222,7 +222,7 @@ test('界面重新载入：检查中与超时停止中的状态从主进程恢�
     const check = page.all().find((e) => e.tagName === 'BUTTON' && (e.textContent === '检查更新' || e.textContent === '重试'));
     assert.equal(status.textContent, text, `${label}：重新载入后显示原状态`);
     assert.equal(!check.classList.contains('hidden'), false, `${label}：周期结束前没有检查按钮`);
-    stateListener({ ...base, availableVersion: null, status: 'error', message: '检查蜂简新版本超时，请稍后重试', checkFailed: true, canCheck: true });
+    stateListener({ ...base, availableVersion: null, status: 'error', message: '检查艾泽魔方新版本超时，请稍后重试', checkFailed: true, canCheck: true });
     assert.equal(check.textContent, '重试');
     assert.equal(!check.classList.contains('hidden'), true, `${label}：周期结束后显示重试`);
   }

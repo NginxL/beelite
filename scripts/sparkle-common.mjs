@@ -16,8 +16,12 @@ export const TOOLS_DIR = path.join(VENDOR_DIR, 'bin');
 export const SPARKLE_LICENSE = path.join(VENDOR_DIR, 'Sparkle-LICENSE');
 export const ADDON_PATH = path.join(PROJECT_ROOT, 'native', 'build', 'Release', 'beelite_sparkle.node');
 
+// 生产身份：productName / 可执行文件 / 应用文件名沿用 BeeLite（userData 与更新信任链不变），
+// 用户可见的显示名为 0.1.7 起的品牌「艾泽魔方」
 export const PRODUCTION = {
   productName: 'BeeLite',
+  displayName: '艾泽魔方',
+  copyright: 'Copyright © 2026 AzerCube',
   appId: 'app.beelite.addons',
   feedURL: 'https://github.com/NginxL/beelite/releases/latest/download/appcast.xml',
   keyAccount: 'app.beelite.addons',

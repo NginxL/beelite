@@ -65,7 +65,7 @@ test('自动弹出：纯文本说明、默认焦点“稍后”；稍后只发�
   C.maybePromptNotes();
   const open = openModals(dom);
   assert.equal(open.length, 1);
-  assert.match(open[0].textContent, /蜂简 v0\.1\.4 可用/);
+  assert.match(open[0].textContent, /艾泽魔方 v0\.1\.4 可用/);
   assert.match(open[0].textContent, /当前版本 v0\.1\.3/);
   const notes = notesOf(open[0]);
   assert.equal(notes.textContent, '修复 <script>alert(1)</script> & 改进');

@@ -194,7 +194,7 @@ test('启动后检查所有已绑定目录一次，之后每小时一次；休�
   }
 });
 
-test('只读：自动与手动检查不写设置、游戏目录（含 .beelite 与 WTF），没有蜂简数据的目录也不会被创建', async () => {
+test('只读：自动与手动检查不写设置、游戏目录（含 .beelite 与 WTF），没有艾泽魔方数据的目录也不会被创建', async () => {
   const x = await world();
   try {
     const C = await makeGameRoot(path.join(x.base, 'C'));
@@ -324,7 +324,7 @@ test('错误隔离：一个目录不可访问只影响它自己；设置无法�
     await x.clock.advance(CHECK_INTERVAL_MS);
     await idle(x.w);
     const s = x.w.snapshot();
-    assert.match(s.settingsError ?? '', /无法读取蜂简设置文件/);
+    assert.match(s.settingsError ?? '', /无法读取艾泽魔方设置文件/);
     assert.equal(x.src.calls.length, calls, '无法确认绑定时不检查');
     assert.equal(await readFile(x.settingsFile, 'utf8'), '{ broken', '不会改写设置文件');
 
@@ -541,7 +541,7 @@ test('设置无法读取：按读取次数核对，等满一小时才重读，�
     await x.clock.advance(CHECK_INTERVAL_MS); // 两个目录到期，读取设置失败
     await idle(x.w);
     const afterFail = reads;
-    assert.match(x.w.snapshot().settingsError ?? '', /无法读取蜂简设置文件/);
+    assert.match(x.w.snapshot().settingsError ?? '', /无法读取艾泽魔方设置文件/);
     for (let i = 0; i < 59; i++) {
       await x.clock.advance(MIN);
       await idle(x.w);
@@ -728,7 +728,7 @@ function controlledSettings(x: Awaited<ReturnType<typeof world>>) {
   const load = x.settings.load.bind(x.settings);
   x.settings.load = async () => {
     ctl.reads++;
-    if (ctl.broken) throw new UserError('无法读取蜂简设置文件（测试）：读取失败（EACCES）', 'settings');
+    if (ctl.broken) throw new UserError('无法读取艾泽魔方设置文件（测试）：读取失败（EACCES）', 'settings');
     return load();
   };
   return ctl;
@@ -747,7 +747,7 @@ test('多目录：一个检查发布前读设置失败后，排队中的其他�
     await idle(x.w);
     assert.equal(x.src.calls.length, 1, '第二个目录（A）的自动检查没有开始');
     assert.equal(ctl.reads, 2, 'B 发布前读取一次（失败），之后没有再读');
-    assert.match(x.w.snapshot().settingsError ?? '', /无法读取蜂简设置文件/);
+    assert.match(x.w.snapshot().settingsError ?? '', /无法读取艾泽魔方设置文件/);
     assert.ok(x.w.snapshot().entries.every((e) => e.status === 'error' && e.items.length === 0), '所有目录都标为无法确认');
     for (let i = 0; i < 59; i++) {
       await x.clock.advance(MIN);
@@ -779,7 +779,7 @@ test('设置读取失败期间，用户手动 / 全部更新的检查不被排�
     assert.ok(x.w.snapshot().settingsError);
     const release = x.gate.enter();
     // 设置仍不可读：显式检查照常执行，但无法确认绑定，明确拒绝而不是挂起
-    await assert.rejects(x.w.check(9, x.A, { fresh: true }), /无法读取蜂简设置文件/);
+    await assert.rejects(x.w.check(9, x.A, { fresh: true }), /无法读取艾泽魔方设置文件/);
     ctl.broken = false;
     const items = await x.w.check(9, x.A, { fresh: true });
     assert.equal(items.length, 2, '设置恢复后显式检查立即成功（不受一小时期限限制）');
@@ -834,7 +834,7 @@ test('设置恢复：检查中读设置失败后，修复并手动检查成功�
     await idle(x.w);
     assert.equal(x.entry(9, x.A)?.pending, 1);
     ctl.broken = true;
-    await assert.rejects(x.w.check(3, x.B, { fresh: true }), /无法读取蜂简设置文件/);
+    await assert.rejects(x.w.check(3, x.B, { fresh: true }), /无法读取艾泽魔方设置文件/);
     let s = x.w.snapshot();
     assert.ok(s.settingsError);
     assert.equal(x.entry(9, x.A)?.pending, 0, 'A 的旧结论在设置不可读时作废');
@@ -897,5 +897,142 @@ test('没有任何目录时设置读取失败：重读期限一到照常读取�
   } finally {
     x.w.stop();
     await cleanup(x.base);
+  }
+});
+
+// ---------- 0.1.7 回归：写后回读重叠 ----------
+
+/**
+ * 读回可控的检查接口：hold 时每次读回立即读取当时的清单，但等测试放行才交出结果（或以给定错误失败）。
+ * 用来让两次写后回读按指定顺序返回。
+ */
+function heldReadback(x: Awaited<ReturnType<typeof world>>) {
+  const held: { ok: () => void; fail: (err: unknown) => void }[] = [];
+  const ctl = { hold: false, held };
+  const checker = {
+    checkUpdatesDetailed: x.checker.checkUpdatesDetailed.bind(x.checker),
+    readCheckedManifest: async (root: string) => {
+      if (!ctl.hold) return x.checker.readCheckedManifest(root);
+      const value = await x.checker.readCheckedManifest(root);
+      return new Promise<typeof value>((resolve, reject) => held.push({ ok: () => resolve(value), fail: reject }));
+    },
+  };
+  return { ctl, checker };
+}
+
+/**
+ * 目录 A 的 M1、M2 都有新文件（2），自动结果显示 2 个可更新；随后依次更新 M1、M2，各自触发一次写后回读：
+ * 旧回读看到 M1=2、M2=1，新回读看到两者都是 2。按 order 放行，返回最终的目录状态与放行第一个之后的快照数。
+ */
+async function overlap(order: 'old-first' | 'new-first', oldOk: boolean, newOk: boolean) {
+  const x = await world();
+  const { ctl, checker } = heldReadback(x);
+  const snaps: AddonWatchSnapshot[] = [];
+  const w = new AddonUpdateWatch({ settings: x.settings, checker, gate: x.gate, clock: x.clock, onChange: (s) => snaps.push(s) });
+  try {
+    x.fake.set('1', 9, { name: 'M1', fileId: '2', zip: zipOf('M1', 'v2') });
+    x.fake.set('2', 9, { name: 'M2', fileId: '2', zip: zipOf('M2', 'v2') });
+    await w.check(9, x.A);
+    assert.equal(w.snapshot().entries.find((e) => e.flavorId === 9)!.pending, 2);
+    ctl.hold = true;
+    await x.writer.install(x.A, 9, '1');
+    const a1 = w.afterWrite(9, x.A);
+    await until(() => ctl.held.length === 1, '旧回读已读取清单');
+    await x.writer.install(x.A, 9, '2');
+    const a2 = w.afterWrite(9, x.A);
+    await until(() => ctl.held.length === 2, '新回读已读取清单');
+    const [oldR, newR] = ctl.held;
+    const settle = (r: (typeof ctl.held)[number], ok: boolean) => (ok ? r.ok() : r.fail(new Error('EIO: 读取失败')));
+    const first = order === 'old-first' ? [oldR, oldOk, a1] as const : [newR, newOk, a2] as const;
+    const second = order === 'old-first' ? [newR, newOk, a2] as const : [oldR, oldOk, a1] as const;
+    settle(first[0], first[1]);
+    await first[2];
+    const afterFirst = snaps.length;
+    settle(second[0], second[1]);
+    await second[2];
+    return { entry: w.snapshot().entries.find((e) => e.flavorId === 9)!, afterFirst, total: snaps.length };
+  } finally {
+    w.stop();
+    x.w.stop();
+    await cleanup(x.base);
+  }
+}
+
+test('F3 写后回读重叠（都成功）：无论哪个先返回，都以最近一次写入的回读为准，不残留已更新插件的提醒', async () => {
+  for (const order of ['old-first', 'new-first'] as const) {
+    const { entry, afterFirst, total } = await overlap(order, true, true);
+    assert.equal(entry.status, 'ok', order);
+    assert.equal(entry.pending, 0, `${order}：两项都已更新，不应残留可更新`);
+    assert.deepEqual(entry.items.map((i) => [i.modId, i.installedFileId, i.hasUpdate]).sort(), [['1', '2', false], ['2', '2', false]], order);
+    if (order === 'new-first') assert.equal(total, afterFirst, '新结果发布后，迟到的旧回读不再发布');
+  }
+});
+
+test('F3 写后回读重叠（失败）：旧回读失败不覆盖新结果；新回读失败时如实标为无法确认，旧回读不能把它改回旧结论', async () => {
+  for (const order of ['old-first', 'new-first'] as const) {
+    const oldFails = await overlap(order, false, true);
+    assert.equal(oldFails.entry.status, 'ok', `${order}：旧回读失败不进入 error`);
+    assert.equal(oldFails.entry.error, null);
+    assert.equal(oldFails.entry.pending, 0);
+
+    const newFails = await overlap(order, true, false);
+    assert.equal(newFails.entry.status, 'error', `${order}：最近一次回读失败时无法确认`);
+    assert.match(newFails.entry.error ?? '', /无法确认更新状态/);
+    assert.deepEqual(newFails.entry.items, []);
+  }
+});
+
+test('F3 写后回读与手动检查交错：回读等待期间手动检查已发布结果时，迟到的回读不覆盖（rev）；换绑后迟到的回读不发布', async () => {
+  // 1. 手动检查交错
+  {
+    const x = await world();
+    const { ctl, checker } = heldReadback(x);
+    const w = new AddonUpdateWatch({ settings: x.settings, checker, gate: x.gate, clock: x.clock });
+    try {
+      x.fake.set('1', 9, { name: 'M1', fileId: '2', zip: zipOf('M1', 'v2') });
+      x.fake.set('2', 9, { name: 'M2', fileId: '2', zip: zipOf('M2', 'v2') });
+      await w.check(9, x.A);
+      ctl.hold = true;
+      await x.writer.install(x.A, 9, '1');
+      const a1 = w.afterWrite(9, x.A);
+      await until(() => ctl.held.length === 1, '回读已读取清单');
+      ctl.hold = false;
+      await x.writer.install(x.A, 9, '2'); // 没有经过协调器的写入（例如外部改动），由手动检查发现
+      const items = await w.check(9, x.A, { fresh: true });
+      assert.equal(items.filter((i) => i.hasUpdate).length, 0, '回读等待期间开始的手动检查照常发布，不被当作作废');
+      const published = w.snapshot().entries.find((e) => e.flavorId === 9)!;
+      ctl.held[0].ok();
+      await a1;
+      assert.deepEqual(w.snapshot().entries.find((e) => e.flavorId === 9), published, '迟到的旧回读没有覆盖手动检查的结果');
+    } finally {
+      w.stop();
+      x.w.stop();
+      await cleanup(x.base);
+    }
+  }
+  // 2. 换绑：回读等待期间该版本绑定变化
+  {
+    const x = await world();
+    const { ctl, checker } = heldReadback(x);
+    const snaps: AddonWatchSnapshot[] = [];
+    const w = new AddonUpdateWatch({ settings: x.settings, checker, gate: x.gate, clock: x.clock, onChange: (s) => snaps.push(s) });
+    try {
+      x.fake.set('1', 9, { name: 'M1', fileId: '2', zip: zipOf('M1', 'v2') });
+      await w.check(9, x.A);
+      ctl.hold = true;
+      await x.writer.install(x.A, 9, '1');
+      const a1 = w.afterWrite(9, x.A);
+      await until(() => ctl.held.length === 1, '回读已读取清单');
+      w.invalidateFlavor(9);
+      const count = snaps.length;
+      ctl.held[0].ok();
+      await a1;
+      assert.equal(snaps.length, count, '换绑后迟到的回读不发布');
+      assert.equal(w.snapshot().entries.find((e) => e.flavorId === 9), undefined);
+    } finally {
+      w.stop();
+      x.w.stop();
+      await cleanup(x.base);
+    }
   }
 });

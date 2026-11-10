@@ -267,9 +267,9 @@ test('设置文件变得不可读：界面不再把旧的“已是最新”当�
     const good = await readFile(file, 'utf8');
     await writeFile(file, '{ broken');
     // 主进程的检查在发布前读取设置失败（例如自动检查）
-    await assert.rejects(h.service.watch.check(F, S.state.local.profile.root, { fresh: true }), /无法读取蜂简设置文件/);
+    await assert.rejects(h.service.watch.check(F, S.state.local.profile.root, { fresh: true }), /无法读取艾泽魔方设置文件/);
     S.applyWatch(h.service.watch.snapshot());
-    assert.match(S.state.watch.settingsError ?? '', /无法读取蜂简设置文件/);
+    assert.match(S.state.watch.settingsError ?? '', /无法读取艾泽魔方设置文件/);
     assert.equal(S.updateFor(p('200')), undefined, '不再显示“已是最新”');
     assert.equal(S.state.updatesChecked, false);
     assert.equal(S.updateCount(), 0);

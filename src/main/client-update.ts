@@ -17,6 +17,6 @@ export function loadSparkleBridge(): { bridge: SparkleBridge | null; reason?: st
   } catch (err) {
     // 详细原因（可能含内部路径与堆栈）只写入控制台，界面显示简短说明
     console.error('[BeeLite] 客户端更新组件加载失败：', err);
-    return { bridge: null, reason: '客户端更新组件无法加载，请重新下载安装蜂简' };
+    return { bridge: null, reason: '客户端更新组件无法加载，请重新下载安装艾泽魔方' };
   }
 }

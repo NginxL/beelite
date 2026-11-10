@@ -1,6 +1,8 @@
 # 维护者：签名与发布
 
-本文面向发布蜂简的维护者，普通用户不需要阅读。
+本文面向发布艾泽魔方 · AzerCube 的维护者，普通用户不需要阅读。
+
+0.1.7 起用户可见的品牌由「蜂简 BeeLite」改为「艾泽魔方 · AzerCube」，只改显示名：`productName`、`CFBundleName`、可执行文件、`BeeLite.app`、安装包前缀 `BeeLite-`、appId `app.beelite.addons`、签名账户、feed 地址、公钥与仓库都保持不变：保留这些值以延续既有的配置路径与更新信任链。生产包的 `CFBundleDisplayName` 为 `艾泽魔方`、`NSHumanReadableCopyright` 为 `Copyright © 2026 AzerCube`，appcast 标题由 `scripts/release-lib.mjs` 的 `appcastTitles` 生成。
 
 ## 客户端更新的信任链
 
@@ -12,7 +14,7 @@
   - `SUSignedFeedFailureExpirationInterval = 0`：feed 签名校验失败时始终拒绝，不进入宽限模式。
 - 应用只有 ad-hoc 代码签名，新旧版本的代码签名身份不同，无法用"新旧代码签名一致"来认可更新，所以 **EdDSA 签名是更新的信任根**：私钥就是信任根。但它不是唯一的检查。按 Sparkle 2.9.6 `SUUpdateValidator.m`（约第 174–200 行及 `passesBasicUpdatePolicy`），Sparkle 还会检查基本更新策略（例如旧版带有 EdDSA 公钥时新版也必须带有、旧版有代码签名时新版也必须有），并校验新应用自身的代码签名完整有效。签名有效但代码签名损坏的包同样会被拒绝。
 
-这些设置由 `npm run dist` 末尾的 `scripts/verify-app.mjs production` 检查；生产包中出现测试身份、测试 feed 或测试公钥时会失败。生产环境如需关闭其中任何一项，需要重新评审。
+这些设置由 `npm run dist` 末尾的 `scripts/verify-app.mjs production` 检查；生产包中出现测试身份、测试 feed 或测试公钥时会失败。它同时核对上面保持不变的内部身份（`CFBundleName`、`CFBundleExecutable`、应用文件名）以及显示名与版权。生产环境如需关闭其中任何一项，需要重新评审。
 
 ### 更新说明
 
@@ -60,6 +62,6 @@
 
 ## 发布前的端到端验收
 
-`npm run e2e:build` 会构建两个隔离的测试版本（productName `BeeLite E2E`、appId `app.beelite.addons.e2e`，使用每次新建的测试签名账户和 `http://127.0.0.1:47831/appcast.xml`），并生成正常（带测试说明 `test/fixtures/e2e-release-notes.txt`）、无说明与负向用例的 feed 目录；每次运行目录中的 `identity.json` 记录了测试账户和删除命令，验收步骤见 [E2E.md](E2E.md)。测试包的 userData 与 Sparkle 偏好都按测试身份隔离，不会读写正式版本的数据；但这些位置是固定的，多次运行共用，清理时只能删除本次运行创建的内容（见 E2E.md）。
+`npm run e2e:build` 会构建两个隔离的测试版本（productName `BeeLite E2E`、appId `app.beelite.addons.e2e`、显示名 `AzerCube E2E`，使用每次新建的测试签名账户和 `http://127.0.0.1:47831/appcast.xml`），并生成正常（带测试说明 `test/fixtures/e2e-release-notes.txt`）、无说明与负向用例的 feed 目录；每次运行目录中的 `identity.json` 记录了测试账户和删除命令，验收步骤见 [E2E.md](E2E.md)。测试包的 userData 与 Sparkle 偏好都按测试身份隔离，不会读写正式版本的数据；但这些位置是固定的，多次运行共用，清理时只能删除本次运行创建的内容（见 E2E.md）。
 
 `node scripts/e2e-feed-server.mjs <feed 目录> --port 47831 [--rate <字节/秒>]` 提供本地 feed。验收结束后按 `identity.json` 删除本次测试密钥。

@@ -3,7 +3,7 @@
 // - 每个原生会话使用严格递增的会话编号；原生事件带有所属会话的编号与意图，只接受当前会话的事件，其余一律丢弃。
 // - 检查有固定预算（CHECK_TIMEOUT_MS）：到期仍未结束则请求原生取消，本次检查作废（之后到达的结果一律不采用），
 //   进入 ending 屏障，直到该会话的周期真正结束（cycle-finished）才报告超时并允许重试；不会仅凭计时器或取消的返回值就允许重试。
-//   停止宽限（STOP_GRACE_MS）到期仍未结束时如实提示退出并重新打开蜂简，此后若该周期结束仍会解除屏障。不自动重试。
+//   停止宽限（STOP_GRACE_MS）到期仍未结束时如实提示退出并重新打开艾泽魔方，此后若该周期结束仍会解除屏障。不自动重试。
 // - update()：用户点击“下载并更新”时唯一的授权入口；原生侧只在本次授权内才同意下载与安装。
 // - 下载、验签、解压完成（ready）后：同步冻结写操作 → 等待已受理的写操作全部结束 → 复核本次尝试仍有效 → 才通知原生安装并重启。
 // - 取消只在原生确认确有取消手段时生效（下载中、等待插件操作完成时）；解压阶段不提供取消。
@@ -85,9 +85,9 @@ const SYSTEM_TIMERS: UpdateTimers = {
   clearTimeout: (h) => clearTimeout(h as ReturnType<typeof setTimeout>),
 };
 
-const MSG_TIMEOUT_STOPPING = '检查蜂简新版本超时，正在停止本次检查…';
-const MSG_TIMEOUT = '检查蜂简新版本超时，请稍后重试';
-const MSG_STUCK = '本次检查未能停止，请退出并重新打开蜂简后再检查';
+const MSG_TIMEOUT_STOPPING = '检查艾泽魔方新版本超时，正在停止本次检查…';
+const MSG_TIMEOUT = '检查艾泽魔方新版本超时，请稍后重试';
+const MSG_STUCK = '本次检查未能停止，请退出并重新打开艾泽魔方后再检查';
 
 /** Sparkle 的 SUNoUpdateError */
 const SU_NO_UPDATE_ERROR = 1001;
@@ -199,7 +199,7 @@ export class ClientUpdater {
       // 详细原因只写入控制台，界面显示简短说明
       console.error('[BeeLite] 客户端更新组件启动失败：', r.error ?? '未知错误');
       this.bridge = null;
-      this.set('unsupported', { message: '客户端更新组件启动失败，请重新下载安装蜂简' });
+      this.set('unsupported', { message: '客户端更新组件启动失败，请重新下载安装艾泽魔方' });
     }
   }
 
@@ -254,7 +254,7 @@ export class ClientUpdater {
     const id = ++this.lastSession;
     if (!this.bridge.probe(id)) {
       this.checkFailed = true;
-      this.set('error', { message: '暂时无法检查蜂简新版本，请稍后重试' });
+      this.set('error', { message: '暂时无法检查艾泽魔方新版本，请稍后重试' });
       return this.getState();
     }
     this.track(id, 'probe');
@@ -458,7 +458,7 @@ export class ClientUpdater {
         this.set('up-to-date', { message: null });
       } else {
         this.checkFailed = true;
-        this.set('error', { message: this.withOffer(`检查蜂简新版本失败：${ev.error ?? '未知错误'}`) });
+        this.set('error', { message: this.withOffer(`检查艾泽魔方新版本失败：${ev.error ?? '未知错误'}`) });
       }
       return;
     }

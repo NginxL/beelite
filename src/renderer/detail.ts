@@ -160,7 +160,7 @@ function renderFileCard(c: DrawerState, mod: ModSummary): HTMLElement {
       notes.push(h('div', { class: 'inline-error', text: `该文件声明的游戏版本与当前「${currentName()}」不匹配，已禁止安装。` }));
     }
   }
-  if (!mod.accessible) notes.push(h('div', { class: 'inline-note', text: '仅支持免费公开插件，该插件无法通过蜂简安装。' }));
+  if (!mod.accessible) notes.push(h('div', { class: 'inline-note', text: '仅支持免费公开插件，该插件无法通过艾泽魔方安装。' }));
 
   return h('div', { class: 'file-card' },
     h('div', { class: 'file-card-head' },

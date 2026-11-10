@@ -4,6 +4,7 @@ import { mkdir, readdir, rename, rm, rmdir, unlink } from 'node:fs/promises';
 import path from 'node:path';
 import type { DirState, LocalFolder, LocalState, ManagedProjectView, OpResult, ProfileInfo, RecoveryEntryView, TaskPhase, TocInfo, UpdateCheckItem } from '../shared/types';
 import { SimulatedCrash, UserError, errorMessage, isTransientError } from './errors';
+import { canonicalFileId } from './file-id';
 import { getFlavor } from './flavors';
 import { inspectLayout, newTxId, pathExists, readFileNoFollow, syncDir, writableLayout, writeFileAtomic, type Layout } from './layout';
 import { downloadToFile, type DownloadOptions, type DownloadResult } from './net';
@@ -164,13 +165,13 @@ export class AddonManager {
     await writeFileAtomic(l.manifestPath, JSON.stringify({ ...manifest, purgeQueue: [] }, null, 1));
   }
 
-  /** 恢复残留事务；目录还没有蜂简数据时直接返回 ok，不创建任何东西 */
+  /** 恢复残留事务；目录还没有艾泽魔方数据时直接返回 ok，不创建任何东西 */
   async recover(root: string): Promise<DirState> {
     const info = await inspectLayout(root, false);
     if (!info.hasInterface || !(await pathExists(info.l.metaDir))) return { status: 'ok', message: null };
     if (!info.hasMeta) {
       // 数据目录不完整：不做任何写入，只报告状态
-      if (await pathExists(info.l.journalPath)) return { status: 'blocked', message: `${BLOCKED_PREFIX}蜂简数据目录不完整。` };
+      if (await pathExists(info.l.journalPath)) return { status: 'blocked', message: `${BLOCKED_PREFIX}艾泽魔方数据目录不完整。` };
       return { status: 'ok', message: null };
     }
     return this.withLock(info.l.interfaceDir, async () => {
@@ -187,7 +188,7 @@ export class AddonManager {
     return { l, manifest: (await readManifest(l)).manifest };
   }
 
-  /** 只读汇总本地状态：扫描 AddOns 不依赖蜂简数据是否存在；没有 manifest 时全部视为未托管 */
+  /** 只读汇总本地状态：扫描 AddOns 不依赖艾泽魔方数据是否存在；没有 manifest 时全部视为未托管 */
   async localState(profile: ProfileInfo & { root: string }, flavorId: number): Promise<LocalState> {
     const suffixes = getFlavor(flavorId)?.tocSuffixes ?? [];
     const empty: LocalState = { flavorId, profile, dir: null, managed: [], unmanaged: [], recovery: [], error: null };
@@ -288,8 +289,10 @@ export class AddonManager {
     phase('checking');
     // 免费与可访问性复核、按 flavor 取最新文件（服务端没有该版本文件时会直接报错，不做回退）
     const detail = await this.opts.source.detail(modId, flavorId, o.signal);
-    if (!detail.accessible) throw new UserError('该插件不是免费公开内容，蜂简不提供安装');
+    if (!detail.accessible) throw new UserError('该插件不是免费公开内容，艾泽魔方不提供安装');
     const latest = await this.opts.source.latest(modId, flavorId, o.signal);
+    // 文件编号会提交到清单：必须已是规范形式（与 parseLatest 的输出一致），否则在下载与加锁之前拒绝
+    if (canonicalFileId(latest.fileId) !== latest.fileId) throw new UserError('服务器返回的文件编号无效');
     if (!latest.compatible) {
       throw new UserError(`该文件声明的游戏版本（${latest.gameVersions.join('、') || '未知'}）与当前游戏版本不匹配，已停止安装`);
     }
@@ -299,7 +302,7 @@ export class AddonManager {
       const existing = manifest.projects[modId];
       if (existing && existing.flavorId !== flavorId) {
         throw new UserError(
-          `「${existing.name}」已以「${getFlavor(existing.flavorId)?.name ?? existing.flavorId}」版本安装在这个目录，与当前游戏版本不同，蜂简不会用当前版本的文件更新或重装它。如需改用当前版本，请先卸载再安装。`,
+          `「${existing.name}」已以「${getFlavor(existing.flavorId)?.name ?? existing.flavorId}」版本安装在这个目录，与当前游戏版本不同，艾泽魔方不会用当前版本的文件更新或重装它。如需改用当前版本，请先卸载再安装。`,
           'flavor-mismatch',
         );
       }
@@ -308,7 +311,7 @@ export class AddonManager {
         throw new UserError(`「${existing.name}」已经安装在这个目录，未做任何改动`, 'changed');
       }
       if (expect?.kind === 'record') {
-        if (!existing) throw new UserError(`「${detail.name}」已不在这个目录的蜂简管理列表中（可能已被卸载），未做任何改动`, 'changed');
+        if (!existing) throw new UserError(`「${detail.name}」已不在这个目录的艾泽魔方管理列表中（可能已被卸载），未做任何改动`, 'changed');
         if (existing.fileId !== expect.fileId || existing.installedAt !== expect.installedAt) {
           throw new UserError(`「${existing.name}」在操作受理后已被重新安装、更新或恢复，未做任何改动，请刷新后重试`, 'changed');
         }
@@ -356,7 +359,7 @@ export class AddonManager {
 
         if (takeover.length || diff) {
           const lines: string[] = [];
-          if (takeover.length) lines.push(`以下目录已存在但不由蜂简管理，继续将把它们移入回收站（可恢复）并由本插件接管：\n${takeover.join('、')}`);
+          if (takeover.length) lines.push(`以下目录已存在但不由艾泽魔方管理，继续将把它们移入回收站（可恢复）并由本插件接管：\n${takeover.join('、')}`);
           if (diff) lines.push(`压缩包实际包含的目录与服务器记录不一致。\n服务器：${latest.folders.join('、') || '（无）'}\n压缩包：${zip.modules.join('、')}`);
           const ok = await this.opts.confirm({ title: '确认安装', message: `安装「${detail.name}」前需要确认`, detail: lines.join('\n\n') });
           if (!ok) {
@@ -400,9 +403,12 @@ export class AddonManager {
           await this.drainPurgeQueue(l, next);
         });
         phase('done');
-        const retired = existing ? oldFolders.filter((f) => !actual.has(foldKey(f))) : [];
+        // 只把实际移入备份的目录说成“已备份”；更新前已不在 AddOns 中的旧目录单独说明，不承诺可以找回
+        const retired = existing ? backup.filter((f) => !actual.has(foldKey(f))) : [];
+        const missingOld = existing ? oldFolders.filter((f) => !disk.has(foldKey(f)) && !actual.has(foldKey(f))) : [];
         const warnings = [...zip.warnings];
         if (retired.length) warnings.push(`新版本不再包含 ${retired.join('、')}，已随旧版本一起移入备份`);
+        if (missingOld.length) warnings.push(`新版本不再包含 ${missingOld.join('、')}；它们在更新前已不在 AddOns 中，没有可备份的内容`);
         return {
           ok: true,
           message: !existing
@@ -432,7 +438,7 @@ export class AddonManager {
     return this.withLock(await this.lockKey(root), async () => {
       const { l, manifest } = await this.openForWrite(root);
       const project = manifest.projects[modId];
-      if (!project) throw new UserError('该插件不在蜂简管理列表中');
+      if (!project) throw new UserError('该插件不在艾泽魔方管理列表中');
       const disk = await this.diskNames(l);
       const present = project.folders.filter((f) => disk.has(foldKey(f))).map((f) => disk.get(foldKey(f))!);
       const missing = project.folders.filter((f) => !disk.has(foldKey(f)));
@@ -535,12 +541,8 @@ export class AddonManager {
    */
   async checkUpdatesDetailed(root: string, flavorId: number, signal?: AbortSignal): Promise<{ items: UpdateCheckItem[]; fingerprint: string }> {
     signal?.throwIfAborted();
-    const info = await inspectLayout(root, false);
-    if (!info.hasMeta) {
-      signal?.throwIfAborted();
-      return { items: [], fingerprint: manifestFingerprint(emptyManifest()) };
-    }
-    const { manifest } = await readManifest(info.l);
+    const manifest = await this.readOnlyManifest(root);
+    signal?.throwIfAborted();
     const out: UpdateCheckItem[] = [];
     const projects: ProjectRecord[] = [];
     for (const p of Object.values(manifest.projects)) {
@@ -569,17 +571,25 @@ export class AddonManager {
     return { items: out, fingerprint: manifestFingerprint(manifest) };
   }
 
-  /** 当前清单（只读），与 checkUpdatesDetailed 的判定一致：蜂简数据目录不完整时视为空清单 */
+  /** 当前清单（只读），与 checkUpdatesDetailed 读取同一份清单 */
   async readCheckedManifest(root: string): Promise<{ manifest: Manifest; fingerprint: string }> {
-    const info = await inspectLayout(root, false);
-    const manifest = info.hasMeta ? (await readManifest(info.l)).manifest : emptyManifest();
+    const manifest = await this.readOnlyManifest(root);
     return { manifest, fingerprint: manifestFingerprint(manifest) };
   }
 
   /** 读取 manifest（只读） */
   async readManifestFor(root: string): Promise<Manifest> {
+    return this.readOnlyManifest(root);
+  }
+
+  /**
+   * 检查、读回与批次共用的只读清单读取：按数据目录中实际的 manifest.json 读取，不要求 staging/trash 存在
+   * （它们缺失时由下一次写操作补齐）。没有数据目录或清单时为空清单；不创建目录、不恢复事务。
+   * 已存在的内部目录仍须是真实目录，清单读取不跟随符号链接，读取失败如实抛出。
+   */
+  private async readOnlyManifest(root: string): Promise<Manifest> {
     const info = await inspectLayout(root, false);
-    if (!(await pathExists(info.l.metaDir))) return emptyManifest();
+    if (!info.hasInterface || !(await pathExists(info.l.metaDir))) return emptyManifest();
     return (await readManifest(info.l)).manifest;
   }
 }

@@ -56,6 +56,17 @@ export function descriptionElement(notes) {
   return `<description sparkle:format="plain-text">${xml(normalizeReleaseNotes(notes))}</description>`;
 }
 
+/**
+ * appcast 的频道与条目标题（feed 中可见的名字）：生产为「艾泽魔方 · AzerCube」，测试包带上自己的 productName 以便区分。
+ * 篡改用例按这里的条目标题定位要改动的内容，两处共用同一个函数。
+ */
+export function appcastTitles({ mode, productName, version }) {
+  return {
+    title: mode === 'production' ? '艾泽魔方 · AzerCube' : `艾泽魔方 ${productName}`,
+    itemTitle: `艾泽魔方 ${version}`,
+  };
+}
+
 export function buildAppcast(o) {
   const description = o.notes === undefined || o.notes === null ? '' : `\n      ${descriptionElement(o.notes)}`;
   return `<?xml version="1.0" encoding="utf-8"?>

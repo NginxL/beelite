@@ -42,7 +42,7 @@ export async function pathExists(p: string): Promise<boolean> {
 async function checkRealDir(p: string, create: boolean, label: string): Promise<boolean> {
   try {
     const st = await lstat(p);
-    if (st.isSymbolicLink()) throw new UserError(`${label}是符号链接，为避免写到意外位置，蜂简不会使用它：${p}`, 'layout');
+    if (st.isSymbolicLink()) throw new UserError(`${label}是符号链接，为避免写到意外位置，艾泽魔方不会使用它：${p}`, 'layout');
     if (!st.isDirectory()) throw new UserError(`${label}不是目录：${p}`, 'layout');
     return true;
   } catch (err) {
@@ -85,16 +85,16 @@ export async function inspectLayout(root: string, create: boolean): Promise<Layo
   const hasInterface = await checkRealDir(l.interfaceDir, create, 'Interface 目录');
   if (!hasInterface) return { l, hasInterface, hasAddons: false, hasMeta: false };
   const hasAddons = await checkRealDir(l.addonsDir, create, 'AddOns 目录');
-  const meta = await checkRealDir(l.metaDir, create, '蜂简数据目录');
+  const meta = await checkRealDir(l.metaDir, create, '艾泽魔方数据目录');
   let hasMeta = false;
   if (meta) {
-    const staging = await checkRealDir(l.stagingDir, create, '蜂简暂存目录');
-    const trash = await checkRealDir(l.trashDir, create, '蜂简回收目录');
+    const staging = await checkRealDir(l.stagingDir, create, '艾泽魔方暂存目录');
+    const trash = await checkRealDir(l.trashDir, create, '艾泽魔方回收目录');
     hasMeta = staging && trash;
   }
   if (hasAddons && meta) {
     const [a, m] = await Promise.all([stat(l.addonsDir), stat(l.metaDir)]);
-    if (a.dev !== m.dev) throw new UserError('AddOns 与蜂简数据目录不在同一磁盘卷上，无法保证安全替换，已停止写入', 'layout');
+    if (a.dev !== m.dev) throw new UserError('AddOns 与艾泽魔方数据目录不在同一磁盘卷上，无法保证安全替换，已停止写入', 'layout');
   }
   return { l, hasInterface, hasAddons, hasMeta };
 }

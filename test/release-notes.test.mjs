@@ -8,8 +8,8 @@ import { buildAppcast, descriptionElement, MAX_NOTES_CHARS, normalizeReleaseNote
 
 const ROOT = path.join(path.dirname(fileURLToPath(import.meta.url)), '..');
 const base = {
-  title: '蜂简 BeeLite',
-  itemTitle: '蜂简 0.1.4',
+  title: '艾泽魔方 · AzerCube',
+  itemTitle: '艾泽魔方 0.1.4',
   pubDate: 'Sun, 08 Nov 2026 00:00:00 GMT',
   version: '0.1.4',
   shortVersion: '0.1.4',

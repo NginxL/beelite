@@ -19,7 +19,7 @@ function isPlainObject(v: unknown): v is Record<string, unknown> {
 }
 
 function settingsError(file: string, reason: string): UserError {
-  return new UserError(`无法读取蜂简设置文件（${file}）：${reason}。为避免覆盖已有的目录绑定，已暂停读取和修改绑定；请修复该文件或恢复备份后点击重试。`, 'settings');
+  return new UserError(`无法读取艾泽魔方设置文件（${file}）：${reason}。为避免覆盖已有的目录绑定，已暂停读取和修改绑定；请修复该文件或恢复备份后点击重试。`, 'settings');
 }
 
 /** 严格校验设置内容：任何不合法之处都报错，不丢弃条目（否则保存时会悄悄删掉它们） */

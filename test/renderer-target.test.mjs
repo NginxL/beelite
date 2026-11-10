@@ -208,7 +208,7 @@ test('刷新失败时界面上的旧快照不会成为操作目标；修复后�
     const good = await import('node:fs/promises').then((f) => f.readFile(settingsFile));
     await writeFile(settingsFile, '{"schema":1,"bindings":');
     await S.refreshLocal();
-    assert.match(S.state.localError, /无法读取蜂简设置文件/);
+    assert.match(S.state.localError, /无法读取艾泽魔方设置文件/);
     assert.ok(S.state.local, '旧快照仍在界面上显示');
     assert.equal(S.currentTarget(), null);
     await L.uninstallProject(p('200'));

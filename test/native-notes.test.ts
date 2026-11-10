@@ -38,7 +38,7 @@ test('原生读取更新说明：只接受签名通过的 sparkle:format="plain-
     assert.equal(cc.status, 0, cc.stderr);
 
     const feed = (notes?: string) => buildAppcast({
-      title: '蜂简', itemTitle: '蜂简 0.1.4', pubDate: 'Sun, 08 Nov 2026 00:00:00 GMT', version: '0.1.4', shortVersion: '0.1.4',
+      title: '艾泽魔方', itemTitle: '艾泽魔方 0.1.4', pubDate: 'Sun, 08 Nov 2026 00:00:00 GMT', version: '0.1.4', shortVersion: '0.1.4',
       minimumSystemVersion: '13.0.0', url: 'https://github.com/NginxL/beelite/releases/download/v0.1.4/x.zip', length: 1, signature: 'abc=', notes,
     });
     const ok = feed(NOTES);

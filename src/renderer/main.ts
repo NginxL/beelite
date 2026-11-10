@@ -72,7 +72,7 @@ function renderUpdateHints(): void {
   if (settingsError) {
     // 设置文件无法读取：无法确认任何目录的绑定，旧结论已作废；所有页面都显示这一状态
     mount(updateNotice,
-      h('span', { class: 'update-notice-text', text: '插件更新检查已暂停：无法读取蜂简设置文件，暂时无法确认插件是否有更新。', title: settingsError }),
+      h('span', { class: 'update-notice-text', text: '插件更新检查已暂停：无法读取艾泽魔方设置文件，暂时无法确认插件是否有更新。', title: settingsError }),
       h('span', { class: 'update-notice-hint', text: '修复设置文件后，先在「我的插件」点「刷新」或「重试」恢复列表，再点「检查更新」恢复检查' }),
     );
     updateNotice.classList.remove('hidden');
@@ -172,7 +172,7 @@ function boot(): void {
   if (!window.beelite) {
     mount(byId('page-discover'), h('div', { class: 'state-box state-error' },
       h('div', { class: 'state-title', text: '界面未能连接到主进程' }),
-      h('div', { class: 'state-msg', text: '请通过蜂简应用启动本界面。' }),
+      h('div', { class: 'state-msg', text: '请通过艾泽魔方应用启动本界面。' }),
     ));
     return;
   }

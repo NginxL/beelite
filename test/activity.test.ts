@@ -144,7 +144,7 @@ test('前置条件：受理后插件被卸载、换了文件、或同一文件�
     await m.uninstallProject(root, '100');
     const s1 = await snapshot(root);
     for (const force of [false, true]) {
-      await assert.rejects(m.install(root, F, '100', { force, expect: { kind: 'record', ...rec100 } }), changed(/已不在这个目录的蜂简管理列表中/));
+      await assert.rejects(m.install(root, F, '100', { force, expect: { kind: 'record', ...rec100 } }), changed(/已不在这个目录的艾泽魔方管理列表中/));
     }
     assert.deepEqual(await snapshot(root), s1);
     assert.equal((await readManifestJson(root)).projects['100'], undefined, '没有被当成首次安装复活');

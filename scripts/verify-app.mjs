@@ -42,6 +42,10 @@ export function verifyApp(mode, appPath, expect = {}) {
   if (mode === 'production') {
     check(info.CFBundleIdentifier === PRODUCTION.appId, `CFBundleIdentifier 应为 ${PRODUCTION.appId}，实际 ${info.CFBundleIdentifier}`);
     check(info.CFBundleName === PRODUCTION.productName, `CFBundleName 应为 ${PRODUCTION.productName}`);
+    check(info.CFBundleExecutable === PRODUCTION.productName, `CFBundleExecutable 应为 ${PRODUCTION.productName}，实际 ${info.CFBundleExecutable}`);
+    check(path.basename(appPath) === `${PRODUCTION.productName}.app`, `应用文件名应为 ${PRODUCTION.productName}.app，实际 ${path.basename(appPath)}`);
+    check(info.CFBundleDisplayName === PRODUCTION.displayName, `CFBundleDisplayName 应为 ${PRODUCTION.displayName}，实际 ${info.CFBundleDisplayName}`);
+    check(info.NSHumanReadableCopyright === PRODUCTION.copyright, `NSHumanReadableCopyright 应为 ${PRODUCTION.copyright}，实际 ${info.NSHumanReadableCopyright}`);
     check(pkg.productName === PRODUCTION.productName, `包内 productName 应为 ${PRODUCTION.productName}，实际 ${pkg.productName}`);
     check(info.SUFeedURL === PRODUCTION.feedURL, `SUFeedURL 应为生产地址，实际 ${info.SUFeedURL}`);
     check(info.SUPublicEDKey === productionKey, 'SUPublicEDKey 与 package.json 中的生产公钥不一致');
@@ -52,6 +56,8 @@ export function verifyApp(mode, appPath, expect = {}) {
     check(info.CFBundleIdentifier !== PRODUCTION.appId, '测试包不得使用生产 appId');
     check(pkg.productName !== PRODUCTION.productName && info.CFBundleName !== PRODUCTION.productName, '测试包不得使用生产 productName');
     check(info.SUPublicEDKey !== productionKey, '测试包不得使用生产公钥');
+    check(typeof info.CFBundleDisplayName === 'string' && info.CFBundleDisplayName !== PRODUCTION.displayName, '测试包的显示名不得与生产包相同');
+    if (expect.displayName) check(info.CFBundleDisplayName === expect.displayName, `CFBundleDisplayName 应为 ${expect.displayName}，实际 ${info.CFBundleDisplayName}`);
     if (expect.feed) check(info.SUFeedURL === expect.feed, `SUFeedURL 应为 ${expect.feed}`);
     if (expect.key) check(info.SUPublicEDKey === expect.key, 'SUPublicEDKey 与测试公钥不一致');
   } else {

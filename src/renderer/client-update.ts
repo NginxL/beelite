@@ -50,7 +50,7 @@ function applyState(s: ClientUpdateState): void {
 
 function notesBody(s: ClientUpdateState): { text: string; note?: string } {
   if (s.notesState === 'ok' && s.releaseNotes) return { text: s.releaseNotes, note: s.notesTruncated ? '更新说明较长，已截断显示。' : undefined };
-  if (s.notesState === 'unsupported') return { text: '此版本的更新说明不是纯文本格式，蜂简不予显示。' };
+  if (s.notesState === 'unsupported') return { text: '此版本的更新说明不是纯文本格式，艾泽魔方不予显示。' };
   if (s.notesState === 'unverified') return { text: '更新信息的签名未通过校验，不显示更新说明。' };
   return { text: '此版本未提供更新说明。' };
 }
@@ -71,7 +71,7 @@ async function openNotes(auto: boolean): Promise<void> {
   let ok = false;
   try {
     const shown = confirmDialog({
-      title: `蜂简 v${s.availableVersion ?? build} 可用`,
+      title: `艾泽魔方 v${s.availableVersion ?? build} 可用`,
       message: `当前版本 v${s.currentVersion}，新版本 v${s.availableVersion ?? build}。点击“下载并更新”后才会下载并校验安装包，完成后自动重新启动；“稍后”不会下载，之后可在侧栏的“更新说明”中重新查看。`,
       notes: body.text,
       notesNote: body.note,
@@ -121,9 +121,9 @@ function statusText(s: ClientUpdateState): string {
     case 'idle':
       return '';
     case 'checking':
-      return '正在检查蜂简新版本…';
+      return '正在检查艾泽魔方新版本…';
     case 'up-to-date':
-      return '蜂简已是最新版本';
+      return '艾泽魔方已是最新版本';
     case 'available':
       return s.message ? `${s.message}，${v} 可用` : `发现新版本 ${v}`;
     case 'downloading':
@@ -170,11 +170,11 @@ function render(): void {
   if (!view) return;
   const s = current;
   if (!s) {
-    setText(view.version, '蜂简');
+    setText(view.version, '艾泽魔方');
     for (const el of [view.status, view.bar, view.update, view.check, view.cancel, view.notes, view.restartNote]) setShown(el, false);
     return;
   }
-  setText(view.version, `蜂简 v${s.currentVersion}`);
+  setText(view.version, `艾泽魔方 v${s.currentVersion}`);
   const text = statusText(s);
   setText(view.status, text);
   setShown(view.status, text !== '');
@@ -206,11 +206,11 @@ export function initClientUpdate(): void {
     bar: h('div', { class: 'client-progress hidden' }, fill),
     fill,
     // 侧栏按钮显示着版本号，点击即授权更新这个构建
-    update: h('button', { class: 'btn btn-sm btn-primary hidden', title: '下载并校验后自动安装，蜂简会自动重新启动', on: { click: () => void act(() => api().clientUpdate(current?.availableBuild ?? '')) } }, '下载并更新'),
+    update: h('button', { class: 'btn btn-sm btn-primary hidden', title: '下载并校验后自动安装，艾泽魔方会自动重新启动', on: { click: () => void act(() => api().clientUpdate(current?.availableBuild ?? '')) } }, '下载并更新'),
     check: h('button', { class: 'btn btn-sm hidden', on: { click: () => void act(() => api().clientCheck()) } }, '检查更新'),
     cancel: h('button', { class: 'btn btn-sm btn-text hidden', on: { click: () => void act(() => api().clientCancel()) } }, '取消'),
     notes: h('button', { class: 'btn btn-sm btn-text hidden', title: '查看新版本的更新说明', on: { click: () => void openNotes(false) } }, '更新说明'),
-    restartNote: h('div', { class: 'client-note hidden', text: '更新完成后蜂简会自动重新启动' }),
+    restartNote: h('div', { class: 'client-note hidden', text: '更新完成后艾泽魔方会自动重新启动' }),
   };
   mount(
     root,

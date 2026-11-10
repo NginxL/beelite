@@ -1,5 +1,6 @@
 // 构建客户端更新 E2E 验收所需的两个隔离测试版本与本地 feed（只生成文件，不启动应用）。
-// - 测试身份：productName “BeeLite E2E”、appId app.beelite.addons.e2e（userData 与 Sparkle 偏好随之隔离，重启不依赖环境变量）
+// - 测试身份：productName “BeeLite E2E”、appId app.beelite.addons.e2e（userData 与 Sparkle 偏好随之隔离，重启不依赖环境变量）；
+//   显示名 CFBundleDisplayName 覆盖为 “AzerCube E2E”，不继承生产包的「艾泽魔方」
 // - 测试签名：每次运行新建一个唯一的 Keychain 账户（beelite-e2e-<时间>-<随机>），记录在 identity.json，验收后按记录删除
 // - feed：http://127.0.0.1:<端口>/appcast.xml，由 scripts/e2e-feed-server.mjs 提供；附带若干负向用例目录
 //
@@ -10,11 +11,12 @@ import { copyFile, mkdir, readFile, writeFile } from 'node:fs/promises';
 import { createRequire } from 'node:module';
 import path from 'node:path';
 import { PROJECT_ROOT, TOOLS_DIR } from './sparkle-common.mjs';
-import { buildAppcast } from './release-lib.mjs';
+import { appcastTitles, buildAppcast } from './release-lib.mjs';
 import { verifyApp } from './verify-app.mjs';
 
 const require = createRequire(import.meta.url);
 const PRODUCT = 'BeeLite E2E';
+const DISPLAY_NAME = 'AzerCube E2E';
 const APP_ID = 'app.beelite.addons.e2e';
 const VERSIONS = ['0.9.1', '0.9.2'];
 const NOTES_FIXTURE = path.join(PROJECT_ROOT, 'test', 'fixtures', 'e2e-release-notes.txt');
@@ -50,6 +52,7 @@ async function main() {
   const identity = {
     createdAt: new Date().toISOString(),
     productName: PRODUCT,
+    displayName: DISPLAY_NAME,
     appId: APP_ID,
     feedURL,
     keychainAccount: account,
@@ -70,11 +73,11 @@ async function main() {
     cfg.directories = { output: path.join(outRoot, `v${version}`), buildResources: 'build' };
     cfg.afterPack = path.join(PROJECT_ROOT, 'scripts', 'after-pack.cjs');
     cfg.extraMetadata = { productName: PRODUCT, version };
-    cfg.mac.extendInfo = { ...cfg.mac.extendInfo, SUFeedURL: feedURL, SUPublicEDKey: publicKey };
+    cfg.mac.extendInfo = { ...cfg.mac.extendInfo, SUFeedURL: feedURL, SUPublicEDKey: publicKey, CFBundleDisplayName: DISPLAY_NAME };
     cfg.mac.artifactName = 'BeeLite-E2E-${version}-${arch}-mac.${ext}';
     await build({ projectDir: PROJECT_ROOT, targets: Platform.MAC.createTarget(['dir', 'zip'], Arch.arm64), config: cfg, publish: 'never' });
     const app = path.join(outRoot, `v${version}`, 'mac-arm64', `${PRODUCT}.app`);
-    const { errors, info } = verifyApp('e2e', app, { feed: feedURL, key: publicKey });
+    const { errors, info } = verifyApp('e2e', app, { feed: feedURL, key: publicKey, displayName: DISPLAY_NAME });
     if (errors.length) throw new Error(`测试包 ${version} 校验失败：\n- ${errors.join('\n- ')}`);
     if (info.CFBundleShortVersionString !== version) throw new Error(`测试包版本应为 ${version}，实际 ${info.CFBundleShortVersionString}`);
     zips[version] = path.join(outRoot, `v${version}`, `BeeLite-E2E-${version}-arm64-mac.zip`);
@@ -115,7 +118,13 @@ async function main() {
   const tampered = path.join(feedRoot, 'tampered-feed');
   await mkdir(tampered, { recursive: true });
   await copyFile(zips[newer], path.join(tampered, zipName));
-  await writeFile(path.join(tampered, 'appcast.xml'), okFeed.replace(/<title>蜂简 0\.9\.2<\/title>/, '<title>蜂简 0.9.2 (modified)</title>'));
+  // 按发布脚本生成的条目标题定位；找不到时直接失败，避免生成一个其实没有被篡改的“篡改”用例
+  const titles = appcastTitles({ mode: 'e2e', productName: PRODUCT, version: newer });
+  const itemTitle = `<title>${titles.itemTitle}</title>`;
+  if (okFeed.split(itemTitle).length !== 2) throw new Error(`正常用例 feed 中应恰好有一个条目标题 ${itemTitle}`);
+  const tamperedFeed = okFeed.replace(itemTitle, `<title>${titles.itemTitle} (modified)</title>`);
+  if (tamperedFeed === okFeed) throw new Error('篡改用例没有改动 feed 内容');
+  await writeFile(path.join(tampered, 'appcast.xml'), tamperedFeed);
 
   // feed 未签名：同样的条目但没有 feed 签名
   const unsigned = path.join(feedRoot, 'unsigned-feed');
@@ -125,7 +134,7 @@ async function main() {
   const length = Number(/length="(\d+)"/.exec(okFeed)[1]);
   await writeFile(
     path.join(unsigned, 'appcast.xml'),
-    buildAppcast({ title: `蜂简 ${PRODUCT}`, itemTitle: `蜂简 ${newer}`, pubDate: new Date().toUTCString(), version: newer, shortVersion: newer, minimumSystemVersion: '13.0.0', url: `http://127.0.0.1:${port}/${zipName}`, length, signature: enclosure }),
+    buildAppcast({ ...titles, pubDate: new Date().toUTCString(), version: newer, shortVersion: newer, minimumSystemVersion: '13.0.0', url: `http://127.0.0.1:${port}/${zipName}`, length, signature: enclosure }),
   );
 
   // 归档缺失：feed 有效，但服务器上没有 zip（下载返回 404）

@@ -14,7 +14,7 @@ import { mkdtemp, readdir, rm, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { PRODUCTION, PROJECT_ROOT, TOOLS_DIR, sha256 } from './sparkle-common.mjs';
-import { buildAppcast, checkSigningKey, isMain, parseSignOutput, resolveDownloadUrl, resolveReleaseNotes, threePart } from './release-lib.mjs';
+import { appcastTitles, buildAppcast, checkSigningKey, isMain, parseSignOutput, resolveDownloadUrl, resolveReleaseNotes, threePart } from './release-lib.mjs';
 import { verifyApp } from './verify-app.mjs';
 
 function arg(name, fallback) {
@@ -70,8 +70,7 @@ async function main() {
     await writeFile(
       feedPath,
       buildAppcast({
-        title: mode === 'production' ? '蜂简 BeeLite' : `蜂简 ${info.CFBundleName}`,
-        itemTitle: `蜂简 ${shortVersion}`,
+        ...appcastTitles({ mode, productName: info.CFBundleName, version: shortVersion }),
         pubDate: new Date().toUTCString(),
         version,
         shortVersion,

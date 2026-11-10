@@ -2,6 +2,7 @@
 // 只发送必要的请求头，不携带任何账号令牌或客户端标识；所有响应都先校验形状再转换为内部模型。
 import type { CategoryInfo, ModDetail, ModFileInfo, ModSummary, SearchQuery, SearchResult, SortOrder } from '../shared/types';
 import { UserError } from './errors';
+import { canonicalFileId } from './file-id';
 import { requestJson, type FetchFn } from './net';
 
 export const API_BASE = 'https://api.newbeebox.com';
@@ -195,16 +196,17 @@ export function parseConfig(raw: unknown): RemoteConfig {
 
 export function parseLatest(data: unknown, modId: string, flavorVersions: string[]): LatestFile {
   if (!isObj(data)) throw new UserError('文件信息格式不正确');
-  const fileId = num(data.t_id);
-  if (!Number.isInteger(fileId) || fileId <= 0) throw new UserError('文件信息缺少编号');
+  // 与本地清单的约定一致（见 file-id.ts）：不合法的编号在下载之前拒绝，不能写进清单
+  const fileId = canonicalFileId(data.t_id);
+  if (fileId === null) throw new UserError('服务器返回的文件编号无效');
   if (str(data.t_mod_id) !== modId) throw new UserError('文件信息与插件不匹配');
   const downloadUrl = str(data.download_url);
   if (!downloadUrl) throw new UserError('该文件没有可用的下载地址');
   const gameVersions = strList(data.versions);
   return {
-    fileId: String(fileId),
+    fileId,
     modId,
-    displayName: str(data.t_display_name) || str(data.t_file_name) || String(fileId),
+    displayName: str(data.t_display_name) || str(data.t_file_name) || fileId,
     size: num(data.t_file_length),
     folders: strList(data.file_folders),
     gameVersions,

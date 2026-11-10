@@ -1,10 +1,10 @@
-// 蜂简 BeeLite 主进程：窗口、本地页面协议、安全策略、启动恢复与客户端更新。
+// 艾泽魔方 · AzerCube 主进程（内部身份 BeeLite）：窗口、本地页面协议、安全策略、启动恢复与客户端更新。
 import { app, BrowserWindow, Menu, powerMonitor, protocol, session, type WebContents } from 'electron';
 import { readFile } from 'node:fs/promises';
 import path from 'node:path';
 import { ClientUpdater } from '../core/client-update';
 import { createQuitGuard, MutationGate } from '../core/gate';
-import { displayName, resolveUserData } from '../core/identity';
+import { BRAND_NAME, displayName, resolveUserData } from '../core/identity';
 import { inspectPickedRoot, SettingsStore } from '../core/profiles';
 import { NewBeeBoxProvider } from '../core/provider';
 import { FLAVORS } from '../core/flavors';
@@ -113,13 +113,13 @@ function buildMenu(): void {
   Menu.setApplicationMenu(
     Menu.buildFromTemplate([
       {
-        label: '蜂简',
+        label: BRAND_NAME,
         submenu: [
-          { role: 'about', label: '关于蜂简' },
+          { role: 'about', label: `关于${BRAND_NAME}` },
           { label: '检查客户端更新…', click: () => clientUpdater?.check() },
           { type: 'separator' },
           { role: 'hide', label: '隐藏' },
-          { role: 'quit', label: '退出蜂简' },
+          { role: 'quit', label: `退出${BRAND_NAME}` },
         ],
       },
       { label: '编辑', submenu: [{ role: 'undo', label: '撤销' }, { role: 'redo', label: '重做' }, { type: 'separator' }, { role: 'cut', label: '剪切' }, { role: 'copy', label: '复制' }, { role: 'paste', label: '粘贴' }, { role: 'selectAll', label: '全选' }] },
@@ -151,6 +151,8 @@ async function applyTestBindings(settings: SettingsStore): Promise<void> {
 
 async function start(): Promise<void> {
   app.setName(APP_DISPLAY_NAME);
+  // 关于面板显式使用品牌名（Info.plist 的 CFBundleName 仍是内部身份 BeeLite）
+  app.setAboutPanelOptions({ applicationName: APP_DISPLAY_NAME });
   registerAppProtocol();
   hardenSession();
   app.on('web-contents-created', (_e, contents) => hardenContents(contents));
