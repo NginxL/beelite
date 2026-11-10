@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdir, readdir, readFile, writeFile } from 'node:fs/promises';
+import { mkdir, readdir, readFile, rm, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { runUpdateAll } from '../src/core/batch';
 import { UserError } from '../src/core/errors';
@@ -119,6 +119,100 @@ test('全部更新：正常情况下全部更新成功', async () => {
   assert.match(r.message, /已更新 2 个插件/);
   assert.match(await readFile(path.join(root, 'Interface', 'AddOns', 'M2', 'M2.toc'), 'utf8'), /v2/);
   await cleanup(base);
+});
+
+/**
+ * 每项更新都会返回提示：WarningFixture（Core、Gone、Missing → 只含 Core，更新前 Missing 已不在 AddOns）
+ * 与 PairFixture（Alpha、Beta → 只含 Alpha）。
+ */
+async function twoWithWarnings(root: string, src: FakeSource) {
+  const m = makeManager(src);
+  const zipOfAll = (folders: string[], v: string) => makeZip(folders.flatMap((f) => addonEntries(f, v)));
+  src.set('100', F, { name: 'WarningFixture', fileId: '1', zip: zipOfAll(['Core', 'Gone', 'Missing'], 'v1') });
+  src.set('200', F, { name: 'PairFixture', fileId: '1', zip: zipOfAll(['Alpha', 'Beta'], 'v1') });
+  await m.install(root, F, '100');
+  await m.install(root, F, '200');
+  await rm(path.join(root, 'Interface', 'AddOns', 'Missing'), { recursive: true });
+  src.set('100', F, { name: 'WarningFixture', fileId: '2', zip: zipOf('Core', 'v2') });
+  src.set('200', F, { name: 'PairFixture', fileId: '2', zip: zipOf('Alpha', 'v2') });
+  return m;
+}
+
+const FIXTURE_NOTES = [
+  'WarningFixture：新版本不再包含 Gone，已随旧版本一起移入备份',
+  'WarningFixture：新版本不再包含 Missing；它们在更新前已不在 AddOns 中，没有可备份的内容',
+];
+const PAIR_NOTE = 'PairFixture：新版本不再包含 Beta，已随旧版本一起移入备份';
+
+test('全部更新：保留每项更新返回的提示并加上插件名称，计数与成功判定不变', async () => {
+  const base = await tmpDir();
+  try {
+    const root = await makeGameRoot(base);
+    const src = new FakeSource();
+    const m = await twoWithWarnings(root, src);
+    const r = await runUpdateAll({ manager: m, root, flavorId: F, isStillBound: async () => true, installOne: (p, r0) => m.install(r0, p.flavorId, p.modId) });
+    assert.equal(r.ok, true);
+    assert.equal(r.message, '已更新 2 个插件');
+    assert.deepEqual([...(r.warnings ?? [])].sort(), [...FIXTURE_NOTES, PAIR_NOTE].sort());
+    const manifest = await m.readManifestFor(root);
+    assert.ok(manifest.recovery.some((e) => e.kind === 'update-backup' && e.folders.includes('Gone')));
+    assert.equal(manifest.recovery.some((e) => e.folders.includes('Missing')), false);
+  } finally {
+    await cleanup(base);
+  }
+});
+
+test('全部更新：前面完成项的提示不因后续项失败、取消或批次停止而丢失', async () => {
+  // 第二项失败（失败排在前面）或第一项完成后换绑停止：第一项的提示仍在
+  for (const how of ['fail', 'stop'] as const) {
+    const base = await tmpDir();
+    try {
+      const root = await makeGameRoot(base);
+      const src = new FakeSource();
+      const m = await twoWithWarnings(root, src);
+      const order: string[] = [];
+      let bound = 0;
+      const r = await runUpdateAll({
+        manager: m,
+        root,
+        flavorId: F,
+        isStillBound: async () => how === 'fail' || bound++ === 0,
+        installOne: async (p, r0) => {
+          order.push(p.modId);
+          if (order.length === 2) throw new Error('网络中断（测试）');
+          return m.install(r0, p.flavorId, p.modId);
+        },
+      });
+      const firstNotes = order[0] === '100' ? FIXTURE_NOTES : [PAIR_NOTE];
+      const firstName = order[0] === '100' ? 'WarningFixture' : 'PairFixture';
+      const secondName = order[0] === '100' ? 'PairFixture' : 'WarningFixture';
+      assert.equal(r.ok, false);
+      if (how === 'fail') {
+        assert.equal(r.message, '已更新 1 个插件，失败 1 个');
+        assert.deepEqual(r.warnings, [`${secondName}：网络中断（测试）`, ...firstNotes]);
+      } else {
+        assert.equal(order.length, 1, `${firstName} 完成后停止`);
+        assert.equal(r.message, '已更新 1 个插件，游戏目录绑定已变更，剩余 1 个未处理');
+        assert.deepEqual(r.warnings, firstNotes);
+      }
+    } finally {
+      await cleanup(base);
+    }
+  }
+
+  // 返回未成功（取消）的项目计为取消，它带回的提示同样保留
+  const base = await tmpDir();
+  try {
+    const root = await makeGameRoot(base);
+    const src = new FakeSource();
+    const m = await twoOutdated(root, src);
+    const r = await runUpdateAll({ manager: m, root, flavorId: F, isStillBound: async () => true, installOne: async (p) => ({ ok: false, message: '已取消安装，未做任何改动', warnings: [`${p.modId} 的提示`] }) });
+    assert.equal(r.ok, false);
+    assert.equal(r.message, '已更新 0 个插件，取消 2 个');
+    assert.deepEqual([...(r.warnings ?? [])].sort(), ['M1：1 的提示', 'M2：2 的提示']);
+  } finally {
+    await cleanup(base);
+  }
 });
 
 test('目录绑定：同一目录不能绑定两个版本；已知版本目录选反直接拒绝；自定义名称仅提示', async () => {

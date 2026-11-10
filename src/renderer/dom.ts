@@ -74,7 +74,8 @@ export function spinner(small = false): HTMLElement {
 
 export type ToastKind = 'success' | 'error' | 'info' | 'warn';
 
-export function toast(message: string, kind: ToastKind = 'info', ms?: number): void {
+/** list：多行合并的长内容，文字区域限高并可滚动（也可用键盘聚焦后滚动） */
+export function toast(message: string, kind: ToastKind = 'info', ms?: number, list = false): void {
   const root = byId('toast-root');
   const timeout = ms ?? (kind === 'error' || kind === 'warn' ? 8000 : 4000);
   let timer = 0;
@@ -85,7 +86,7 @@ export function toast(message: string, kind: ToastKind = 'info', ms?: number): v
   };
   const el = h('div', { class: `toast toast-${kind}`, attrs: { role: 'status' } },
     h('span', { class: 'toast-dot' }),
-    h('div', { class: 'toast-msg', text: message }),
+    h('div', list ? { class: 'toast-msg toast-msg-list', text: message, attrs: { tabindex: '0' } } : { class: 'toast-msg', text: message }),
     h('button', { class: 'toast-close', title: '关闭', on: { click: close } }, '×'),
   );
   root.appendChild(el);

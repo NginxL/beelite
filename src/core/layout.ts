@@ -138,6 +138,16 @@ export async function identityOf(p: string): Promise<string | null> {
   }
 }
 
+/** 元数据文件（manifest、journal）的大小上限，读取与写入共用：超过它的内容不会被写出，也不会被读入 */
+export const MAX_METADATA_BYTES = 16 * 1024 * 1024;
+
+/** 写入前确认元数据文本按 UTF-8 不超过读取上限；超过时拒绝，调用方不得写出任何内容 */
+export function assertMetadataFits(text: string, what: string): void {
+  if (Buffer.byteLength(text, 'utf8') > MAX_METADATA_BYTES) {
+    throw new UserError(`${what}将超过 ${MAX_METADATA_BYTES / 1024 / 1024} MiB 的记录上限，本次操作未提交，插件与原有记录均未改动`, 'metadata-too-large');
+  }
+}
+
 /** 读取小型元数据文件；O_NOFOLLOW 保证不会跟随符号链接，文件不存在返回 null */
 export async function readFileNoFollow(p: string): Promise<string | null> {
   let fh;
@@ -152,7 +162,7 @@ export async function readFileNoFollow(p: string): Promise<string | null> {
   try {
     const st = await fh.stat();
     if (!st.isFile()) throw new UserError(`元数据不是普通文件：${p}`, 'layout');
-    if (st.size > 16 * 1024 * 1024) throw new UserError(`元数据文件过大：${p}`, 'layout');
+    if (st.size > MAX_METADATA_BYTES) throw new UserError(`元数据文件过大：${p}`, 'layout');
     return await fh.readFile('utf8');
   } finally {
     await fh.close();

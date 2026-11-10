@@ -10,7 +10,7 @@ import { inspectLayout, newTxId, pathExists, readFileNoFollow, syncDir, writable
 import { downloadToFile, type DownloadOptions, type DownloadResult } from './net';
 import { foldKey, isValidModuleName, resolveInside } from './paths';
 import type { LatestFile } from './provider';
-import { emptyManifest, ID_RE, parseJournal, readManifest, type Journal, type Manifest, type ProjectRecord, type RecoveryEntry } from './store';
+import { commitTexts, emptyManifest, ID_RE, parseJournal, readManifest, serializeManifest, type Journal, type Manifest, type ProjectRecord, type RecoveryEntry } from './store';
 import { scanAddOns } from './toc';
 import { executeOps, isCrash, prepareOps, rollbackOps, type PlannedOp, type StepHook } from './txn';
 import { DEFAULT_LIMITS, extractAddonZip, type ZipLimits } from './zip';
@@ -162,7 +162,8 @@ export class AddonManager {
     for (const id of manifest.purgeQueue) {
       if (ID_RE.test(id)) await rm(resolveInside(l.trashDir, id), { recursive: true, force: true });
     }
-    await writeFileAtomic(l.manifestPath, JSON.stringify({ ...manifest, purgeQueue: [] }, null, 1));
+    // 只清空待删除队列，不会比已提交的清单更大
+    await writeFileAtomic(l.manifestPath, serializeManifest({ ...manifest, purgeQueue: [] }));
   }
 
   /** 恢复残留事务；目录还没有艾泽魔方数据时直接返回 ok，不创建任何东西 */
@@ -241,14 +242,16 @@ export class AddonManager {
     next.lastTxId = txId;
     const ops = await prepareOps(l, planned);
     const journal: Journal = { schema: 1, txId, kind, state: 'prepared', trashIds, ops, createdAt: Date.now() };
-    await writeFileAtomic(l.journalPath, JSON.stringify(journal));
+    // 写 journal、移动任何目录之前确认三段元数据都不超过读取上限；超过即拒绝，什么都不写
+    const texts = commitTexts(next, journal);
+    await writeFileAtomic(l.journalPath, texts.prepared);
     let committed = false;
     try {
       await this.hook('journal-written');
       await executeOps(l, ops, this.opts.hook);
-      await writeFileAtomic(l.manifestTmpPath, JSON.stringify(next, null, 1), `${l.manifestTmpPath}.part`);
+      await writeFileAtomic(l.manifestTmpPath, texts.manifest, `${l.manifestTmpPath}.part`);
       await this.hook('manifest-tmp-written');
-      await writeFileAtomic(l.journalPath, JSON.stringify({ ...journal, state: 'committing' }));
+      await writeFileAtomic(l.journalPath, texts.committing);
       await this.hook('committing');
       await rename(l.manifestTmpPath, l.manifestPath);
       await syncDir(l.metaDir);

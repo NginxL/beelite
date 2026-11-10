@@ -4,7 +4,7 @@
 
 | 项目 | 值 |
 |---|---|
-| 应用 | `BeeLite E2E.app`（productName `BeeLite E2E`，appId `app.beelite.addons.e2e`，显示名 CFBundleDisplayName `AzerCube E2E`；正式应用分别是 `BeeLite`、`app.beelite.addons`、`艾泽魔方`） |
+| 应用 | `BeeLite E2E.app`（productName `BeeLite E2E`，appId `app.beelite.addons.e2e`，raw CFBundleDisplayName `AzerCube E2E`，没有 `InfoPlist.strings`，不继承正式应用的本地化显示名；正式应用分别是 `BeeLite`、`app.beelite.addons`、raw `BeeLite` 加三种语言的本地化显示名「艾泽魔方 · AzerCube」）。测试包的 raw 显示名与文件名不同，访达中会显示文件名 `BeeLite E2E`，这不影响客户端更新验收 |
 | 旧版 / 新版 | `v0.9.1/mac-arm64/BeeLite E2E.app` / `feed/ok/BeeLite-E2E-0.9.2-arm64-mac.zip` |
 | 更新说明 | `feed/ok` 的 appcast 带纯文本说明（取自 `test/fixtures/e2e-release-notes.txt`，含 `<b>`、`<script>`、`&` 等应原样显示的字符）；`feed/no-notes` 是同一安装包、签名有效但不带说明的 feed |
 | feed | `http://127.0.0.1:47831/appcast.xml`（Electron 默认 ATS 允许 127.0.0.1 的 http） |

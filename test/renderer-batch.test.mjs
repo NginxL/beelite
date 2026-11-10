@@ -5,7 +5,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { createRequire } from 'node:module';
-import { realpath } from 'node:fs/promises';
+import { realpath, rm } from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { installFakeDom, openModals, toasts } from './fake-dom.mjs';
@@ -619,6 +619,87 @@ test('任务事件只按 目标 + 插件编号 关联：其他目录 / 其他版
     assert.equal(S.state.local.profile.root, B);
     assert.equal(p('200').fileId, '1');
   } finally {
+    h.service.watch.stop();
+    await cleanup(base);
+  }
+});
+
+/**
+ * 每个插件装有 <前缀>Core、<前缀>Gone、<前缀>Missing 三个目录的文件 1；更新前 <前缀>Missing 已不在 AddOns，
+ * 远端文件 2 只含 <前缀>Core。每项更新返回两条提示（已移入备份、没有可备份的内容）。
+ */
+async function warningSetup(mods) {
+  const s = await setup({ updatable: [] });
+  const m = makeManager(s.src);
+  const entries = (prefix, v, parts) => makeZip(parts.flatMap((f) => addonEntries(`${prefix}${f}`, v)));
+  for (const [id, name, prefix] of mods) {
+    s.src.set(id, F, { name, fileId: '1', zip: entries(prefix, 'v1', ['Core', 'Gone', 'Missing']) });
+    await m.install(s.A, F, id);
+    await rm(path.join(s.A, 'Interface', 'AddOns', `${prefix}Missing`), { recursive: true });
+    s.src.set(id, F, { name, fileId: '2', zip: entries(prefix, 'v2', ['Core']) });
+  }
+  await S.refreshLocal();
+  await S.checkUpdates(true);
+  dom.toastRoot().replaceChildren();
+  assert.equal(S.updateCount(), mods.length);
+  return s;
+}
+
+const notesFor = (name, prefix) => [
+  `${name}：新版本不再包含 ${prefix}Gone，已随旧版本一起移入备份`,
+  `${name}：新版本不再包含 ${prefix}Missing；它们在更新前已不在 AddOns 中，没有可备份的内容`,
+];
+
+/** 记录 toast 的显示时长（假 window 的计时器不执行） */
+function recordTimeouts() {
+  const ms = [];
+  const original = globalThis.window.setTimeout;
+  globalThis.window.setTimeout = (_fn, t) => (ms.push(t), 0);
+  return { ms, restore: () => (globalThis.window.setTimeout = original) };
+}
+
+test('全部更新显示每项更新的提示（Core / Gone / Missing）：经 IPC 到界面逐条显示并带插件名称；任务事件与计数不变', async () => {
+  const { base, A, h } = await warningSetup([['100', 'WarningFixture', '']]);
+  const timers = recordTimeouts();
+  try {
+    await L.doUpdateAll();
+    const shown = dom.toastRoot().childNodes;
+    assert.deepEqual(toasts(dom), ['已更新 1 个插件×', ...notesFor('WarningFixture', '').map((w) => `${w}×`)]);
+    assert.deepEqual(shown.map((t) => t.className), ['toast toast-success', 'toast toast-warn', 'toast toast-warn']);
+    assert.ok(shown.every((t) => !t.querySelector('.toast-msg-list')), '提示不多时逐条显示，不合并');
+    assert.equal(timers.ms.includes(15000), false);
+    const done = taskEvents(h).filter((e) => e.phase === 'done');
+    assert.equal(done.length, 1);
+    assert.equal(done[0].message, '「WarningFixture」已更新到 v2');
+    assert.equal('warnings' in done[0], false, '任务事件结构不变');
+    const manifest = await H.readManifestJson(A);
+    assert.equal(manifest.projects['100'].fileId, '2');
+    assert.ok(manifest.recovery.some((e) => e.kind === 'update-backup' && e.folders.includes('Gone')));
+    assert.equal(manifest.recovery.some((e) => e.folders.includes('Missing')), false);
+  } finally {
+    timers.restore();
+    h.service.watch.stop();
+    await cleanup(base);
+  }
+});
+
+test('全部更新的提示超过 4 条：合并为一条限高可滚动的提示，全部内容可读，显示 15 秒', async () => {
+  const mods = [['100', 'Dungeons', 'D'], ['200', 'openmap', 'O'], ['300', 'RegionIcons', 'R']];
+  const { base, h } = await warningSetup(mods);
+  const timers = recordTimeouts();
+  try {
+    await L.doUpdateAll();
+    const shown = dom.toastRoot().childNodes;
+    assert.equal(shown.length, 2, '结果一条 + 合并的提示一条，没有被挤掉的提示');
+    assert.equal(toasts(dom)[0], '已更新 3 个插件×');
+    const list = shown[1].querySelector('.toast-msg-list');
+    assert.ok(list, '合并的提示使用限高的文字区域');
+    assert.equal(shown[1].className, 'toast toast-warn');
+    assert.equal(list.attrs.tabindex, '0', '可用键盘聚焦后滚动');
+    assert.deepEqual(list.textContent.split('\n').sort(), mods.flatMap(([, name, prefix]) => notesFor(name, prefix)).sort());
+    assert.ok(timers.ms.includes(15000));
+  } finally {
+    timers.restore();
     h.service.watch.stop();
     await cleanup(base);
   }

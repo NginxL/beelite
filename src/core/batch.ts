@@ -61,6 +61,8 @@ export async function runUpdateAll(o: UpdateAllOptions): Promise<OpResult> {
   const failed: string[] = [];
   /** 排队期间被卸载、重装或恢复，未处理 */
   const stale: string[] = [];
+  /** 每项返回的提示（例如目录移入备份、没有可备份的内容），逐项收集，后续项目失败或批次停止时不丢失 */
+  const notes: string[] = [];
   let stopped = false;
   o.plan?.(todo.map((c) => manifest.projects[c.modId]));
   for (const c of todo) {
@@ -71,6 +73,7 @@ export async function runUpdateAll(o: UpdateAllOptions): Promise<OpResult> {
     }
     try {
       const r = await o.installOne(p, o.root);
+      for (const w of r.warnings ?? []) notes.push(`${p.name}：${w}`);
       if (r.ok) updated++;
       else cancelled++;
     } catch (err) {
@@ -88,7 +91,7 @@ export async function runUpdateAll(o: UpdateAllOptions): Promise<OpResult> {
   if (checkFailed.length) parts.push(`检查失败 ${checkFailed.length} 个`);
   if (changed.length) parts.push(`检查后发生变化未处理 ${changed.length} 个`);
   if (skipped.length) parts.push(`跳过其他游戏版本来源的 ${skipped.length} 个`);
-  const warnings = [...failed, ...stale, ...checkFailed, ...changedNotes, ...skipped];
+  const warnings = [...failed, ...stale, ...notes, ...checkFailed, ...changedNotes, ...skipped];
   if (stopped) {
     const rest = todo.length - updated - cancelled - failed.length - stale.length;
     parts.push(`游戏目录绑定已变更，剩余 ${rest} 个未处理`);

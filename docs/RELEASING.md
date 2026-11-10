@@ -2,7 +2,20 @@
 
 本文面向发布艾泽魔方 · AzerCube 的维护者，普通用户不需要阅读。
 
-0.1.7 起用户可见的品牌由「蜂简 BeeLite」改为「艾泽魔方 · AzerCube」，只改显示名：`productName`、`CFBundleName`、可执行文件、`BeeLite.app`、安装包前缀 `BeeLite-`、appId `app.beelite.addons`、签名账户、feed 地址、公钥与仓库都保持不变：保留这些值以延续既有的配置路径与更新信任链。生产包的 `CFBundleDisplayName` 为 `艾泽魔方`、`NSHumanReadableCopyright` 为 `Copyright © 2026 AzerCube`，appcast 标题由 `scripts/release-lib.mjs` 的 `appcastTitles` 生成。
+0.1.7 起用户可见的品牌由「蜂简 BeeLite」改为「艾泽魔方 · AzerCube」，只改显示名：`productName`、`CFBundleName`、可执行文件、`BeeLite.app`、安装包前缀 `BeeLite-`、appId `app.beelite.addons`、签名账户、feed 地址、公钥与仓库都保持不变：保留这些值以延续既有的配置路径与更新信任链。`NSHumanReadableCopyright` 为 `Copyright © 2026 AzerCube`，appcast 标题由 `scripts/release-lib.mjs` 的 `appcastTitles` 生成。
+
+系统位置（访达等）的显示名，从 0.1.8 起按 raw 与本地化两层区分，取值都在 `scripts/sparkle-common.mjs` 的 `PRODUCTION` 中：
+
+| 字段 | 值 |
+| --- | --- |
+| raw `CFBundleName` / `CFBundleExecutable` / productName | `BeeLite`（Electron 按 raw `CFBundleName` 查找 `BeeLite Helper*.app`，不能改） |
+| raw `CFBundleDisplayName`（`rawDisplayName`） | `BeeLite`：必须与应用文件名一致，macOS 才采用本地化显示名；0.1.7 的 raw 值是 `艾泽魔方`，与文件名不一致，所以访达仍显示 BeeLite |
+| `CFBundleDevelopmentRegion`（`developmentRegion`） | `en`，没有对应资源的语言回退到英文资源 |
+| `Contents/Resources/{en,zh-Hans,zh-Hant}.lproj/InfoPlist.strings`（`localizations`、`localizedInfo`） | `CFBundleName = "艾泽魔方"`，`CFBundleDisplayName = "艾泽魔方 · AzerCube"`，三种语言相同 |
+
+本地化文件由 `scripts/after-pack.cjs` 调用 `scripts/brand-localization.cjs` 写入，只在 appId 与应用文件名都是生产值时写，签名由 electron-builder 在之后完成。必须在 afterPack 中写：electron-builder 在 afterPack 之前按 `electronLanguages`（`zh_CN`、`en`）删除主 bundle 中不匹配的 `.lproj`，提前放入的 `zh-Hans` / `zh-Hant` 会被删掉。筛选后主 bundle 中还留有 Electron 自带的空 `en_GB.lproj`、`zh_CN.lproj`，它们也会参与系统的语言匹配，被选中时其中没有本地化显示名，所以写入前删除不在这三个语言中的 `.lproj`：只删除空目录，目录非空、是符号链接或不是目录时构建失败，不覆盖任何内容；所有检查在改动之前完成。只处理主 bundle 的 `Contents/Resources`，`Electron Framework` 内的语言资源不变。不要设置 `SUBundleName`、`SUDefaultsDomain` 或 `LSHasLocalizedDisplayName`。
+
+隔离的真实 Electron 测试（正常退出后再启动，不经过 Sparkle）中，0.1.8 的命名方式让访达显示名与运行中应用的系统名称都变为「艾泽魔方 · AzerCube」，`app.getName()` 仍是 BeeLite。程序坞的悬停名称，以及程序坞中原有图标升级后是否更新，都没有验证。
 
 ## 客户端更新的信任链
 
@@ -14,7 +27,7 @@
   - `SUSignedFeedFailureExpirationInterval = 0`：feed 签名校验失败时始终拒绝，不进入宽限模式。
 - 应用只有 ad-hoc 代码签名，新旧版本的代码签名身份不同，无法用"新旧代码签名一致"来认可更新，所以 **EdDSA 签名是更新的信任根**：私钥就是信任根。但它不是唯一的检查。按 Sparkle 2.9.6 `SUUpdateValidator.m`（约第 174–200 行及 `passesBasicUpdatePolicy`），Sparkle 还会检查基本更新策略（例如旧版带有 EdDSA 公钥时新版也必须带有、旧版有代码签名时新版也必须有），并校验新应用自身的代码签名完整有效。签名有效但代码签名损坏的包同样会被拒绝。
 
-这些设置由 `npm run dist` 末尾的 `scripts/verify-app.mjs production` 检查；生产包中出现测试身份、测试 feed 或测试公钥时会失败。它同时核对上面保持不变的内部身份（`CFBundleName`、`CFBundleExecutable`、应用文件名）以及显示名与版权。生产环境如需关闭其中任何一项，需要重新评审。
+这些设置由 `npm run dist` 末尾的 `scripts/verify-app.mjs production` 检查；生产包中出现测试身份、测试 feed 或测试公钥时会失败。它同时核对上面保持不变的内部身份（`CFBundleName`、`CFBundleExecutable`、应用文件名）、raw 显示名与 `CFBundleDevelopmentRegion`、主 bundle 中恰好是 `en` / `zh-Hans` / `zh-Hant` 三个 `.lproj` 且各自的 `InfoPlist.strings` 与 `localizedInfo` 一致、4 个以 raw `CFBundleName` 命名的 helper（`BeeLite Helper`、`(GPU)`、`(Plugin)`、`(Renderer)`，可执行文件同名、bundle ID 在 appId 之下），以及版权；最后的 `codesign --verify --deep --strict` 确认本地化文件在签名范围内。e2e 模式要求测试包没有任何 `InfoPlist.strings`，显示名不同于生产包的 raw 与本地化显示名。生产环境如需关闭其中任何一项，需要重新评审。
 
 ### 更新说明
 

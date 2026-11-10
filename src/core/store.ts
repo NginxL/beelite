@@ -1,7 +1,7 @@
 // 每个游戏目录一份 manifest（按目录记账，flavor 只是项目属性）与事务 journal 的读写和严格校验。
 import { UserError } from './errors';
 import { FILE_ID_RE } from './file-id';
-import { readFileNoFollow, type Layout } from './layout';
+import { assertMetadataFits, readFileNoFollow, type Layout } from './layout';
 import { foldKey, isValidModuleName } from './paths';
 
 export interface ProjectRecord {
@@ -132,6 +132,38 @@ export function parseManifest(text: string): Manifest {
   if (!Array.isArray(purgeQueue) || !purgeQueue.every((id) => typeof id === 'string' && ID_RE.test(id) && !ids.has(id))) bad('待删除列表');
   const lastTxId = typeof r.lastTxId === 'string' ? r.lastTxId : null;
   return { schema: 1, lastTxId, projects, recovery, purgeQueue: [...new Set(purgeQueue as string[])] };
+}
+
+/** manifest 的写入格式 */
+export function serializeManifest(m: Manifest): string {
+  return JSON.stringify(m, null, 1);
+}
+
+/** journal 的写入格式 */
+export function serializeJournal(j: Journal): string {
+  return JSON.stringify(j);
+}
+
+export interface CommitTexts {
+  manifest: string;
+  prepared: string;
+  committing: string;
+}
+
+/**
+ * 一次事务要写出的全部元数据文本：下一份 manifest、prepared 与 committing 两个状态的 journal。
+ * 写入任何内容之前调用；任何一段超过读取上限即拒绝，调用方原样写出返回的文本，保证提交的内容都能读回。
+ */
+export function commitTexts(next: Manifest, journal: Journal): CommitTexts {
+  const texts = {
+    manifest: serializeManifest(next),
+    prepared: serializeJournal({ ...journal, state: 'prepared' }),
+    committing: serializeJournal({ ...journal, state: 'committing' }),
+  };
+  assertMetadataFits(texts.manifest, '插件清单');
+  assertMetadataFits(texts.prepared, '事务日志');
+  assertMetadataFits(texts.committing, '事务日志');
+  return texts;
 }
 
 export async function readManifest(l: Layout): Promise<{ manifest: Manifest; exists: boolean }> {

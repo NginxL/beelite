@@ -16,11 +16,15 @@ export const TOOLS_DIR = path.join(VENDOR_DIR, 'bin');
 export const SPARKLE_LICENSE = path.join(VENDOR_DIR, 'Sparkle-LICENSE');
 export const ADDON_PATH = path.join(PROJECT_ROOT, 'native', 'build', 'Release', 'beelite_sparkle.node');
 
-// 生产身份：productName / 可执行文件 / 应用文件名沿用 BeeLite（userData 与更新信任链不变），
-// 用户可见的显示名为 0.1.7 起的品牌「艾泽魔方」
+// 生产身份：productName / 可执行文件 / 应用文件名沿用 BeeLite（userData 与更新信任链不变）。
+// raw CFBundleDisplayName 也是 BeeLite，与应用文件名一致，系统才会采用本地化显示名；
+// 用户在访达、程序坞看到的品牌由各语言的 InfoPlist.strings 提供（见 brand-localization.cjs，0.1.8 起）
 export const PRODUCTION = {
   productName: 'BeeLite',
-  displayName: '艾泽魔方',
+  rawDisplayName: 'BeeLite',
+  developmentRegion: 'en',
+  localizations: ['en', 'zh-Hans', 'zh-Hant'],
+  localizedInfo: { CFBundleName: '艾泽魔方', CFBundleDisplayName: '艾泽魔方 · AzerCube' },
   copyright: 'Copyright © 2026 AzerCube',
   appId: 'app.beelite.addons',
   feedURL: 'https://github.com/NginxL/beelite/releases/latest/download/appcast.xml',

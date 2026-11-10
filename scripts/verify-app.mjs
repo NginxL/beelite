@@ -1,9 +1,9 @@
-// 校验打包后的 .app：身份、Sparkle 设置、组件版本、原生桥最低系统与代码签名。
+// 校验打包后的 .app：身份、系统显示名的本地化、helper 布局、Sparkle 设置、组件版本、原生桥最低系统与代码签名。
 // 用法：node scripts/verify-app.mjs production <BeeLite.app>
 //       node scripts/verify-app.mjs e2e <BeeLite E2E.app> --feed <url> --key <public-key>
-// 生产模式会断言不含任何测试身份、测试 feed 或测试公钥。
+// 生产模式会断言不含任何测试身份、测试 feed 或测试公钥；测试包不得带生产包的本地化显示名。
 import { spawnSync } from 'node:child_process';
-import { existsSync, readFileSync } from 'node:fs';
+import { existsSync, readdirSync, readFileSync } from 'node:fs';
 import path from 'node:path';
 import { createRequire } from 'node:module';
 import { isMain } from './release-lib.mjs';
@@ -32,6 +32,40 @@ function out(cmd, args) {
   return { ok: r.status === 0, text: `${r.stdout}${r.stderr}` };
 }
 
+/** 主 bundle 的各个 .lproj（按语言名排序）及其中的 InfoPlist.strings 内容（没有时为 null） */
+function localizations(appPath) {
+  const resources = path.join(appPath, 'Contents', 'Resources');
+  return readdirSync(resources)
+    .filter((n) => n.endsWith('.lproj'))
+    .sort()
+    .map((n) => {
+      const file = path.join(resources, n, 'InfoPlist.strings');
+      return { lang: n.slice(0, -'.lproj'.length), values: existsSync(file) ? plist(file) : null };
+    });
+}
+
+function sameEntries(actual, expected) {
+  return actual !== null && Object.keys(actual).length === Object.keys(expected).length && Object.entries(expected).every(([k, v]) => actual[k] === v);
+}
+
+// Electron 45 按 raw CFBundleName 查找这些 helper，缺少任何一个都无法启动
+const HELPER_SUFFIXES = [' Helper', ' Helper (GPU)', ' Helper (Plugin)', ' Helper (Renderer)'];
+
+/** helper 应恰好是以 raw CFBundleName 命名的这 4 个，可执行文件与目录同名，bundle ID 在主 appId 之下 */
+function checkHelpers(appPath, info, check) {
+  const frameworks = path.join(appPath, 'Contents', 'Frameworks');
+  const expected = HELPER_SUFFIXES.map((s) => `${info.CFBundleName}${s}.app`).sort();
+  const actual = readdirSync(frameworks).filter((n) => /Helper.*\.app$/.test(n)).sort();
+  check(JSON.stringify(actual) === JSON.stringify(expected), `helper 应为 ${expected.join('、')}，实际 ${actual.join('、') || '无'}`);
+  for (const name of expected.filter((n) => actual.includes(n))) {
+    const helper = plist(path.join(frameworks, name, 'Contents', 'Info.plist'));
+    const exe = name.slice(0, -'.app'.length);
+    check(helper.CFBundleExecutable === exe, `${name} 的 CFBundleExecutable 应为 ${exe}，实际 ${helper.CFBundleExecutable}`);
+    check(existsSync(path.join(frameworks, name, 'Contents', 'MacOS', exe)), `${name} 缺少可执行文件 ${exe}`);
+    check(String(helper.CFBundleIdentifier).startsWith(`${info.CFBundleIdentifier}.helper`), `${name} 的 bundle ID 应在 ${info.CFBundleIdentifier}.helper 之下，实际 ${helper.CFBundleIdentifier}`);
+  }
+}
+
 export function verifyApp(mode, appPath, expect = {}) {
   const errors = [];
   const check = (cond, msg) => cond || errors.push(msg);
@@ -44,7 +78,16 @@ export function verifyApp(mode, appPath, expect = {}) {
     check(info.CFBundleName === PRODUCTION.productName, `CFBundleName 应为 ${PRODUCTION.productName}`);
     check(info.CFBundleExecutable === PRODUCTION.productName, `CFBundleExecutable 应为 ${PRODUCTION.productName}，实际 ${info.CFBundleExecutable}`);
     check(path.basename(appPath) === `${PRODUCTION.productName}.app`, `应用文件名应为 ${PRODUCTION.productName}.app，实际 ${path.basename(appPath)}`);
-    check(info.CFBundleDisplayName === PRODUCTION.displayName, `CFBundleDisplayName 应为 ${PRODUCTION.displayName}，实际 ${info.CFBundleDisplayName}`);
+    // raw 显示名与应用文件名一致，系统才会采用下面各语言的本地化显示名
+    check(info.CFBundleDisplayName === PRODUCTION.rawDisplayName, `raw CFBundleDisplayName 应为 ${PRODUCTION.rawDisplayName}，实际 ${info.CFBundleDisplayName}`);
+    check(info.CFBundleDevelopmentRegion === PRODUCTION.developmentRegion, `CFBundleDevelopmentRegion 应为 ${PRODUCTION.developmentRegion}，实际 ${info.CFBundleDevelopmentRegion}`);
+    // 主 bundle 只能有这几个 .lproj：多出的语言目录（即使没有 InfoPlist.strings）也会参与系统的语言匹配
+    const localized = localizations(appPath);
+    const langs = localized.map((l) => l.lang);
+    check(JSON.stringify(langs) === JSON.stringify([...PRODUCTION.localizations].sort()), `主 bundle 的 .lproj 应恰好是 ${PRODUCTION.localizations.join('、')}，实际 ${langs.join('、') || '无'}`);
+    for (const { lang, values } of localized) {
+      check(sameEntries(values, PRODUCTION.localizedInfo), `${lang}.lproj/InfoPlist.strings 应为 ${JSON.stringify(PRODUCTION.localizedInfo)}，实际 ${JSON.stringify(values)}`);
+    }
     check(info.NSHumanReadableCopyright === PRODUCTION.copyright, `NSHumanReadableCopyright 应为 ${PRODUCTION.copyright}，实际 ${info.NSHumanReadableCopyright}`);
     check(pkg.productName === PRODUCTION.productName, `包内 productName 应为 ${PRODUCTION.productName}，实际 ${pkg.productName}`);
     check(info.SUFeedURL === PRODUCTION.feedURL, `SUFeedURL 应为生产地址，实际 ${info.SUFeedURL}`);
@@ -56,13 +99,17 @@ export function verifyApp(mode, appPath, expect = {}) {
     check(info.CFBundleIdentifier !== PRODUCTION.appId, '测试包不得使用生产 appId');
     check(pkg.productName !== PRODUCTION.productName && info.CFBundleName !== PRODUCTION.productName, '测试包不得使用生产 productName');
     check(info.SUPublicEDKey !== productionKey, '测试包不得使用生产公钥');
-    check(typeof info.CFBundleDisplayName === 'string' && info.CFBundleDisplayName !== PRODUCTION.displayName, '测试包的显示名不得与生产包相同');
+    const productionNames = [PRODUCTION.rawDisplayName, ...Object.values(PRODUCTION.localizedInfo)];
+    check(typeof info.CFBundleDisplayName === 'string' && !productionNames.includes(info.CFBundleDisplayName), '测试包的显示名不得与生产包的 raw 或本地化显示名相同');
+    const localized = localizations(appPath).filter((l) => l.values !== null);
+    check(localized.length === 0, `测试包不得继承生产包的本地化显示名，实际带有 ${localized.map((l) => `${l.lang}.lproj/InfoPlist.strings`).join('、')}`);
     if (expect.displayName) check(info.CFBundleDisplayName === expect.displayName, `CFBundleDisplayName 应为 ${expect.displayName}，实际 ${info.CFBundleDisplayName}`);
     if (expect.feed) check(info.SUFeedURL === expect.feed, `SUFeedURL 应为 ${expect.feed}`);
     if (expect.key) check(info.SUPublicEDKey === expect.key, 'SUPublicEDKey 与测试公钥不一致');
   } else {
     throw new Error(`未知模式 ${mode}`);
   }
+  checkHelpers(appPath, info, check);
   for (const [k, v] of Object.entries(SECURITY)) check(info[k] === v, `${k} 应为 ${v}，实际 ${info[k]}`);
   check(info.LSMinimumSystemVersion === '13.0', `LSMinimumSystemVersion 应为 13.0，实际 ${info.LSMinimumSystemVersion}`);
   check(info.CFBundleVersion === pkg.version && info.CFBundleShortVersionString === pkg.version, 'CFBundleVersion / CFBundleShortVersionString 应等于版本号');

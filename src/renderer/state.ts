@@ -580,6 +580,10 @@ export async function ensureBound(): Promise<boolean> {
 
 // ---------- 写操作统一封装 ----------
 
+/** 写操作结果中逐条显示的提示上限；超过时合并显示 */
+const MAX_SEPARATE_WARNINGS = 4;
+const MERGED_WARNINGS_MS = 15000;
+
 /** 执行写操作：防重复、toast 结果与警告、完成后刷新本地状态 */
 export async function runWrite(key: string, fn: () => Promise<OpResult>): Promise<OpResult | null> {
   if (isBusy(key)) return null;
@@ -590,7 +594,10 @@ export async function runWrite(key: string, fn: () => Promise<OpResult>): Promis
     result = await fn();
     if (result.ok) toast(result.message || '操作完成', 'success');
     else if (result.message) toast(result.message, 'info');
-    for (const w of result.warnings ?? []) toast(w, 'warn');
+    const warnings = result.warnings ?? [];
+    // toast 最多保留 5 条（其中一条是结果）：提示更多时合并为一条可滚动的提示，避免前面的被挤掉
+    if (warnings.length > MAX_SEPARATE_WARNINGS) toast(warnings.join('\n'), 'warn', MERGED_WARNINGS_MS, true);
+    else for (const w of warnings) toast(w, 'warn');
   } catch (err) {
     toast(errMsg(err), 'error');
   } finally {

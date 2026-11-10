@@ -449,6 +449,7 @@ select:focus { border-color: var(--accent); }
 .toast-out { opacity: 0; transform: translateY(-6px); }
 .toast-dot { width: 8px; height: 8px; margin-top: 7px; border-radius: 50%; flex: none; background: var(--muted); }
 .toast-msg { flex: 1; font-size: 13px; white-space: pre-wrap; word-break: break-word; user-select: text; }
+.toast-msg-list { max-height: 40vh; overflow-y: auto; overscroll-behavior: contain; }
 .toast-close { flex: none; width: 22px; height: 22px; border: 0; border-radius: 4px; background: transparent; color: var(--muted); cursor: pointer; font-size: 16px; line-height: 1; }
 .toast-close:hover { background: var(--panel-3); color: var(--text); }
 .toast-success { border-left-color: var(--success); } .toast-success .toast-dot { background: var(--success); }
