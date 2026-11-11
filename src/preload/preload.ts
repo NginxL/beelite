@@ -71,7 +71,7 @@ const api: BeeLiteApi = {
       ipcRenderer.removeListener('history:status', listener);
     };
   },
-  // WTF 配置备份：只传游戏版本、期望目录、备份编号与任务编号等标量；保存位置由主进程的选择框决定
+  // WTF 配置备份：只传游戏版本、期望目录、备份编号、任务编号与备份范围（纯数据，由主进程严格校验）；保存位置由主进程的选择框决定
   backupTaskState: () => invoke('backup:taskState'),
   onBackupTask: (cb) => {
     const listener = (_e: IpcRendererEvent, s: BackupTaskSnapshot) => cb(s);
@@ -83,7 +83,8 @@ const api: BeeLiteApi = {
   backupState: (flavorId, root) => invoke('backup:state', flavorId, root),
   backupConfigure: (flavorId, root) => invoke('backup:configure', flavorId, root),
   backupDisable: (flavorId, root) => invoke('backup:disable', flavorId, root),
-  backupRun: (flavorId, root) => invoke('backup:run', flavorId, root),
+  backupCatalog: (flavorId, root) => invoke('backup:catalog', flavorId, root),
+  backupRun: (flavorId, root, scope) => invoke('backup:run', flavorId, root, scope),
   backupVerify: (flavorId, root, snapshotId) => invoke('backup:verify', flavorId, root, snapshotId),
   backupCancel: (taskId, flavorId, root) => invoke('backup:cancel', taskId, flavorId, root),
   backupReveal: (flavorId, root, snapshotId) => invoke('backup:reveal', flavorId, root, snapshotId),

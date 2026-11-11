@@ -3,7 +3,6 @@
 import type { LocalFolder, LocalState, ManagedProjectView, RecoveryEntryView, TaskPhase } from '../shared/types';
 import { BATCH_REASON, PAUSED_REASON, setPaused, updateBlock, updateProject } from './actions.js';
 import { ACTIVITY_BLOCKED_TEXT } from './activity-notice.js';
-import { backupTabBadge, noteBackupTarget, renderBackup, resetBackup, setBackupTabOpen } from './backup.js';
 import { confirmDialog, h, modIcon, mount, spinner } from './dom.js';
 import { cleanTocText, formatDateTime } from './format.js';
 import { noteHealthTarget, renderHealth, resetHealth } from './health.js';
@@ -19,7 +18,7 @@ const SYNC_REASON = '后台任务状态尚未取得（正在同步或获取失�
 /** 未托管目录写操作的占用键（按目标区分：不同目录中的同名目录互不影响） */
 const folderKey = (t: Target, name: string): string => `folder:${targetKey(t)}\n${name}`;
 
-type Tab = 'managed' | 'unmanaged' | 'recovery' | 'history' | 'health' | 'backup';
+type Tab = 'managed' | 'unmanaged' | 'recovery' | 'history' | 'health';
 
 const KIND_TEXT: Record<RecoveryEntryView['kind'], string> = {
   uninstall: '卸载',
@@ -88,8 +87,6 @@ export function initLocal(root: HTMLElement): void {
   on('local', () => {
     // 目标变化（含同一版本换绑、解除绑定、外部修改设置后刷新、读取失败）都会经过这里：健康检查结果随之作废
     noteHealthTarget(currentTarget());
-    // 备份状态同样随目标变化作废；标签页打开时读取新目标
-    noteBackupTarget(currentTarget());
     render();
   });
   on('progress', () => {
@@ -106,7 +103,6 @@ export function initLocal(root: HTMLElement): void {
     // 旧目标的记录与健康检查结果不再显示，回复到达时也被丢弃
     resetHistory();
     resetHealth();
-    resetBackup();
     render();
   });
   // 记录保存状态变化（每次写入之后）：正在查看操作记录时重新读取
@@ -186,16 +182,14 @@ function checkInfo(): { text: string; title: string; error: boolean } | null {
 export function showManagedTab(): void {
   if (tab === 'managed') return;
   tab = 'managed';
-  setBackupTabOpen(false);
   if (bodyEl) renderBody();
 }
 
-/** 切换标签页；进入操作记录时读取当前目标的记录，进入配置备份时读取当前目标的备份状态（不读取 WTF） */
+/** 切换标签页；进入操作记录时读取当前目标的记录 */
 export function showTab(id: Tab): void {
   tab = id;
   const t = currentTarget();
   if (id === 'history' && t) void loadHistory(t);
-  setBackupTabOpen(id === 'backup');
   if (bodyEl) renderBody();
 }
 
@@ -275,16 +269,13 @@ function renderBody(): void {
     ['recovery', '回收站', local.recovery.length],
     ['history', '操作记录', null],
     ['health', '健康检查', null],
-    ['backup', '配置备份', null],
   ];
-  const backupBadge = backupTabBadge();
   const tabBar = h('div', { class: 'tabs' }, tabs.map(([id, label, count]) =>
     h('button', {
       class: id === tab ? 'tab active' : 'tab',
       on: { click: () => showTab(id) },
     }, label,
-    count === null ? null : h('span', { class: 'tab-count', text: String(count) }),
-    id === 'backup' && backupBadge ? h('span', { class: 'tab-count tab-count-accent', text: backupBadge }) : null),
+    count === null ? null : h('span', { class: 'tab-count', text: String(count) })),
   ));
 
   let content: HTMLElement;
@@ -295,8 +286,6 @@ function renderBody(): void {
   else if (tab === 'recovery') content = renderRecovery(local);
   // 健康检查：打开标签页不读取，只有点击按钮才检查
   else if (tab === 'health') content = renderHealth(t);
-  // 配置备份：不经过本地状态读取与插件写操作；打开时只读取已登记的备份位置
-  else if (tab === 'backup') content = renderBackup(t);
   else content = t ? renderHistory(t) : h('div', { class: 'tab-content scroll' }, emptyState('暂时无法显示操作记录', '本地插件状态刷新后可查看。'));
 
   const prevScroll = bodyEl.querySelector('.tab-content')?.scrollTop ?? 0;

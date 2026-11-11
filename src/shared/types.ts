@@ -1,14 +1,14 @@
 // 主进程与界面之间传递的数据结构。界面只拿到这些已规范化的对象，不接触路径之外的系统能力。
 
-import type { BackupRunResult, BackupState, BackupTaskInfo, BackupVerifyResult } from './backup-types';
+import type { BackupCatalog, BackupRunResult, BackupScope, BackupState, BackupTaskInfo, BackupVerifyResult } from './backup-types';
 import type { HealthReport } from './health-types';
 
 /** 只读插件健康检查的结果类型 */
 export type { HealthIssue, HealthIssueKind, HealthReport, HealthSeverity, HealthStatus, HealthUnavailableReason } from './health-types';
 /** 可选本地 WTF 配置备份的数据类型 */
 export type {
-  BackupAnomaly, BackupAnomalyKind, BackupLimits, BackupPhase, BackupRunResult, BackupSnapshotInfo, BackupSnapshotStatus, BackupState, BackupStatus,
-  BackupTaskInfo, BackupTaskKind, BackupUsage, BackupVerifyRecord, BackupVerifyResult,
+  BackupAnomaly, BackupAnomalyKind, BackupCatalog, BackupLimits, BackupPhase, BackupRunResult, BackupScope, BackupSnapshotInfo, BackupSnapshotStatus, BackupState,
+  BackupStatus, BackupTaskInfo, BackupTaskKind, BackupUsage, BackupVerifyRecord, BackupVerifyResult,
 } from './backup-types';
 
 /**
@@ -484,8 +484,16 @@ export interface BeeLiteApi {
   backupConfigure(flavorId: number, root: string): Promise<BackupState | null>;
   /** 关闭该目录的备份：只改设置，不删除已有备份 */
   backupDisable(flavorId: number, root: string): Promise<BackupState>;
-  /** 手动备份：结束时句柄、临时内容与占用标记都已收尾；取消以 cancelled 返回，其他失败报错 */
-  backupRun(flavorId: number, root: string): Promise<BackupOutcome<BackupRunResult>>;
+  /**
+   * 只读：列出当前目录 WTF/Account 下的账号、服务器与角色（只看目录名称与元数据，不读取文件内容）。
+   * 只在已启用且用户点击“读取账号与角色”时调用；结果只在内存中，不能当作备份授权
+   */
+  backupCatalog(flavorId: number, root: string): Promise<BackupCatalog>;
+  /**
+   * 手动备份：scope 必须显式给出（缺失即拒绝，不会默认改成全部 WTF），主进程重新校验并在受理时固定；
+   * 结束时句柄、临时内容与占用标记都已收尾；取消以 cancelled 返回，其他失败报错
+   */
+  backupRun(flavorId: number, root: string, scope: BackupScope): Promise<BackupOutcome<BackupRunResult>>;
   /** 按清单完整校验一份备份的内容；内容不一致为 completed 且 ok:false */
   backupVerify(flavorId: number, root: string, snapshotId: string): Promise<BackupOutcome<BackupVerifyResult>>;
   /** 取消任务：taskId、flavorId 与 root 均为任务受理时的原值（不要求与当前绑定相同）；不匹配时返回 false */

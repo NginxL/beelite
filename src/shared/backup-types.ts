@@ -19,6 +19,50 @@ export interface BackupLimits {
   maxManifestBytes: number;
 }
 
+/**
+ * 备份范围。all：完整 WTF；account：一个 Account/<账号> 完整子树；
+ * characters：同一账号的直属普通文件 + 账号 SavedVariables 完整子树 + 所选 <服务器>/<角色> 完整子树。
+ * 名称必须与磁盘上的目录名逐字节相等，不做规范化改写；由 core 的 parseBackupScope 严格校验。
+ */
+export type BackupScope =
+  | { kind: 'all' }
+  | { kind: 'account'; account: string }
+  | { kind: 'characters'; account: string; characters: Array<{ realm: string; character: string }> };
+
+/** 一次按角色备份最多可选的角色数（主进程校验与页面选择共用） */
+export const MAX_BACKUP_SCOPE_CHARACTERS = 256;
+
+/** 账号与角色目录列表（只含目录名称，不读任何文件正文；只在内存中使用） */
+export interface BackupCatalog {
+  flavorId: number;
+  root: string;
+  accounts: Array<{
+    account: string;
+    realms: Array<{ realm: string; characters: string[] }>;
+    /** 非 null：该账号的角色无法完整列出（超限或 Account/<账号> 无法读取），realms 为 []，只能整账号备份 */
+    characterError: string | null;
+  }>;
+  /** 被跳过的条目等说明；只用于界面显示 */
+  warnings: string[];
+  scannedAt: number;
+}
+
+/** 账号与角色目录列表的上限；默认值见 core/wtf-backup.ts 的 DEFAULT_CATALOG_LIMITS */
+export interface CatalogLimits {
+  /** 账号数；超出时整个列表失败 */
+  maxAccounts: number;
+  /** 每个账号的服务器数；超出时该账号 characterError */
+  maxRealmsPerAccount: number;
+  /** 每个服务器的角色数；超出时该账号 characterError */
+  maxCharactersPerRealm: number;
+  /** 角色总数；超出时当前账号 characterError，后续账号不再列角色 */
+  maxCharactersTotal: number;
+  /** 读取的目录项名称总数（含识别文件检查读到的名字）；超出时当前账号 characterError，后续账号不再列角色 */
+  maxNames: number;
+  /** warnings 条数；超出部分汇总为一条 */
+  maxWarnings: number;
+}
+
 export type BackupTaskKind = 'run' | 'verify';
 
 export type BackupPhase = 'preparing' | 'copying' | 'rechecking' | 'publishing' | 'verifying' | 'cleanup';
@@ -32,6 +76,8 @@ export interface BackupTaskInfo {
   root: string;
   /** 校验任务的快照编号；备份任务为 null */
   snapshotId: string | null;
+  /** 备份任务受理时固定的范围（冻结对象）；校验任务为 null */
+  scope: BackupScope | null;
   phase: BackupPhase;
   filesDone: number;
   filesTotal: number;
@@ -62,6 +108,8 @@ export interface BackupSnapshotInfo {
   fileCount: number;
   dirCount: number;
   totalBytes: number;
+  /** 清单记录的范围（schema 1 视为 all）；清单无法解析时为 null，不能显示为全部 WTF */
+  scope: BackupScope | null;
   /** 本次扫描到的实际占用（含清单与额外文件） */
   actualBytes: number;
   status: BackupSnapshotStatus;

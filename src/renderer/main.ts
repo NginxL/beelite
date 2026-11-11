@@ -1,7 +1,7 @@
 // 入口：导航、顶部栏（游戏版本与目录）、启动加载配置
 
 import { initActivityNotice } from './activity-notice.js';
-import { applyBackupTask, syncBackupTask } from './backup.js';
+import { applyBackupTask, backupNavBadge, initBackup, setBackupPageOpen, syncBackupTask } from './backup.js';
 import { initClientUpdate } from './client-update.js';
 import { initDetail } from './detail.js';
 import { initDiscover, focusSearch } from './discover.js';
@@ -15,7 +15,8 @@ import {
   syncHistoryStatus, syncWatch, unbindDirectory,
 } from './state.js';
 
-type Page = 'discover' | 'local';
+type Page = 'discover' | 'local' | 'backup';
+const PAGES: readonly Page[] = ['discover', 'local', 'backup'];
 
 const flavorSelect = byId<HTMLSelectElement>('flavor-select');
 const dirPath = byId('dir-path');
@@ -24,16 +25,32 @@ const unbindBtn = byId<HTMLButtonElement>('unbind-btn');
 const configWarn = byId('config-warning');
 const updateNotice = byId('update-notice');
 const badge = byId('update-badge');
+const backupBadge = byId('backup-badge');
 /** 已处理到的自动检查提醒序号；首次收到快照时只记录，不弹提示（启动时的结果由徽标与提示条展示） */
 let noticeSeen: number | null = null;
+/** 当前显示的页面；配置加载完成后不强制切回发现插件 */
+let currentPage: Page = 'discover';
 
+/** 三个页面互斥显示；配置备份页的打开 / 离开交给 backup 模块（重复点击已打开的页面不会重新读取） */
 function showPage(page: Page): void {
+  currentPage = page;
   for (const btn of document.querySelectorAll<HTMLButtonElement>('.nav-item')) {
     btn.classList.toggle('active', btn.dataset.page === page);
   }
-  byId('page-discover').classList.toggle('hidden', page !== 'discover');
-  byId('page-local').classList.toggle('hidden', page !== 'local');
+  for (const p of PAGES) byId(`page-${p}`).classList.toggle('hidden', p !== page);
+  setBackupPageOpen(page === 'backup');
   if (page === 'discover') focusSearch();
+}
+
+function pageOf(v: string | undefined): Page {
+  return v === 'local' || v === 'backup' ? v : 'discover';
+}
+
+/** 侧栏「配置备份」的进行中标记：来自主进程的全局任务（可能属于其他游戏版本或目录） */
+function renderBackupBadge(): void {
+  const text = backupNavBadge() ?? '';
+  if (backupBadge.textContent !== text) backupBadge.textContent = text;
+  backupBadge.classList.toggle('hidden', !text);
 }
 
 function renderTopbar(): void {
@@ -139,7 +156,7 @@ function onWatch(s: AddonWatchSnapshot): void {
 
 function bindUi(): void {
   for (const btn of document.querySelectorAll<HTMLButtonElement>('.nav-item')) {
-    btn.addEventListener('click', () => showPage(btn.dataset.page === 'local' ? 'local' : 'discover'));
+    btn.addEventListener('click', () => showPage(pageOf(btn.dataset.page)));
   }
   flavorSelect.addEventListener('change', () => {
     const id = Number(flavorSelect.value);
@@ -150,6 +167,8 @@ function bindUi(): void {
   unbindBtn.addEventListener('click', () => void unbindDirectory());
   on('local', renderTopbar);
   on('flavor', renderTopbar);
+  on('backup', renderBackupBadge);
+  renderBackupBadge();
 }
 
 async function loadConfig(): Promise<void> {
@@ -168,7 +187,8 @@ async function loadConfig(): Promise<void> {
     initLocal(byId('page-local'));
     initDetail();
     setFlavor(id);
-    focusSearch();
+    // 配置加载期间用户可能已切到其他页面：只在仍停留在发现插件时聚焦搜索框
+    if (currentPage === 'discover') focusSearch();
   } catch (err) {
     mount(page, h('div', { class: 'state-box state-error' },
       h('div', { class: 'state-title', text: '启动失败：无法读取应用配置' }),
@@ -204,7 +224,9 @@ function boot(): void {
   // 操作记录的保存状态：无法读取或未保存时页面一直提示，可重试
   window.beelite.onHistoryStatus(applyHistoryStatus);
   void syncHistoryStatus();
-  // WTF 配置备份：启动时只同步主进程内存中的任务快照（先订阅再获取，按 rev 丢弃过时的一方），不读取备份状态与 WTF
+  // WTF 配置备份：页面不依赖插件数据源配置，先于配置加载初始化（加载慢时点进去也能正确显示）；
+  // 启动时只同步主进程内存中的任务快照（先订阅再获取，按 rev 丢弃过时的一方），不读取备份状态与 WTF
+  initBackup(byId('page-backup'));
   window.beelite.onBackupTask((s) => void applyBackupTask(s));
   void syncBackupTask();
   // 客户端更新入口不依赖插件数据源配置，先于配置加载初始化

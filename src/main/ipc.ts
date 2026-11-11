@@ -3,7 +3,7 @@ import { app, dialog, ipcMain, shell, type BrowserWindow, type IpcMainInvokeEven
 import { stat } from 'node:fs/promises';
 import path from 'node:path';
 import type {
-  ActivityReservation, ActivitySnapshot, AddonWatchSnapshot, AppConfig, BackupOutcome, BackupState, BackupTaskSnapshot, ClientUpdateState, ExpectedRecord, FlavorInfo, HealthReport, HistoryKind, HistoryStatusView,
+  ActivityReservation, ActivitySnapshot, AddonWatchSnapshot, AppConfig, BackupOutcome, BackupScope, BackupState, BackupTaskSnapshot, ClientUpdateState, ExpectedRecord, FlavorInfo, HealthReport, HistoryKind, HistoryStatusView,
   HistoryVersion, InstalledRecord, LocalState, OpResult, ProfileInfo, SearchQuery, SortOrder, TaskEvent, TaskPhase,
 } from '../shared/types';
 import { ActivityRegistry } from '../core/activity';
@@ -21,7 +21,7 @@ import type { PolicyStore } from '../core/policy';
 import { inspectPickedRoot, SettingsStore } from '../core/profiles';
 import { NewBeeBoxProvider } from '../core/provider';
 import { ID_RE, type ProjectRecord } from '../core/store';
-import { SNAPSHOT_ID_RE, WtfBackupService, type WtfBackupOptions } from '../core/wtf-backup';
+import { parseBackupScope, SNAPSHOT_ID_RE, WtfBackupService, type WtfBackupOptions } from '../core/wtf-backup';
 
 const ORDERS: readonly SortOrder[] = ['ranking', 'update', 'total_download', 'favourite'];
 const FINAL_PHASES: ReadonlySet<TaskPhase> = new Set(['done', 'failed', 'cancelled']);
@@ -64,6 +64,14 @@ function snapshotIdArg(v: unknown): string {
 function backupTaskIdArg(v: unknown): string {
   if (typeof v !== 'string' || v.length === 0 || v.length > 64) throw new UserError('任务编号无效');
   return v;
+}
+/**
+ * 备份范围：必须显式给出（缺失不默认改成全部 WTF），由核心统一严格校验并返回冻结的深拷贝；
+ * 只含账号 / 服务器 / 角色的目录名称，不含任何路径
+ */
+function backupScopeArg(v: unknown): BackupScope {
+  if (v === undefined || v === null) throw new UserError('备份范围参数缺失', 'backup-scope');
+  return parseBackupScope(v);
 }
 /** 更新 / 重装时界面看到的安装记录 */
 function expectedArg(v: unknown): ExpectedRecord {
@@ -781,10 +789,14 @@ export class AppService {
     handle('backup:state', async (f, root) => this.backup.state(flavorArg(f), expectedRootArg(root)));
     handle('backup:configure', (f, root) => this.configureBackup(flavorArg(f), expectedRootArg(root)));
     handle('backup:disable', async (f, root) => this.backup.disable(flavorArg(f), expectedRootArg(root)));
-    handle('backup:run', async (f, root) => {
+    // 账号与角色列表：只读目录名称与元数据（核心要求已启用），不入闸、不写设置与备份位置
+    handle('backup:catalog', async (f, root) => this.backup.catalog(flavorArg(f), expectedRootArg(root)));
+    // 范围在受理前校验：无效或缺失时直接拒绝，不开始任务
+    handle('backup:run', async (f, root, s) => {
       const flavorId = flavorArg(f);
       const target = expectedRootArg(root);
-      return this.backupOutcome(() => this.backup.run(flavorId, target));
+      const scope = backupScopeArg(s);
+      return this.backupOutcome(() => this.backup.run(flavorId, target, scope));
     });
     handle('backup:verify', async (f, root, id) => {
       const flavorId = flavorArg(f);

@@ -1,7 +1,9 @@
 // 可选本地 WTF 配置备份：用户主动启用、选择本地位置、手动创建、重新校验、在访达中查看。
 // - 默认关闭；未启用时不访问 WTF，也不访问备份位置。不检测游戏是否运行，不提供恢复、定时、云端或自动删除。
 // - 备份位置是用户所选目录下新建的专属容器「AzerCube WTF Backup-<随机编号>」，带标记文件；不接管已有目录。
-// - 遇到符号链接、多硬链接文件、特殊文件、名称冲突或超出上限时整份失败；复制期间源发生变化直接失败，不自动重试。
+// - 范围：全部 WTF（清单 schema 1）、单个账号或同一账号的多个角色（schema 2）。缩小范围时只在所选路径上下降，
+//   未选的账号 / 服务器 / 角色只读取名字，不 lstat、不进入；账号与角色目录列表只在已启用且用户请求时读取名称。
+// - 所选范围内遇到符号链接、多硬链接文件、特殊文件、名称冲突或超出上限时整份失败；复制期间源发生变化直接失败，不自动重试。
 // - 发布前双向核对：重算源文件校验值，按清单完整校验本次临时目录，最后再复核源与目标的集合及每项身份 / 大小 / 时间。
 //   这些检查能发现常规的写入与替换，但不是瞬时的文件系统快照：最后一次复核与发布之间仍有极短的窗口。
 // - 失败或取消时只删除本次登记且身份（含各级父目录）仍匹配的临时内容；外来内容、历史备份与旧的未完成目录一律保留。
@@ -12,8 +14,10 @@ import { createHash, randomBytes } from 'node:crypto';
 import path from 'node:path';
 import type {
   BackupAnomaly,
+  BackupCatalog,
   BackupLimits,
   BackupRunResult,
+  BackupScope,
   BackupSnapshotInfo,
   BackupSnapshotStatus,
   BackupState,
@@ -22,7 +26,9 @@ import type {
   BackupUsage,
   BackupVerifyRecord,
   BackupVerifyResult,
+  CatalogLimits,
 } from '../shared/backup-types';
+import { MAX_BACKUP_SCOPE_CHARACTERS as MAX_SCOPE_CHARACTERS } from '../shared/backup-types';
 import { errorMessage, UserError } from './errors';
 import { writeAll } from './fsio';
 import { syncDir } from './layout';
@@ -40,6 +46,20 @@ export const DEFAULT_BACKUP_LIMITS: Readonly<BackupLimits> = Object.freeze({
   maxDepth: 32,
   maxManifestBytes: 16 * MiB,
 });
+
+export const DEFAULT_CATALOG_LIMITS: Readonly<CatalogLimits> = Object.freeze({
+  maxAccounts: 64,
+  maxRealmsPerAccount: 256,
+  maxCharactersPerRealm: 256,
+  maxCharactersTotal: 4096,
+  maxNames: 50000,
+  maxWarnings: 50,
+});
+
+/** 固定目录名与角色识别文件名：按 foldKey 唯一匹配 */
+const ACCOUNT_KEY = foldKey('Account');
+const SAVED_VARIABLES_KEY = foldKey('SavedVariables');
+const CHARACTER_MARKER_KEYS: ReadonlySet<string> = new Set(['AddOns.txt', 'bindings-cache.wtf', 'config-cache.wtf'].map(foldKey));
 
 export const CONTAINER_PREFIX = 'AzerCube WTF Backup-';
 export const MARKER_NAME = '.azercube-wtf-backup.json';
@@ -96,6 +116,8 @@ export interface WtfBackupOptions {
   /** 状态变化通知（无内容）；开始与结束必定触发，进度限频 */
   onChange?(): void;
   limits?: Partial<BackupLimits>;
+  /** 测试注入：账号与角色目录列表的上限 */
+  catalogLimits?: Partial<CatalogLimits>;
   hooks?: WtfBackupHooks;
 }
 
@@ -158,6 +180,95 @@ function resolveLimits(over: Partial<BackupLimits> | undefined): BackupLimits {
     if (typeof v !== 'number' || !Number.isSafeInteger(v) || v <= 0) throw new Error(`备份上限 ${k} 不合法`);
   }
   return limits;
+}
+
+function resolveCatalogLimits(over: Partial<CatalogLimits> | undefined): CatalogLimits {
+  const limits: CatalogLimits = { ...DEFAULT_CATALOG_LIMITS, ...over };
+  for (const [k, v] of Object.entries(limits)) {
+    if (typeof v !== 'number' || !Number.isSafeInteger(v) || v <= 0) throw new Error(`目录列表上限 ${k} 不合法`);
+  }
+  return limits;
+}
+
+// ---------- 备份范围 ----------
+
+const ALL_SCOPE: BackupScope = Object.freeze({ kind: 'all' as const });
+
+function scopeError(reason: string): UserError {
+  return new UserError(`备份范围无效（${reason}），请重新读取账号与角色后再试`, 'backup-scope');
+}
+
+/** 原型为 Object.prototype 或 null 的普通对象 */
+function isPureObject(v: unknown): v is object {
+  if (typeof v !== 'object' || v === null || Array.isArray(v)) return false;
+  const proto = Object.getPrototypeOf(v);
+  return proto === Object.prototype || proto === null;
+}
+
+/** 自有属性恰为 keys 且都是数据属性（不触发访问器）；返回各属性值 */
+function exactData(v: object, keys: readonly string[], what: string): Record<string, unknown> {
+  const own = Reflect.ownKeys(v);
+  if (own.length !== keys.length || !keys.every((k) => own.includes(k))) throw scopeError(`${what}的字段不正确`);
+  const out: Record<string, unknown> = {};
+  for (const k of keys) {
+    const d = Object.getOwnPropertyDescriptor(v, k);
+    if (!d || !('value' in d)) throw scopeError(`${what}的字段不正确`);
+    out[k] = d.value;
+  }
+  return out;
+}
+
+function scopeName(v: unknown, what: string): string {
+  if (typeof v !== 'string' || !isSafeSegment(v) || v.startsWith('.')) throw scopeError(`${what}名称不安全`);
+  return v;
+}
+
+/**
+ * 严格解析备份范围：普通对象、字段精确、名称安全且不以 . 开头（单段、不超过 255 字节）；
+ * characters 为无空洞的真数组，1–256 项，按大小写 / Unicode 无关的服务器 + 角色去重，服务器不能是 SavedVariables。
+ * 名称原样保留（不做规范化改写）。返回深拷贝并深度冻结。
+ */
+export function parseBackupScope(v: unknown): BackupScope {
+  if (!isPureObject(v)) throw scopeError('不是普通对象');
+  const kd = Object.getOwnPropertyDescriptor(v, 'kind');
+  const kind = kd && 'value' in kd ? kd.value : undefined;
+  if (kind === 'all') {
+    exactData(v, ['kind'], '范围');
+    return ALL_SCOPE;
+  }
+  if (kind === 'account') {
+    const d = exactData(v, ['kind', 'account'], '范围');
+    return Object.freeze({ kind: 'account' as const, account: scopeName(d.account, '账号') });
+  }
+  if (kind !== 'characters') throw scopeError('类型不受支持');
+  const d = exactData(v, ['kind', 'account', 'characters'], '范围');
+  const account = scopeName(d.account, '账号');
+  const arr = d.characters;
+  if (!Array.isArray(arr) || Object.getPrototypeOf(arr) !== Array.prototype) throw scopeError('角色列表不是数组');
+  if (arr.length < 1 || arr.length > MAX_SCOPE_CHARACTERS) throw scopeError(`角色数量须为 1–${MAX_SCOPE_CHARACTERS} 个`);
+  // 自有键只能是 length 与每个下标（拒绝空洞与额外属性）
+  if (Reflect.ownKeys(arr).length !== arr.length + 1) throw scopeError('角色列表格式不正确');
+  const seen = new Set<string>();
+  /** 同一 foldKey 的服务器必须使用完全相同的名称（否则后续定位会把它们混为一个） */
+  const realmSpelling = new Map<string, string>();
+  const characters: Array<{ realm: string; character: string }> = [];
+  for (let i = 0; i < arr.length; i++) {
+    const slot = Object.getOwnPropertyDescriptor(arr, String(i));
+    if (!slot || !('value' in slot) || !isPureObject(slot.value)) throw scopeError('角色列表格式不正确');
+    const item = exactData(slot.value, ['realm', 'character'], '角色');
+    const realm = scopeName(item.realm, '服务器');
+    const character = scopeName(item.character, '角色');
+    if (foldKey(realm) === SAVED_VARIABLES_KEY) throw scopeError('SavedVariables 不是服务器');
+    const spelled = realmSpelling.get(foldKey(realm));
+    if (spelled !== undefined && spelled !== realm) throw scopeError('同一服务器使用了大小写或 Unicode 形式不同的名称');
+    realmSpelling.set(foldKey(realm), realm);
+    const key = `${foldKey(realm)}/${foldKey(character)}`;
+    if (seen.has(key)) throw scopeError('角色重复');
+    seen.add(key);
+    characters.push(Object.freeze({ realm, character }));
+  }
+  Object.freeze(characters);
+  return Object.freeze({ kind: 'characters' as const, account, characters });
 }
 
 function cancelledError(): UserError {
@@ -298,6 +409,8 @@ interface WalkEntry {
   rel: string;
   kind: 'dir' | 'file';
   st: BigIntStats;
+  /** 途经目录：只为容纳所选子树，复核时只比较身份与类型（未选兄弟的变化不影响） */
+  pass?: boolean;
 }
 
 interface WalkOptions {
@@ -377,16 +490,198 @@ function sumFileBytes(entries: WalkEntry[]): number {
   return n;
 }
 
-/** 两次枚举是否完全一致（集合、类型、每项身份 / 大小 / 时间）；返回第一处不同的相对路径 */
+/**
+ * 两次枚举是否完全一致（集合、类型、每项身份 / 大小 / 时间）；返回第一处不同的相对路径。
+ * 途经目录只比较身份与类型：其下未选兄弟的增删会改变目录时间，但不属于所选范围的变化。
+ */
 function walkDiff(a: WalkEntry[], b: WalkEntry[]): string | null {
   const prev = new Map(a.map((e) => [e.rel, e]));
   for (const e of b) {
     const p = prev.get(e.rel);
-    if (!p || p.kind !== e.kind || !sameStat(p.st, e.st)) return e.rel;
+    if (!p || p.kind !== e.kind || !!p.pass !== !!e.pass) return e.rel;
+    if (p.pass ? idOf(p.st) !== idOf(e.st) : !sameStat(p.st, e.st)) return e.rel;
     prev.delete(e.rel);
   }
   for (const rel of prev.keys()) return rel;
   return null;
+}
+
+// ---------- 按范围枚举源 ----------
+
+interface PassBudget {
+  left: number;
+  total: number;
+}
+
+/**
+ * 在途经目录中按名称定位子目录：只读取名字（计入途经预算），未命中的名字不 lstat、不校验、不进入。
+ * wanted：foldKey → 必须逐字节相等的名称（固定名称为 null，只按 foldKey 匹配）。
+ * 同一 foldKey 命中多个名字，或与所选名称只差大小写 / Unicode 形式时失败。
+ */
+async function findPass(dirAbs: string, relDir: string, wanted: Map<string, string | null>, budget: PassBudget, o: WalkOptions): Promise<Map<string, string>> {
+  const hits = new Map<string, string[]>();
+  throwIfAborted(o.signal);
+  const dir = await opendir(dirAbs);
+  try {
+    for (let d = await dir.read(); d !== null; d = await dir.read()) {
+      throwIfAborted(o.signal);
+      if (budget.left <= 0) throw limitError('途经目录的条目数量', budget.total, 'count');
+      budget.left--;
+      const k = foldKey(d.name);
+      if (!wanted.has(k)) continue;
+      const list = hits.get(k) ?? [];
+      list.push(d.name);
+      hits.set(k, list);
+    }
+  } finally {
+    await dir.close().catch(() => undefined);
+  }
+  const found = new Map<string, string>();
+  for (const [k, exact] of wanted) {
+    const list = hits.get(k);
+    if (!list) continue;
+    if (list.length > 1) throw scopeError(`「${relDir || 'WTF'}」中有多个仅大小写或 Unicode 形式不同的「${list[0]}」`);
+    if (exact !== null && list[0] !== exact) throw scopeError(`「${relDir ? `${relDir}/` : ''}${list[0]}」与所选名称「${exact}」的大小写或 Unicode 形式不一致`);
+    found.set(k, list[0]);
+  }
+  return found;
+}
+
+/** 已定位的目录：必须是同卷真实目录（不跟随链接） */
+async function dirEntry(base: string, rel: string, dev: bigint, o: WalkOptions, pass: boolean): Promise<WalkEntry> {
+  if (rel.split('/').length > o.maxDepth) throw limitError('目录层数', o.maxDepth, 'count');
+  let st: BigIntStats;
+  try {
+    st = await lstat(path.join(base, ...rel.split('/')), { bigint: true });
+  } catch (err) {
+    if (errCode(err) === 'ENOENT') throw scopeError(`「${rel}」已不存在`);
+    throw err;
+  }
+  if (st.isSymbolicLink()) throw unsupported(o.label, rel, '是符号链接');
+  if (!st.isDirectory()) throw unsupported(o.label, rel, '不是文件夹');
+  if (st.dev !== dev) throw unsupported(o.label, rel, '位于其他磁盘卷');
+  return pass ? { rel, kind: 'dir', st, pass: true } : { rel, kind: 'dir', st };
+}
+
+/** 严格完整枚举 rel 之下的子树（原有全部检查），结果追加到 out；共用总条目与层数上限 */
+async function walkSubtree(base: string, rel: string, out: WalkEntry[], o: WalkOptions): Promise<void> {
+  if (out.length > o.maxEntries) throw limitError('文件与目录数量', o.maxEntries, 'count');
+  const sub = await walkTree(path.join(base, ...rel.split('/')), {
+    ...o,
+    maxEntries: o.maxEntries - out.length,
+    maxDepth: o.maxDepth - rel.split('/').length,
+    label: `${o.label}/${rel}`,
+  });
+  for (const e of sub) out.push({ ...e, rel: `${rel}/${e.rel}` });
+}
+
+/**
+ * 按冻结范围枚举 WTF。all 与原行为相同；其余范围每次都从 WTF 重新按名称定位，只在所选路径上下降：
+ * - account：WTF、Account 为途经目录；Account/<账号> 严格完整子树。
+ * - characters：Account/<账号> 的直属条目逐项严格分类（普通文件全部纳入，SavedVariables 完整子树，所选服务器作途经目录，
+ *   其他目录跳过不进入）；所选服务器下只定位所选角色，角色目录严格完整子树，顶层须有识别文件（普通文件）。
+ * 父目录总是先于子项出现在结果中。
+ */
+async function walkScopedSource(wtf: string, scope: BackupScope, o: WalkOptions): Promise<WalkEntry[]> {
+  if (scope.kind === 'all') return walkTree(wtf, o);
+  const baseSt = await lstat(wtf, { bigint: true });
+  if (baseSt.isSymbolicLink() || !baseSt.isDirectory()) throw unsupported(o.label, '.', '不是普通文件夹');
+  const dev = baseSt.dev;
+  const budget: PassBudget = { left: o.maxEntries, total: o.maxEntries };
+  const out: WalkEntry[] = [];
+  // 所有写入结果的条目（途经目录、直属文件、子树）共用同一总量上限；子树由 walkSubtree 按剩余量约束
+  const push = (e: WalkEntry) => {
+    if (out.length + 1 > o.maxEntries) throw limitError('文件与目录数量', o.maxEntries, 'count');
+    out.push(e);
+  };
+
+  const accountName = (await findPass(wtf, '', new Map<string, string | null>([[ACCOUNT_KEY, null]]), budget, o)).get(ACCOUNT_KEY);
+  if (!accountName) throw scopeError('WTF 中没有 Account 目录');
+  push(await dirEntry(wtf, accountName, dev, o, true));
+  const acctKey = foldKey(scope.account);
+  const acctName = (await findPass(path.join(wtf, accountName), accountName, new Map<string, string | null>([[acctKey, scope.account]]), budget, o)).get(acctKey);
+  if (!acctName) throw scopeError(`找不到账号「${scope.account}」`);
+  const acctRel = `${accountName}/${acctName}`;
+  if (scope.kind === 'account') {
+    push(await dirEntry(wtf, acctRel, dev, o, false));
+    await walkSubtree(wtf, acctRel, out, o);
+    return out;
+  }
+
+  push(await dirEntry(wtf, acctRel, dev, o, true));
+  const realms = new Map<string, string[]>();
+  for (const c of scope.characters) realms.set(c.realm, [...(realms.get(c.realm) ?? []), c.character]);
+  const realmByKey = new Map([...realms.keys()].map((r) => [foldKey(r), r]));
+
+  // 账号目录直属条目逐项严格分类
+  const acctAbs = path.join(wtf, accountName, acctName);
+  const names: string[] = [];
+  const seen = new Set<string>();
+  throwIfAborted(o.signal);
+  const dir = await opendir(acctAbs);
+  try {
+    for (let d = await dir.read(); d !== null; d = await dir.read()) {
+      throwIfAborted(o.signal);
+      // 读到的名字计入扫描预算；写入结果的条目由 push 按总量约束
+      if (budget.left <= 0) throw limitError('途经目录的条目数量', budget.total, 'count');
+      budget.left--;
+      const rel = `${acctRel}/${d.name}`;
+      if (!isSafeSegment(d.name)) throw unsupported(o.label, rel, '的名称不受支持');
+      const k = foldKey(d.name);
+      if (seen.has(k)) throw unsupported(o.label, rel, '与同目录中的其他条目仅大小写或 Unicode 形式不同');
+      seen.add(k);
+      names.push(d.name);
+    }
+  } finally {
+    await dir.close().catch(() => undefined);
+  }
+  names.sort();
+  const realmDirs: string[] = [];
+  for (const name of names) {
+    throwIfAborted(o.signal);
+    const rel = `${acctRel}/${name}`;
+    if (rel.split('/').length > o.maxDepth) throw limitError('目录层数', o.maxDepth, 'count');
+    const st = await lstat(path.join(acctAbs, name), { bigint: true });
+    if (st.isSymbolicLink()) throw unsupported(o.label, rel, '是符号链接');
+    if (st.dev !== dev) throw unsupported(o.label, rel, '位于其他磁盘卷');
+    if (st.isFile()) {
+      if (o.rejectHardlinks && st.nlink > 1n) throw unsupported(o.label, rel, '有多个硬链接');
+      push({ rel, kind: 'file', st });
+      continue;
+    }
+    if (!st.isDirectory()) throw unsupported(o.label, rel, '是特殊文件');
+    const k = foldKey(name);
+    if (k === SAVED_VARIABLES_KEY) {
+      push({ rel, kind: 'dir', st });
+      await walkSubtree(wtf, rel, out, o);
+      continue;
+    }
+    const realm = realmByKey.get(k);
+    if (realm === undefined) continue; // 未选目录：不进入
+    if (realm !== name) throw scopeError(`服务器「${name}」与所选名称「${realm}」的大小写或 Unicode 形式不一致`);
+    push({ rel, kind: 'dir', st, pass: true });
+    realmDirs.push(name);
+  }
+  for (const realm of realms.keys()) if (!realmDirs.includes(realm)) throw scopeError(`找不到服务器「${realm}」`);
+
+  // 所选服务器下只定位所选角色
+  for (const realm of realmDirs) {
+    const realmRel = `${acctRel}/${realm}`;
+    const chars = [...(realms.get(realm) ?? [])].sort();
+    const found = await findPass(path.join(acctAbs, realm), realmRel, new Map(chars.map((c) => [foldKey(c), c])), budget, o);
+    for (const character of chars) {
+      const hit = found.get(foldKey(character));
+      if (!hit) throw scopeError(`找不到角色「${realm}/${character}」`);
+      const rel = `${realmRel}/${hit}`;
+      push(await dirEntry(wtf, rel, dev, o, false));
+      const before = out.length;
+      await walkSubtree(wtf, rel, out, o);
+      const depth = rel.split('/').length + 1;
+      const marked = out.slice(before).some((e) => e.kind === 'file' && e.rel.split('/').length === depth && CHARACTER_MARKER_KEYS.has(foldKey(path.posix.basename(e.rel))));
+      if (!marked) throw scopeError(`角色「${realm}/${character}」缺少识别文件（AddOns.txt、bindings-cache.wtf 或 config-cache.wtf）`);
+    }
+  }
+  return out;
 }
 
 /** 读取并计算校验值；超过 limit 字节立即以 onOver 的错误停止 */
@@ -472,7 +767,8 @@ interface ManifestEntry {
 interface SnapshotManifest {
   format: typeof FORMAT;
   kind: 'snapshot';
-  schema: 1;
+  /** 1：完整 WTF（0.2.0 格式，不含 scope 字段）；2：缩小范围，必须带 scope */
+  schema: 1 | 2;
   snapshotId: string;
   createdAt: number;
   appVersion: string;
@@ -482,10 +778,66 @@ interface SnapshotManifest {
   totalBytes: number;
   /** 相对 WTF 的全部文件与目录（含空目录）；文件带大小与 SHA-256。清单不包含自身的校验值 */
   entries: ManifestEntry[];
+  /** schema 1 视为 all */
+  scope: BackupScope;
+}
+
+/** 写入格式：完整 WTF 仍写 schema 1（不含 scope，0.2.0 可读），缩小范围写 schema 2 并带 scope */
+function serializeManifest(m: SnapshotManifest): string {
+  const { scope, ...rest } = m;
+  return JSON.stringify(m.schema === 1 ? rest : { ...rest, scope }, null, 1);
 }
 
 function badManifest(reason: string): UserError {
   return new UserError(`备份清单不合法（${reason}）`, 'backup-manifest');
+}
+
+/**
+ * schema 2 的范围约束：每个条目都落在范围允许的区域内，且账号、所选服务器、所选角色目录与角色识别文件都存在。
+ * 固定目录名 Account / SavedVariables / 识别文件按 foldKey 匹配；所选名称逐字节相等。返回第一处问题。
+ */
+function scopeEntriesProblem(scope: BackupScope, entries: ManifestEntry[]): string | null {
+  if (scope.kind === 'all') return null;
+  const realms = new Set(scope.kind === 'characters' ? scope.characters.map((c) => c.realm) : []);
+  const pairs = new Set(scope.kind === 'characters' ? scope.characters.map((c) => `${c.realm}/${c.character}`) : []);
+  const outside = (p: string) => `「${p}」不在备份范围内`;
+  let accountDir: string | null = null;
+  for (const e of entries) {
+    const s = e.path.split('/');
+    if (foldKey(s[0]) !== ACCOUNT_KEY) return outside(e.path);
+    if (s.length === 1) {
+      if (e.type !== 'dir') return outside(e.path);
+      accountDir = s[0];
+      continue;
+    }
+    if (s[1] !== scope.account) return outside(e.path);
+    if (s.length === 2) {
+      if (e.type !== 'dir') return outside(e.path);
+      continue;
+    }
+    if (scope.kind === 'account') continue;
+    const third = s[2];
+    if (s.length === 3) {
+      if (e.type === 'file' || foldKey(third) === SAVED_VARIABLES_KEY || realms.has(third)) continue;
+      return outside(e.path);
+    }
+    if (foldKey(third) === SAVED_VARIABLES_KEY) continue;
+    if (!realms.has(third) || !pairs.has(`${third}/${s[3]}`)) return outside(e.path);
+    if (s.length === 4 && e.type !== 'dir') return outside(e.path);
+  }
+  if (accountDir === null) return '缺少 Account 目录';
+  const types = new Map(entries.map((e) => [e.path, e.type]));
+  const markedDirs = new Set(entries.filter((e) => e.type === 'file' && CHARACTER_MARKER_KEYS.has(foldKey(path.posix.basename(e.path)))).map((e) => path.posix.dirname(e.path)));
+  const acct = `${accountDir}/${scope.account}`;
+  if (types.get(acct) !== 'dir') return `缺少账号目录「${scope.account}」`;
+  if (scope.kind === 'account') return null;
+  for (const realm of realms) if (types.get(`${acct}/${realm}`) !== 'dir') return `缺少服务器目录「${realm}」`;
+  for (const pair of pairs) {
+    const dir = `${acct}/${pair}`;
+    if (types.get(dir) !== 'dir') return `缺少角色目录「${pair}」`;
+    if (!markedDirs.has(dir)) return `角色「${pair}」缺少识别文件`;
+  }
+  return null;
 }
 
 function parseManifest(buf: Buffer, expectedId: string, limits: BackupLimits): SnapshotManifest {
@@ -495,8 +847,17 @@ function parseManifest(buf: Buffer, expectedId: string, limits: BackupLimits): S
   } catch {
     throw badManifest('无法解析');
   }
-  if (!isPlainObject(raw) || raw.format !== FORMAT || raw.kind !== 'snapshot' || raw.schema !== 1) throw badManifest('格式或版本不受支持');
+  if (!isPlainObject(raw) || raw.format !== FORMAT || raw.kind !== 'snapshot' || (raw.schema !== 1 && raw.schema !== 2)) throw badManifest('格式或版本不受支持');
   if (raw.snapshotId !== expectedId) throw badManifest('编号与目录不符');
+  let scope: BackupScope = ALL_SCOPE;
+  if (raw.schema === 2) {
+    // schema 2 必须带合法范围；缺失或不合法不回退为全部 WTF
+    try {
+      scope = parseBackupScope(raw.scope);
+    } catch {
+      throw badManifest('范围缺失或不合法');
+    }
+  }
   if (!isCount(raw.createdAt) || typeof raw.appVersion !== 'string' || raw.appVersion.length > 64) throw badManifest('基本信息');
   if (typeof raw.flavorId !== 'number' || !Number.isInteger(raw.flavorId)) throw badManifest('游戏版本');
   if (!isCount(raw.fileCount) || !isCount(raw.dirCount) || !isCount(raw.totalBytes)) throw badManifest('统计');
@@ -533,7 +894,9 @@ function parseManifest(buf: Buffer, expectedId: string, limits: BackupLimits): S
     if (i >= 0 && kinds.get(foldKey(e.path.slice(0, i))) !== 'dir') throw badManifest('缺少上级目录');
   }
   if (files !== raw.fileCount || dirs !== raw.dirCount || total !== raw.totalBytes || total > limits.maxSnapshotBytes) throw badManifest('统计与条目不符');
-  return { format: FORMAT, kind: 'snapshot', schema: 1, snapshotId: expectedId, createdAt: raw.createdAt, appVersion: raw.appVersion, flavorId: raw.flavorId, fileCount: files, dirCount: dirs, totalBytes: total, entries };
+  const problem = scopeEntriesProblem(scope, entries);
+  if (problem) throw badManifest(`条目与范围不符：${problem}`);
+  return { format: FORMAT, kind: 'snapshot', schema: raw.schema === 2 ? 2 : 1, snapshotId: expectedId, createdAt: raw.createdAt, appVersion: raw.appVersion, flavorId: raw.flavorId, fileCount: files, dirCount: dirs, totalBytes: total, entries, scope };
 }
 
 /** 枚举结果与清单比较：集合（大小写 / Unicode 无关）、类型、大小；返回第一处差异 */
@@ -869,11 +1232,11 @@ interface ScanContext {
 }
 
 function blankSnapshot(id: string, status: BackupSnapshotStatus, reason: string, actualBytes: number, lastVerify: BackupVerifyRecord | null): BackupSnapshotInfo {
-  return { id, createdAt: 0, appVersion: '', flavorId: 0, fileCount: 0, dirCount: 0, totalBytes: 0, actualBytes, status, reason, lastVerify };
+  return { id, createdAt: 0, appVersion: '', flavorId: 0, fileCount: 0, dirCount: 0, totalBytes: 0, scope: null, actualBytes, status, reason, lastVerify };
 }
 
 function manifestSnapshot(m: SnapshotManifest, actualBytes: number, status: BackupSnapshotStatus, reason: string | null, lastVerify: BackupVerifyRecord | null): BackupSnapshotInfo {
-  return { id: m.snapshotId, createdAt: m.createdAt, appVersion: m.appVersion, flavorId: m.flavorId, fileCount: m.fileCount, dirCount: m.dirCount, totalBytes: m.totalBytes, actualBytes, status, reason, lastVerify };
+  return { id: m.snapshotId, createdAt: m.createdAt, appVersion: m.appVersion, flavorId: m.flavorId, fileCount: m.fileCount, dirCount: m.dirCount, totalBytes: m.totalBytes, scope: m.scope, actualBytes, status, reason, lastVerify };
 }
 
 /** 取消与扫描预算耗尽必须向上传递，不能被当作某一项的普通错误 */
@@ -1017,6 +1380,214 @@ function blockingReason(scan: ContainerScan, limits: BackupLimits, container: st
   return null;
 }
 
+// ---------- 账号与角色目录列表 ----------
+
+/** 列表读取中止：global 为 true 时（总名称或总角色数耗尽）其后账号不再读取角色 */
+class CatalogStop extends Error {
+  constructor(
+    message: string,
+    readonly global: boolean,
+  ) {
+    super(message);
+  }
+}
+
+function catalogLimitError(what: string): UserError {
+  return new UserError(`账号与角色目录超出列表上限（${what}），无法完整列出；可改用全部 WTF 备份`, 'backup-catalog-limit');
+}
+
+/**
+ * 有界列出 Account/<账号>/<服务器>/<角色>：只读取目录项名称并对候选做 lstat，不打开任何文件、不递归角色目录。
+ * 候选角色目录只做一次浅层读取名称，识别文件按 foldKey 匹配（同名冲突则跳过该角色），唯一匹配者须是单一硬链接的普通文件。
+ * 链接、跨卷、名称不受支持或冲突的条目跳过并写入提示；Account 缺失或无法读取时报错，不当作没有账号。
+ */
+async function scanCatalog(wtf: string, limits: CatalogLimits): Promise<{ accounts: BackupCatalog['accounts']; warnings: string[] }> {
+  const dev = (await lstat(wtf, { bigint: true })).dev;
+  let namesLeft = limits.maxNames;
+  let charsLeft = limits.maxCharactersTotal;
+  const warnings: string[] = [];
+  let hidden = 0;
+  const warn = (m: string) => {
+    if (warnings.length < limits.maxWarnings) warnings.push(m);
+    else hidden++;
+  };
+  const show = (name: string) => JSON.stringify(name.length > 64 ? `${name.slice(0, 64)}…` : name);
+
+  const readNames = async (abs: string): Promise<string[]> => {
+    const out: string[] = [];
+    const dir = await opendir(abs);
+    try {
+      for (let d = await dir.read(); d !== null; d = await dir.read()) {
+        if (namesLeft <= 0) throw new CatalogStop(`读取的目录项超过 ${limits.maxNames} 个，未列出全部角色，只能整账号备份`, true);
+        namesLeft--;
+        out.push(d.name);
+      }
+    } finally {
+      await dir.close().catch(() => undefined);
+    }
+    return out;
+  };
+
+  /** 名称安全、不以 . 开头、同目录内 foldKey 唯一的名字（排序）；冲突与不受支持的名字写入提示 */
+  const candidates = (names: string[], where: string, exclude: string | null): string[] => {
+    const groups = new Map<string, string[]>();
+    for (const n of names) {
+      if (n.startsWith('.')) continue;
+      if (!isSafeSegment(n)) {
+        warn(`已跳过名称不受支持的条目：${where}/${show(n)}`);
+        continue;
+      }
+      const k = foldKey(n);
+      if (k === exclude) continue;
+      const list = groups.get(k);
+      if (list) list.push(n);
+      else groups.set(k, [n]);
+    }
+    const out: string[] = [];
+    for (const list of groups.values()) {
+      if (list.length > 1) warn(`已跳过仅大小写或 Unicode 形式不同的同名条目：${where}/${list.map(show).join('、')}`);
+      else out.push(list[0]);
+    }
+    return out.sort();
+  };
+
+  const kindOf = async (abs: string, label: string): Promise<'dir' | 'file' | 'skip'> => {
+    let st: BigIntStats;
+    try {
+      st = await lstat(abs, { bigint: true });
+    } catch {
+      warn(`无法读取：${label}`);
+      return 'skip';
+    }
+    if (st.isSymbolicLink()) {
+      warn(`已跳过符号链接：${label}`);
+      return 'skip';
+    }
+    if (st.dev !== dev) {
+      warn(`已跳过位于其他磁盘卷的条目：${label}`);
+      return 'skip';
+    }
+    if (st.isDirectory()) return 'dir';
+    if (st.isFile()) return 'file';
+    warn(`已跳过特殊文件：${label}`);
+    return 'skip';
+  };
+
+  const hasMarker = async (charAbs: string, label: string): Promise<boolean> => {
+    let names: string[];
+    try {
+      names = await readNames(charAbs);
+    } catch (err) {
+      if (err instanceof CatalogStop) throw err;
+      warn(`无法读取角色目录：${label}`);
+      return false;
+    }
+    const groups = new Map<string, string[]>();
+    for (const n of names) {
+      const k = foldKey(n);
+      if (!CHARACTER_MARKER_KEYS.has(k)) continue;
+      const list = groups.get(k);
+      if (list) list.push(n);
+      else groups.set(k, [n]);
+    }
+    if ([...groups.values()].some((l) => l.length > 1)) {
+      warn(`已跳过识别文件名称冲突的角色目录：${label}`);
+      return false;
+    }
+    // 所有匹配到的识别文件都必须是单一硬链接的同卷普通文件；任一不受支持则跳过（备份时整棵角色目录也会因此失败）
+    if (groups.size === 0) return false;
+    for (const [n] of groups.values()) {
+      const st = await lstat(path.join(charAbs, n), { bigint: true }).catch(() => null);
+      if (!st || st.isSymbolicLink() || !st.isFile() || st.nlink !== 1n || st.dev !== dev) {
+        warn(`已跳过识别文件不受支持（链接、多硬链接、特殊文件或无法读取）的角色目录：${label}`);
+        return false;
+      }
+    }
+    return true;
+  };
+
+  const listRealms = async (acctAbs: string, label: string): Promise<Array<{ realm: string; characters: string[] }>> => {
+    const realmNames: string[] = [];
+    for (const n of candidates(await readNames(acctAbs), label, SAVED_VARIABLES_KEY)) {
+      if ((await kindOf(path.join(acctAbs, n), `${label}/${show(n)}`)) !== 'dir') continue;
+      if (realmNames.length >= limits.maxRealmsPerAccount) throw new CatalogStop(`服务器超过 ${limits.maxRealmsPerAccount} 个，未列出角色，只能整账号备份`, false);
+      realmNames.push(n);
+    }
+    const realms: Array<{ realm: string; characters: string[] }> = [];
+    for (const realm of realmNames) {
+      const realmAbs = path.join(acctAbs, realm);
+      const realmLabel = `${label}/${show(realm)}`;
+      let names: string[];
+      try {
+        names = await readNames(realmAbs);
+      } catch (err) {
+        if (err instanceof CatalogStop) throw err;
+        warn(`无法读取服务器目录：${realmLabel}`);
+        continue;
+      }
+      const characters: string[] = [];
+      let directFiles = 0;
+      for (const n of candidates(names, realmLabel, SAVED_VARIABLES_KEY)) {
+        const kind = await kindOf(path.join(realmAbs, n), `${realmLabel}/${show(n)}`);
+        if (kind === 'file') directFiles++;
+        if (kind !== 'dir' || !(await hasMarker(path.join(realmAbs, n), `${realmLabel}/${show(n)}`))) continue;
+        if (characters.length >= limits.maxCharactersPerRealm) throw new CatalogStop(`服务器 ${show(realm)} 的角色超过 ${limits.maxCharactersPerRealm} 个，只能整账号备份`, false);
+        if (charsLeft <= 0) throw new CatalogStop(`角色总数超过 ${limits.maxCharactersTotal} 个，未列出全部角色，只能整账号备份`, true);
+        charsLeft--;
+        characters.push(n);
+      }
+      if (directFiles > 0) warn(`服务器目录 ${realmLabel} 下有 ${directFiles} 个直属文件，按角色备份不包含它们；需要时请选择整账号备份`);
+      if (characters.length > 0) realms.push({ realm, characters });
+    }
+    return realms;
+  };
+
+  // WTF 与 Account：无法定位或超出上限时整体失败，不当作没有账号
+  const readTop = async (abs: string, what: string): Promise<string[]> => {
+    try {
+      return await readNames(abs);
+    } catch (err) {
+      if (err instanceof CatalogStop) throw catalogLimitError(`读取的目录项超过 ${limits.maxNames} 个`);
+      const c = errCode(err);
+      throw new UserError(`无法读取 ${what}${c ? `（${c}）` : ''}，无法列出账号；可改用全部 WTF 备份`, 'backup-catalog');
+    }
+  };
+  const hits = (await readTop(wtf, 'WTF 目录')).filter((n) => foldKey(n) === ACCOUNT_KEY);
+  if (hits.length > 1) throw new UserError('WTF 中有多个仅大小写或 Unicode 形式不同的 Account 目录，无法确定账号目录；可改用全部 WTF 备份', 'backup-catalog');
+  if (hits.length === 0) throw new UserError('WTF 中没有 Account 目录，未发现账号；可改用全部 WTF 备份', 'backup-catalog');
+  const accountRoot = path.join(wtf, hits[0]);
+  const ast = await lstat(accountRoot, { bigint: true });
+  if (ast.isSymbolicLink() || !ast.isDirectory() || ast.dev !== dev) throw new UserError('WTF/Account 不是同一磁盘上的普通文件夹，无法列出账号；可改用全部 WTF 备份', 'backup-catalog');
+  const accountNames: string[] = [];
+  for (const n of candidates(await readTop(accountRoot, 'Account 目录'), hits[0], SAVED_VARIABLES_KEY)) {
+    if ((await kindOf(path.join(accountRoot, n), `${hits[0]}/${show(n)}`)) !== 'dir') continue;
+    if (accountNames.length >= limits.maxAccounts) throw catalogLimitError(`账号超过 ${limits.maxAccounts} 个`);
+    accountNames.push(n);
+  }
+
+  const accounts: BackupCatalog['accounts'] = [];
+  let exhausted: string | null = null;
+  for (const account of accountNames) {
+    if (exhausted) {
+      accounts.push({ account, realms: [], characterError: exhausted });
+      continue;
+    }
+    try {
+      accounts.push({ account, realms: await listRealms(path.join(accountRoot, account), `${hits[0]}/${show(account)}`), characterError: null });
+    } catch (err) {
+      if (err instanceof CatalogStop) {
+        if (err.global) exhausted = err.message;
+        accounts.push({ account, realms: [], characterError: err.message });
+      } else {
+        const c = errCode(err);
+        accounts.push({ account, realms: [], characterError: `无法读取该账号目录${c ? `（${c}）` : ''}，只能整账号备份` });
+      }
+    }
+  }
+  if (hidden > 0) warnings[warnings.length - 1] = `另有 ${hidden + 1} 条提示未显示`;
+  return { accounts, warnings };
+}
+
 // ---------- 服务 ----------
 
 interface ActiveTask {
@@ -1055,6 +1626,7 @@ function snapshotArg(v: unknown): string {
 
 export class WtfBackupService {
   readonly limits: BackupLimits;
+  readonly catalogLimits: CatalogLimits;
   private readonly config: ConfigStore;
   private active: ActiveTask | null = null;
   /** 本实例正在修改备份设置（与任务互斥） */
@@ -1068,6 +1640,7 @@ export class WtfBackupService {
 
   constructor(private readonly opts: WtfBackupOptions) {
     this.limits = resolveLimits(opts.limits);
+    this.catalogLimits = resolveCatalogLimits(opts.catalogLimits);
     this.config = new ConfigStore(opts.settingsFile, (name, detail) => this.step(name, detail));
   }
 
@@ -1095,14 +1668,14 @@ export class WtfBackupService {
   }
 
   /** 同步占位：同一时刻全局只有一个备份 / 校验任务，且不与设置修改并行 */
-  private begin(kind: BackupTaskKind, flavorId: number, root: string, snapshotId: string | null): ActiveTask {
+  private begin(kind: BackupTaskKind, flavorId: number, root: string, snapshotId: string | null, scope: BackupScope | null): ActiveTask {
     if (this.closed || this.active || this.configuring) throw this.busyError();
     let finish: () => void = () => undefined;
     const done = new Promise<void>((resolve) => {
       finish = () => resolve();
     });
     const task: ActiveTask = {
-      info: { id: newTaskId(), kind, flavorId, root, snapshotId, phase: 'preparing', filesDone: 0, filesTotal: 0, bytesDone: 0, bytesTotal: 0, cancelling: false, startedAt: Date.now() },
+      info: { id: newTaskId(), kind, flavorId, root, snapshotId, scope, phase: 'preparing', filesDone: 0, filesTotal: 0, bytesDone: 0, bytesTotal: 0, cancelling: false, startedAt: Date.now() },
       controller: new AbortController(),
       done,
       finish,
@@ -1408,13 +1981,40 @@ export class WtfBackupService {
     }
   }
 
-  // ---------- 备份 ----------
+  // ---------- 账号与角色目录列表 ----------
 
-  /** 手动备份；Promise 在文件句柄关闭、临时内容收尾、占用标记释放之后才结束。已受理的任务固定原目录 */
-  async run(flavorId: number, expectedRoot: string): Promise<BackupRunResult> {
+  /**
+   * 读取账号与角色目录列表：只在已启用且用户明确请求时调用；不要求备份位置可用。
+   * 只读取目录项名称与候选的 lstat（不打开任何文件、不递归角色目录）；回包前复核绑定与源目录身份。结果不持久化、不写日志。
+   */
+  async catalog(flavorId: number, expectedRoot: string): Promise<BackupCatalog> {
     const f = flavorArg(flavorId);
     const expected = pathArg(expectedRoot, '目标目录');
-    const task = this.begin('run', f, expected, null);
+    if (this.closed) throw this.busyError();
+    const root = await this.checkTarget(f, expected);
+    await this.enabledRecord(f, root);
+    const src = await this.openSource(root);
+    const scan = await scanCatalog(src.wtf, this.catalogLimits);
+    await this.checkTarget(f, expected);
+    try {
+      await this.recheckSource(src);
+    } catch {
+      throw new UserError('读取期间游戏目录或其 WTF 文件夹被移动或替换，请重新读取', 'backup-source-changed');
+    }
+    return { flavorId: f, root, accounts: scan.accounts, warnings: scan.warnings, scannedAt: Date.now() };
+  }
+
+  // ---------- 备份 ----------
+
+  /**
+   * 手动备份；Promise 在文件句柄关闭、临时内容收尾、占用标记释放之后才结束。已受理的任务固定原目录与范围。
+   * scope 在受理前严格解析并冻结；省略时为全部 WTF（仅供进程内旧调用，IPC 必须显式传入）。
+   */
+  async run(flavorId: number, expectedRoot: string, scope: unknown = ALL_SCOPE): Promise<BackupRunResult> {
+    const f = flavorArg(flavorId);
+    const expected = pathArg(expectedRoot, '目标目录');
+    const fixed = parseBackupScope(scope);
+    const task = this.begin('run', f, expected, null, fixed);
     try {
       return await this.doRun(task);
     } finally {
@@ -1477,7 +2077,10 @@ export class WtfBackupService {
     const src = await this.openSource(root);
     await this.step('source-enumerate');
     const walkOpts: WalkOptions = { maxEntries: limits.maxEntries, maxDepth: limits.maxDepth, rejectHardlinks: true, signal, label: 'WTF' };
-    const entries = await walkTree(src.wtf, walkOpts);
+    // 首次枚举与两次源复核共用同一个冻结范围，每次都从 WTF 重新按名称定位
+    const scope = info.scope ?? ALL_SCOPE;
+    const walkSource = () => walkScopedSource(src.wtf, scope, walkOpts);
+    const entries = await walkSource();
     const files = entries.filter((e) => e.kind === 'file');
     for (const e of files) if (Number(e.st.size) > limits.maxFileBytes) throw limitError(`单个文件（「${e.rel}」）`, limits.maxFileBytes, 'bytes');
     const statBytes = sumFileBytes(entries);
@@ -1509,7 +2112,7 @@ export class WtfBackupService {
     // 4. 源复核：集合与每项身份未变，源内容重算一致（读取所用的源文件身份与枚举一致）
     this.phase(task, 'rechecking');
     await this.step('source-recheck');
-    await this.assertSourceUnchanged(src, entries, walkOpts);
+    await this.assertSourceUnchanged(src, entries, walkSource);
     for (const e of files) {
       const fh = await openSourceFile(path.join(src.wtf, ...e.rel.split('/')), e.rel, e.st);
       try {
@@ -1531,7 +2134,7 @@ export class WtfBackupService {
     const manifest: SnapshotManifest = {
       format: FORMAT,
       kind: 'snapshot',
-      schema: 1,
+      schema: scope.kind === 'all' ? 1 : 2,
       snapshotId: id,
       createdAt,
       appVersion: this.opts.appVersion,
@@ -1540,8 +2143,9 @@ export class WtfBackupService {
       dirCount: entries.length - files.length,
       totalBytes: statBytes,
       entries: manifestEntries,
+      scope,
     };
-    const text = Buffer.from(JSON.stringify(manifest, null, 1), 'utf8');
+    const text = Buffer.from(serializeManifest(manifest), 'utf8');
     if (text.byteLength > limits.maxManifestBytes) throw limitError('备份清单大小', limits.maxManifestBytes, 'bytes');
     await this.step('manifest-write');
     await partial.writeFile(MANIFEST_NAME, text);
@@ -1563,7 +2167,7 @@ export class WtfBackupService {
 
     // 8. 最终复核：源与目标的集合及每项身份 / 大小 / 时间在上述检查之后仍未变化
     await this.step('final-check');
-    await this.assertSourceUnchanged(src, entries, walkOpts);
+    await this.assertSourceUnchanged(src, entries, walkSource);
     const finalTarget = await this.walkPartial(partial, signal);
     const moved = walkDiff(pinned, finalTarget);
     if (moved) throw targetChanged(`「${moved}」在核对后被改动`);
@@ -1593,10 +2197,19 @@ export class WtfBackupService {
     if (scan.usage.bytes > limits.maxTotalBytes) throw limitError('备份位置总占用', limits.maxTotalBytes, 'bytes');
   }
 
-  /** 源的根目录链、WTF 身份、完整集合与每项身份 / 大小 / 时间与首次枚举一致 */
-  private async assertSourceUnchanged(src: SourceCtx, entries: WalkEntry[], walkOpts: WalkOptions): Promise<void> {
+  /**
+   * 源的根目录链、WTF 身份、按同一范围重新枚举的集合与每项身份 / 大小 / 时间与首次枚举一致（途经目录只比身份与类型）。
+   * 所选路径在复核时消失、被替换或名称变化，按源变化处理。
+   */
+  private async assertSourceUnchanged(src: SourceCtx, entries: WalkEntry[], walkSource: () => Promise<WalkEntry[]>): Promise<void> {
     await this.recheckSource(src);
-    const again = await walkTree(src.wtf, walkOpts);
+    let again: WalkEntry[];
+    try {
+      again = await walkSource();
+    } catch (err) {
+      if (err instanceof UserError && err.code === 'backup-scope') throw new UserError(`备份期间所选范围发生了变化（${err.message}），本次备份未完成`, 'backup-source-changed');
+      throw err;
+    }
     const changed = walkDiff(entries, again);
     if (changed) throw sourceChanged(changed);
   }
@@ -1670,7 +2283,7 @@ export class WtfBackupService {
     const f = flavorArg(flavorId);
     const expected = pathArg(expectedRoot, '目标目录');
     const id = snapshotArg(snapshotId);
-    const task = this.begin('verify', f, expected, id);
+    const task = this.begin('verify', f, expected, id, null);
     try {
       return await this.doVerify(task, id);
     } finally {

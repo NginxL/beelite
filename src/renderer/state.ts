@@ -18,9 +18,10 @@ export const api = (): BeeLiteApi => window.beelite;
 
 /**
  * flavor：切换版本；local：本地状态或按钮状态变化；watch：主进程插件更新检查快照变化；
- * progress：进行中任务的下载百分比变化（只需就地更新进度文字，不重绘页面）；history：操作记录的保存状态变化
+ * progress：进行中任务的下载百分比变化（只需就地更新进度文字，不重绘页面）；history：操作记录的保存状态变化；
+ * backup：配置备份的任务开始 / 结束、备份状态、账号与角色列表或操作结果变化（同一任务的进度不触发，只就地更新任务卡片）
  */
-type EventName = 'flavor' | 'local' | 'watch' | 'progress' | 'history';
+type EventName = 'flavor' | 'local' | 'watch' | 'progress' | 'history' | 'backup';
 const listeners = new Map<EventName, Set<() => void>>();
 
 export function on(ev: EventName, fn: () => void): void {

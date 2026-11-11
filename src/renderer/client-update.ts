@@ -223,8 +223,9 @@ export function initClientUpdate(): void {
     h('div', { class: 'client-note', text: '仅支持免费公开插件' }),
   );
   render();
-  // 进行中的操作结束、确认框关闭后，再判断是否可以展示被推迟的更新说明
+  // 进行中的操作结束、确认框关闭后，再判断是否可以展示被推迟的更新说明（插件操作经 local，WTF 备份 / 校验经 backup）
   on('local', schedulePrompt);
+  on('backup', schedulePrompt);
   onModalClosed(schedulePrompt);
   api().onClientState(applyState);
   api()

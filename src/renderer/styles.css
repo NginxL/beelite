@@ -79,11 +79,13 @@ button, input, select { font: inherit; color: inherit; }
 .nav-icon { width: 14px; height: 14px; flex: none; background: currentColor; }
 .nav-icon-discover { border-radius: 50%; clip-path: circle(50%); }
 .nav-icon-local { clip-path: polygon(25% 3%, 75% 3%, 100% 50%, 75% 97%, 25% 97%, 0 50%); }
+.nav-icon-backup { border-radius: 3px; clip-path: polygon(evenodd, 0 12%, 100% 12%, 100% 100%, 0 100%, 0 12%, 18% 32%, 82% 32%, 82% 46%, 18% 46%, 18% 32%); }
 .badge {
   margin-left: auto; min-width: 20px; padding: 0 6px;
   border-radius: 10px; background: var(--accent); color: #1a1400;
   font-size: 12px; font-weight: 700; line-height: 20px; text-align: center;
 }
+.badge-soft { background: var(--accent-soft); color: var(--accent); font-weight: 600; white-space: nowrap; }
 .sidebar-foot { margin-top: auto; padding: 8px; font-size: 12px; color: #6b7178; display: flex; flex-direction: column; gap: 6px; }
 .client-version { color: var(--muted); font-weight: 600; }
 .client-status { color: var(--text); line-height: 1.4; word-break: break-all; }
@@ -417,14 +419,34 @@ select:focus { border-color: var(--accent); }
 .health-issue { font-size: 12px; white-space: pre-wrap; word-break: break-word; user-select: text; }
 .history-warnings { display: flex; flex-direction: column; gap: 4px; font-size: 12px; color: #f3c34a; white-space: pre-wrap; user-select: text; }
 /* 配置备份：路径与说明可选中复制；列表与警告限高滚动 */
-.tab-count-accent { background: var(--accent-soft); color: var(--accent); }
+.backup-page-head { flex: none; display: flex; align-items: center; justify-content: space-between; gap: 10px; margin-bottom: 10px; }
+.backup-body { flex: 1; min-height: 0; padding-right: 4px; display: flex; flex-direction: column; }
 .backup-title { font-size: 14px; font-weight: 600; margin-right: auto; }
+.backup-source { flex: none; display: flex; flex-direction: column; gap: 2px; margin-bottom: 8px; font-size: 12px; color: var(--muted); user-select: text; }
+.backup-source .mono { color: var(--text); word-break: break-all; }
+.backup-scope { flex: none; min-width: 0; margin: 4px 0 10px; padding: 10px 14px; border: 1px solid var(--border); border-radius: var(--radius-sm); background: var(--panel); display: flex; flex-direction: column; gap: 8px; font-size: 13px; }
+.backup-scope legend { padding: 0 4px; font-weight: 600; }
+.backup-scope-kinds { display: flex; flex-wrap: wrap; gap: 6px 18px; }
+.backup-choice { display: inline-flex; align-items: flex-start; gap: 6px; min-width: 0; cursor: pointer; overflow-wrap: anywhere; }
+.backup-choice input { flex: none; margin: 2px 0 0; cursor: pointer; }
+.backup-choice input:disabled, .backup-choice input:disabled + span { cursor: not-allowed; opacity: .6; }
+.backup-scope-desc { color: var(--muted); font-size: 12px; line-height: 1.55; user-select: text; }
+.backup-scope-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
+.backup-account { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; min-width: 0; }
+.backup-account select { min-width: 0; max-width: 100%; }
+.backup-chars { max-height: 240px; overflow-y: auto; display: flex; flex-direction: column; gap: 6px; padding: 6px 8px; border: 1px solid var(--border); border-radius: var(--radius-sm); background: var(--bg); }
+.backup-realm { display: flex; flex-direction: column; gap: 4px; }
+.backup-realm-name { font-size: 12px; font-weight: 600; color: var(--muted); overflow-wrap: anywhere; user-select: text; }
+.backup-realm-chars { display: flex; flex-wrap: wrap; gap: 4px 16px; padding-left: 8px; }
+.backup-summary { font-size: 12px; color: var(--text); overflow-wrap: anywhere; user-select: text; }
+.backup-summary-missing { color: #f3c34a; }
 .backup-intro { display: flex; flex-direction: column; gap: 6px; line-height: 1.55; }
 .backup-status { flex: none; display: flex; flex-direction: column; gap: 4px; margin: 4px 0 8px; font-size: 13px; user-select: text; }
 .backup-path { word-break: break-all; color: var(--text); }
 .backup-usage { font-variant-numeric: tabular-nums; }
 .backup-meta { font-size: 12px; color: var(--muted); user-select: text; }
 .backup-task { flex: none; margin-bottom: 8px; }
+.backup-task:empty { display: none; }
 .backup-task-row { align-items: center; }
 .backup-progress { font-variant-numeric: tabular-nums; }
 .backup-notice { background: var(--panel); border: 1px solid var(--border); color: var(--text); }

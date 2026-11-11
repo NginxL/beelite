@@ -9,11 +9,13 @@ import { mkdir, readdir, realpath, rm, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { createQuitGuard } from '../src/core/gate';
 import { LOCK_NAME, PARTIAL_PREFIX, type BackupStep } from '../src/core/wtf-backup';
-import type { BackupOutcome, BackupTaskSnapshot } from '../src/shared/types';
+import type { BackupOutcome, BackupScope, BackupTaskSnapshot } from '../src/shared/types';
 import { cleanup, exists, FakeSource, makeGameRoot, tmpDir } from './helpers';
 import { createHarness, snapshot } from './ipc-harness';
 
 const F = 9;
+/** 0.2.1 起备份范围必须显式给出；默认的全部 WTF 也要明确传入 */
+const ALL = { kind: 'all' } as const;
 const tick = () => new Promise((r) => setImmediate(r));
 
 async function until(fn: () => boolean, what: string): Promise<void> {
@@ -113,7 +115,8 @@ test('备份 IPC：只接受主窗口的请求；游戏版本、期望目录、�
       ['backup:state', [F, A]],
       ['backup:configure', [F, A]],
       ['backup:disable', [F, A]],
-      ['backup:run', [F, A]],
+      ['backup:catalog', [F, A]],
+      ['backup:run', [F, A, ALL]],
       ['backup:verify', [F, A, '20260101-000000-00000000']],
       ['backup:cancel', ['x', F, A]],
       ['backup:reveal', [F, A, null]],
@@ -122,7 +125,7 @@ test('备份 IPC：只接受主窗口的请求；游戏版本、期望目录、�
     }
     await assert.rejects(h.api.backupState(999, A), /不支持的游戏版本/);
     await assert.rejects(h.api.backupState('9' as unknown as number, A), /不支持的游戏版本/);
-    await assert.rejects(h.api.backupRun(F, 'relative/path'), /目标目录参数无效/);
+    await assert.rejects(h.api.backupRun(F, 'relative/path', ALL), /目标目录参数无效/);
     await assert.rejects(h.api.backupState(F, path.join(f.base, 'elsewhere')), /绑定已变更/);
     for (const bad of ['../..', '/etc', '20260101-000000-0000000G', '20260101-000000-00000000/..', 42, null]) {
       await assert.rejects(h.api.backupVerify(F, A, bad as string), /备份编号无效/, String(bad));
@@ -175,11 +178,105 @@ test('默认关闭：启动、任务快照与查看状态都不读取 WTF、不�
     assert.ok(!h.stub.sent.some((x) => x.channel === 'backup:task' && (x.payload as BackupTaskSnapshot).task), '没有任务');
 
     // 手动备份才读取 WTF（说明上面的观察确实有效）
-    await h.api.backupRun(F, A);
+    await h.api.backupRun(F, A, ALL);
     assert.ok(spy.calls.length > 0);
   } finally {
     spy.restore();
     await cleanup(base);
+  }
+});
+
+/** 在临时游戏目录中合成账号、服务器与角色目录（同一账号两个服务器有同名角色）和 WTF 根级设置 */
+async function addCharacters(root: string): Promise<void> {
+  const acct = path.join(root, 'WTF', 'Account', 'TEST');
+  for (const [realm, ch] of [['RealmA', 'Bob'], ['RealmB', 'Bob'], ['RealmA', 'Alice']]) {
+    await mkdir(path.join(acct, realm, ch), { recursive: true });
+    await writeFile(path.join(acct, realm, ch, 'AddOns.txt'), 'Questie: enabled\n');
+  }
+  await writeFile(path.join(root, 'WTF', 'Config.wtf'), 'SET test "1"\n');
+}
+
+test('账号与角色范围：catalog 只读、不入闸、不产生任务且未启用时拒绝；backup:run 缺少或不合法的范围在受理前拒绝（没有任务、不读 WTF）；合法范围交给核心并出现在任务、结果与列表中', async () => {
+  const f = await setup();
+  const { h, A } = f;
+  const isError = (err: unknown) => err instanceof Error;
+  try {
+    await addCharacters(A);
+    await assert.rejects(h.api.backupCatalog(F, A), /尚未启用/);
+    await assert.rejects(h.api.backupCatalog(F, path.join(f.base, 'elsewhere')), /绑定已变更/);
+    await assert.rejects(h.api.backupCatalog('9' as unknown as number, A), /不支持的游戏版本/);
+    await assert.rejects(h.api.backupCatalog(F, 'relative/path'), /目标目录参数无效/);
+    const container = await enable(f);
+    const pushesBefore = f.taskPushes().length;
+
+    // 范围缺失或不合法：受理前拒绝，不开始任务，也不访问 WTF
+    const spy = watchAccess(f.wtf);
+    try {
+      await assert.rejects(h.invoke('backup:run', F, A), /备份范围参数缺失/);
+      for (const bad of [undefined, null]) await assert.rejects(h.invoke('backup:run', F, A, bad), /备份范围参数缺失/, String(bad));
+      for (const bad of [
+        'all', 42, [], { kind: 'everything' }, { kind: 'all', extra: 1 }, { kind: 'account' }, { kind: 'account', account: '../OTHER' },
+        { kind: 'account', account: 'TEST', path: '/etc' }, { kind: 'characters', account: 'TEST', characters: [] },
+        { kind: 'characters', account: 'TEST', characters: [{ realm: 'RealmA', character: 'Bob' }, { realm: 'RealmA', character: 'Bob' }] },
+        { kind: 'characters', account: 'TEST', characters: [{ realm: 'RealmA/Bob', character: 'x' }] },
+      ]) {
+        await assert.rejects(h.invoke('backup:run', F, A, bad), isError, JSON.stringify(bad));
+      }
+      assert.deepEqual(spy.calls, [], '无效范围不读取 WTF');
+    } finally {
+      spy.restore();
+    }
+    await tick();
+    assert.equal(f.taskPushes().length, pushesBefore, '没有受理任务');
+    assert.equal((await h.api.backupTaskState()).task, null);
+    assert.equal(h.gate.activeCount, 0);
+
+    // 列表：只读目录名称与元数据，不打开任何文件；不入闸，不产生任务
+    const spy2 = watchAccess(f.wtf);
+    let c: Awaited<ReturnType<typeof h.api.backupCatalog>>;
+    try {
+      c = await h.api.backupCatalog(F, A);
+      assert.deepEqual(spy2.calls.filter((x) => x.startsWith('open:') || x.startsWith('readFile:')), [], '不读取文件内容');
+    } finally {
+      spy2.restore();
+    }
+    assert.equal(c.flavorId, F);
+    assert.equal(c.root, A);
+    const acct = c.accounts.find((a) => a.account === 'TEST');
+    assert.ok(acct && acct.characterError === null);
+    assert.deepEqual(acct.realms.flatMap((r) => r.characters.map((ch) => `${r.realm}/${ch}`)).sort(), ['RealmA/Alice', 'RealmA/Bob', 'RealmB/Bob']);
+    assert.equal(h.gate.activeCount, 0);
+    await tick();
+    assert.equal(f.taskPushes().length, pushesBefore, '读取列表不产生任务');
+
+    // 合法范围：同一账号跨服务器的同名角色；任务、推送、结果与列表中的范围一致
+    const scope: BackupScope = { kind: 'characters', account: 'TEST', characters: [{ realm: 'RealmA', character: 'Bob' }, { realm: 'RealmB', character: 'Bob' }] };
+    const at = f.pause.arm('copy-file');
+    const run = h.api.backupRun(F, A, scope);
+    await at.reached;
+    assert.deepEqual((await h.api.backupTaskState()).task?.scope, scope);
+    assert.ok(f.taskPushes().some((p) => p.task?.kind === 'run' && JSON.stringify(p.task.scope) === JSON.stringify(scope)), '推送的任务带范围');
+    at.release();
+    const r = completed(await run);
+    assert.deepEqual(r.snapshot.scope, scope);
+    assert.deepEqual((await h.api.backupState(F, A)).snapshots.find((x) => x.id === r.snapshot.id)?.scope, scope);
+    const copied = path.join(container, r.snapshot.id, 'WTF');
+    assert.ok(await exists(path.join(copied, 'Account', 'TEST', 'RealmA', 'Bob', 'AddOns.txt')));
+    assert.ok(await exists(path.join(copied, 'Account', 'TEST', 'RealmB', 'Bob', 'AddOns.txt')));
+    assert.ok(await exists(path.join(copied, 'Account', 'TEST', 'SavedVariables', 'Questie.lua')), '含账号共享配置');
+    assert.equal(await exists(path.join(copied, 'Account', 'TEST', 'RealmA', 'Alice')), false, '不含未选角色');
+    assert.equal(await exists(path.join(copied, 'Config.wtf')), false, '不含 WTF 根级设置');
+
+    // 校验任务没有范围
+    const vat = f.pause.arm('verify-file');
+    const verify = h.api.backupVerify(F, A, r.snapshot.id);
+    await vat.reached;
+    assert.equal((await h.api.backupTaskState()).task?.scope, null);
+    vat.release();
+    assert.equal(completed(await verify).ok, true);
+    assert.equal(h.gate.activeCount, 0);
+  } finally {
+    await cleanup(f.base);
   }
 });
 
@@ -244,8 +341,9 @@ test('备份与校验：源不变；任务快照只来自内存（进度推送�
     };
     const sentBefore = f.taskPushes().length;
 
-    const r = completed(await h.api.backupRun(F, A));
+    const r = completed(await h.api.backupRun(F, A, ALL));
     assert.equal(r.snapshot.status, 'structure-ok');
+    assert.deepEqual(r.snapshot.scope, ALL);
     assert.deepEqual(r.warnings, []);
     assert.deepEqual(await snapshot(f.wtf), before, '源 WTF 不变');
     assert.ok(await exists(path.join(container, r.snapshot.id)));
@@ -284,7 +382,7 @@ test('换绑后取消：按原任务编号、原游戏版本与原目录取消�
   try {
     const container = await enable(f);
     const at = f.pause.arm('copy-file');
-    const run = h.api.backupRun(F, A);
+    const run = h.api.backupRun(F, A, ALL);
     await at.reached;
     const task = (await h.api.backupTaskState()).task;
     assert.ok(task && task.kind === 'run');
@@ -297,7 +395,7 @@ test('换绑后取消：按原任务编号、原游戏版本与原目录取消�
     await assert.rejects(h.api.backupState(F, A), /绑定已变更/);
     assert.equal((await h.api.backupState(F, B)).status, 'disabled');
     // 运行期间不能再次启用或备份
-    await assert.rejects(h.api.backupRun(F, B), /已有备份或校验任务/);
+    await assert.rejects(h.api.backupRun(F, B, ALL), /已有备份或校验任务/);
     await assert.rejects(h.api.backupConfigure(F, B), /已有备份或校验任务/);
 
     assert.equal(await h.api.backupCancel('other-task', F, A), false);
@@ -330,7 +428,7 @@ test('结构化结果：取消保留完整收尾说明；已发布后才收到�
 
     // 1. 取消，且占用标记在收尾前被替换：cancelled 的说明包含保留标记的提示
     let at = f.pause.arm('copy-file');
-    const cancelled = h.api.backupRun(F, A);
+    const cancelled = h.api.backupRun(F, A, ALL);
     await at.reached;
     const task = (await h.api.backupTaskState()).task!;
     assert.equal(await h.api.backupCancel(task.id, F, A), true);
@@ -344,7 +442,7 @@ test('结构化结果：取消保留完整收尾说明；已发布后才收到�
 
     // 2. 已发布、正在释放占用标记时才收到取消：仍是 completed，备份存在
     at = f.pause.arm('before-lock-release');
-    const late = h.api.backupRun(F, A);
+    const late = h.api.backupRun(F, A, ALL);
     await at.reached;
     const t2 = (await h.api.backupTaskState()).task!;
     assert.equal(await h.api.backupCancel(t2.id, F, A), true);
@@ -354,7 +452,7 @@ test('结构化结果：取消保留完整收尾说明；已发布后才收到�
 
     // 3. 复制期间源被改动：普通失败以错误返回
     at = f.pause.arm('copy-file');
-    const failing = h.api.backupRun(F, A);
+    const failing = h.api.backupRun(F, A, ALL);
     await at.reached;
     await writeFile(path.join(f.wtf, 'Account', 'TEST', 'SavedVariables', 'Questie.lua'), 'QuestieConfig = { changed = true }\n');
     at.release();
@@ -371,7 +469,7 @@ test('退出：同一次 before-quit 中先中止备份，退出保护等待备�
   try {
     const container = await enable(f);
     const at = f.pause.arm('copy-file');
-    const run = h.api.backupRun(F, A);
+    const run = h.api.backupRun(F, A, ALL);
     await at.reached;
     assert.ok(readdirSync(container).some((n) => n.startsWith(PARTIAL_PREFIX)));
 
@@ -410,7 +508,7 @@ test('客户端更新等待：重新校验会写占用标记，也在闸门内�
   const { h, A } = f;
   try {
     const container = await enable(f);
-    const r = completed(await h.api.backupRun(F, A));
+    const r = completed(await h.api.backupRun(F, A, ALL));
     const at = f.pause.arm('verify-file');
     const verify = h.api.backupVerify(F, A, r.snapshot.id);
     await at.reached;
