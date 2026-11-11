@@ -6,7 +6,10 @@ import { lstat, readdir, readFile } from 'node:fs/promises';
 import path from 'node:path';
 import type { BeeLiteApi, ExpectedRecord } from '../src/shared/types';
 import type { ManagerOptions } from '../src/core/manager';
+import type { WtfBackupOptions } from '../src/core/wtf-backup';
 import { MutationGate } from '../src/core/gate';
+import { HistoryStore } from '../src/core/history';
+import { PolicyStore } from '../src/core/policy';
 import { SettingsStore } from '../src/core/profiles';
 import type { NewBeeBoxProvider } from '../src/core/provider';
 import type { FakeSource } from './helpers';
@@ -19,7 +22,11 @@ interface Stub {
   messageBoxResponse: number;
   messageBoxes: { title?: string; message?: string }[];
   openDialogs: number;
+  /** 每次文件夹选择框的 properties（例如 openDirectory） */
+  openDialogProps: string[][];
   pick: string | null;
+  /** shell.showItemInFolder 收到的路径 */
+  revealed: string[];
   exposed: BeeLiteApi | null;
   /** 主进程推送给窗口的事件（通道与内容） */
   sent: { channel: string; payload: unknown }[];
@@ -27,7 +34,7 @@ interface Stub {
   listeners: Map<string, Set<(e: unknown, payload: unknown) => void>>;
 }
 
-const stub: Stub = { handlers: new Map(), messageBoxResponse: 0, messageBoxes: [], openDialogs: 0, pick: null, exposed: null, sent: [], listeners: new Map() };
+const stub: Stub = { handlers: new Map(), messageBoxResponse: 0, messageBoxes: [], openDialogs: 0, openDialogProps: [], pick: null, revealed: [], exposed: null, sent: [], listeners: new Map() };
 const webContents = {
   // 与 Electron 一致：按发送顺序异步送达界面的订阅者（早于随后才完成的 invoke 回复），不在主进程的调用栈中同步执行界面代码
   send: (channel: string, payload: unknown) => {
@@ -58,11 +65,14 @@ const fakeElectron = {
       stub.messageBoxes.push({ title: opts.title, message: opts.message });
       return { response: stub.messageBoxResponse };
     },
-    showOpenDialog: async () => {
+    showOpenDialog: async (...a: unknown[]) => {
+      const opts = (a.length > 1 ? a[1] : a[0]) as { properties?: string[] };
       stub.openDialogs++;
+      stub.openDialogProps.push([...(opts.properties ?? [])]);
       return stub.pick ? { canceled: false, filePaths: [stub.pick] } : { canceled: true, filePaths: [] };
     },
   },
+  shell: { showItemInFolder: (p: string) => void stub.revealed.push(p) },
   contextBridge: { exposeInMainWorld: (_name: string, api: BeeLiteApi) => void (stub.exposed = api) },
   ipcRenderer: {
     invoke,
@@ -83,6 +93,9 @@ function installElectronStub(): void {
 
 export interface Harness {
   settings: SettingsStore;
+  /** 操作记录与更新策略：默认放在设置文件所在的临时目录中，绝不使用真实的 userData */
+  history: HistoryStore;
+  policy: PolicyStore;
   gate: MutationGate;
   stub: Stub;
   invoke: typeof invoke;
@@ -91,35 +104,54 @@ export interface Harness {
   service: import('../src/main/ipc').AppService;
 }
 
-export function createHarness(opts: { settingsFile: string; source: FakeSource; download?: ManagerOptions['download'] }): Harness {
+export function createHarness(opts: {
+  settingsFile: string;
+  source: FakeSource;
+  download?: ManagerOptions['download'];
+  history?: HistoryStore;
+  policy?: PolicyStore;
+  /** WTF 备份的测试注入（上限与阶段钩子）；备份设置与受保护的应用数据目录都在设置文件所在的临时目录 */
+  backup?: Pick<WtfBackupOptions, 'limits' | 'hooks'>;
+}): Harness {
   installElectronStub();
   stub.handlers.clear();
   stub.messageBoxResponse = 0;
   stub.messageBoxes = [];
   stub.openDialogs = 0;
+  stub.openDialogProps = [];
   stub.pick = null;
+  stub.revealed = [];
   stub.sent = [];
   stub.listeners = new Map();
   ipcCalls.length = 0;
   // eslint-disable-next-line @typescript-eslint/no-require-imports
-  const { AppService } = require('../src/main/ipc') as typeof import('../src/main/ipc');
+  const { AppService, backupOptions } = require('../src/main/ipc') as typeof import('../src/main/ipc');
   const settings = new SettingsStore(opts.settingsFile);
+  const dataDir = path.dirname(opts.settingsFile);
+  const history = opts.history ?? new HistoryStore(path.join(dataDir, 'operation-history.json'));
+  const policy = opts.policy ?? new PolicyStore(path.join(dataDir, 'addon-policy.json'));
   const gate = new MutationGate();
   const service = new AppService({
     getWindow: () => ({ webContents, isDestroyed: () => false }) as unknown as Electron.BrowserWindow,
     settings,
     provider: opts.source as unknown as NewBeeBoxProvider,
     gate,
+    history,
+    policy,
     download: opts.download ?? opts.source.download,
+    // 与 main 相同的目录解析；应用数据目录是设置文件所在的临时目录，绝不使用真实的 userData
+    backup: { ...backupOptions(settings, dataDir, fakeElectron.app.getVersion()), ...opts.backup },
   });
   service.register();
+  // 与 main 一致：先读取一次策略（只读；文件不存在即没有暂停项）。读取在之后的任何检查完成之前结束
+  void policy.reload();
   // 每次重新加载 preload，让它把接口暴露到本次的桩上
   const preloadId = require.resolve('../src/preload/preload');
   delete require.cache[preloadId];
   // eslint-disable-next-line @typescript-eslint/no-require-imports
   require('../src/preload/preload');
   if (!stub.exposed) throw new Error('preload 没有暴露接口');
-  return { settings, gate, stub, invoke, api: stub.exposed, service };
+  return { settings, history, policy, gate, stub, invoke, api: stub.exposed, service };
 }
 
 /** 递归快照：目录与文件（内容哈希），用于断言某个游戏目录（含 .beelite 清单、回收站与 WTF）完全没有变化 */

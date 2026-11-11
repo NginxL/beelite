@@ -3,9 +3,10 @@ import type { FileHandle } from 'node:fs/promises';
 
 export type WriteFn = (fh: FileHandle, buf: Uint8Array, offset: number, length: number) => Promise<{ bytesWritten: number }>;
 
-/** 可替换的底层写入实现（测试用来注入短写 / 0 写） */
-export const io: { write: WriteFn } = {
+/** 可替换的底层写入与 fsync 实现（测试用来注入短写 / 0 写 / fsync 失败） */
+export const io: { write: WriteFn; sync: (fh: FileHandle) => Promise<void> } = {
   write: (fh, buf, offset, length) => fh.write(buf, offset, length),
+  sync: (fh) => fh.sync(),
 };
 
 export async function writeAll(fh: FileHandle, chunk: Uint8Array): Promise<void> {

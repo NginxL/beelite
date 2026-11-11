@@ -400,6 +400,43 @@ select:focus { border-color: var(--accent); }
 .kind-uninstall { background: var(--danger-soft); color: #f08482; }
 .kind-update-backup { background: var(--accent-soft); color: var(--accent); }
 .kind-takeover { background: rgba(100, 160, 255, .12); color: #8ab4f8; }
+.history-succeeded { background: rgba(76, 175, 80, .14); color: #81c784; }
+.history-failed { background: var(--danger-soft); color: #f08482; }
+.history-unconfirmed { background: rgba(229, 165, 10, .14); color: #f3c34a; }
+.history-accepted { background: var(--accent-soft); color: var(--accent); }
+.history-unchanged, .history-cancelled, .history-not-processed { background: #262a31; color: var(--muted); }
+.history-message { font-size: 12px; color: var(--muted); margin-top: 4px; white-space: pre-wrap; user-select: text; }
+.health-head { display: flex; align-items: center; gap: 10px; margin: 8px 0; }
+.health-ref, .health-counts, .health-status { font-size: 13px; margin: 4px 0; user-select: text; }
+.health-status { font-weight: 600; }
+.health-unavailable { color: #f08482; }
+.health-partial { color: #f3c34a; }
+.health-scope, .health-message { font-size: 12px; color: var(--muted); margin: 4px 0 8px; user-select: text; }
+.health-list { max-height: 60vh; overflow-y: auto; }
+.health-row { align-items: flex-start; gap: 10px; }
+.health-issue { font-size: 12px; white-space: pre-wrap; word-break: break-word; user-select: text; }
+.history-warnings { display: flex; flex-direction: column; gap: 4px; font-size: 12px; color: #f3c34a; white-space: pre-wrap; user-select: text; }
+/* 配置备份：路径与说明可选中复制；列表与警告限高滚动 */
+.tab-count-accent { background: var(--accent-soft); color: var(--accent); }
+.backup-title { font-size: 14px; font-weight: 600; margin-right: auto; }
+.backup-intro { display: flex; flex-direction: column; gap: 6px; line-height: 1.55; }
+.backup-status { flex: none; display: flex; flex-direction: column; gap: 4px; margin: 4px 0 8px; font-size: 13px; user-select: text; }
+.backup-path { word-break: break-all; color: var(--text); }
+.backup-usage { font-variant-numeric: tabular-nums; }
+.backup-meta { font-size: 12px; color: var(--muted); user-select: text; }
+.backup-task { flex: none; margin-bottom: 8px; }
+.backup-task-row { align-items: center; }
+.backup-progress { font-variant-numeric: tabular-nums; }
+.backup-notice { background: var(--panel); border: 1px solid var(--border); color: var(--text); }
+.backup-result { display: flex; flex-direction: column; align-items: flex-start; gap: 4px; }
+.backup-result-title { font-weight: 600; }
+.backup-lines { display: flex; flex-direction: column; gap: 4px; max-height: 180px; overflow-y: auto; font-size: 12px; white-space: pre-wrap; word-break: break-word; user-select: text; }
+.backup-list { flex: none; max-height: 50vh; overflow-y: auto; }
+.backup-anomalies { display: flex; flex-direction: column; gap: 4px; margin-top: 6px; max-height: 160px; overflow-y: auto; }
+.backup-anomaly { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; font-size: 12px; word-break: break-all; }
+.backup-limits { flex: none; margin: 10px 0; font-size: 12px; color: var(--muted); }
+.backup-limits summary { cursor: pointer; width: fit-content; }
+.backup-limits .backup-meta { display: flex; flex-direction: column; gap: 4px; margin-top: 6px; }
 
 /* ---------- 任务面板 ---------- */
 #task-panel {

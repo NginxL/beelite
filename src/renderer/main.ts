@@ -1,6 +1,7 @@
 // 入口：导航、顶部栏（游戏版本与目录）、启动加载配置
 
 import { initActivityNotice } from './activity-notice.js';
+import { applyBackupTask, syncBackupTask } from './backup.js';
 import { initClientUpdate } from './client-update.js';
 import { initDetail } from './detail.js';
 import { initDiscover, focusSearch } from './discover.js';
@@ -10,7 +11,8 @@ import { errMsg } from './format.js';
 import { initLocal, showManagedTab } from './local.js';
 import { handleTask, syncTasks } from './tasks.js';
 import {
-  api, applyActivity, applyTask, applyWatch, bindDirectory, flavorName, isBusy, on, onActivityAccepted, pendingByFlavor, setFlavor, state, syncActivity, unbindDirectory,
+  api, applyActivity, applyHistoryStatus, applyTask, applyWatch, bindDirectory, flavorName, isBusy, on, onActivityAccepted, pendingByFlavor, setFlavor, state, syncActivity,
+  syncHistoryStatus, syncWatch, unbindDirectory,
 } from './state.js';
 
 type Page = 'discover' | 'local';
@@ -68,8 +70,16 @@ function renderUpdateHints(): void {
   badge.classList.toggle('hidden', total === 0);
   badge.title = total ? [...pending].map(([f, n]) => `${flavorName(f)}：${n} 个可更新`).join('\n') : '';
   const settingsError = state.watch?.settingsError ?? null;
-  updateNotice.classList.toggle('update-notice-warn', !!settingsError);
-  if (settingsError) {
+  const policyError = state.watch?.policyError ?? null;
+  updateNotice.classList.toggle('update-notice-warn', !!settingsError || !!policyError);
+  if (policyError) {
+    // 更新策略无法读取：所有插件更新都被拒绝，不能显示为已是最新；所有页面都显示这一状态
+    mount(updateNotice,
+      h('span', { class: 'update-notice-text', text: '插件更新已停止：无法读取更新策略（暂停列表），暂时不能更新任何插件。', title: policyError }),
+      h('span', { class: 'update-notice-hint', text: '修复或移走该文件后，在「我的插件」点「重试」' }),
+    );
+    updateNotice.classList.remove('hidden');
+  } else if (settingsError) {
     // 设置文件无法读取：无法确认任何目录的绑定，旧结论已作废；所有页面都显示这一状态
     mount(updateNotice,
       h('span', { class: 'update-notice-text', text: '插件更新检查已暂停：无法读取艾泽魔方设置文件，暂时无法确认插件是否有更新。', title: settingsError }),
@@ -189,7 +199,14 @@ function boot(): void {
   void syncActivity();
   // 插件更新检查在主进程进行，可能早于界面完成：先订阅事件再获取快照，按 rev 丢弃过时的一方
   window.beelite.onAddonWatch(onWatch);
-  void window.beelite.watchState().then(onWatch, () => undefined);
+  // 获取失败时插件更新保持关闭，「我的插件」页面显示原因与重试；之后任何一次推送也会恢复
+  void syncWatch(onWatch);
+  // 操作记录的保存状态：无法读取或未保存时页面一直提示，可重试
+  window.beelite.onHistoryStatus(applyHistoryStatus);
+  void syncHistoryStatus();
+  // WTF 配置备份：启动时只同步主进程内存中的任务快照（先订阅再获取，按 rev 丢弃过时的一方），不读取备份状态与 WTF
+  window.beelite.onBackupTask((s) => void applyBackupTask(s));
+  void syncBackupTask();
   // 客户端更新入口不依赖插件数据源配置，先于配置加载初始化
   initClientUpdate();
   bindUi();

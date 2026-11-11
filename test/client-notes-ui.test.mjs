@@ -278,3 +278,45 @@ test('0.1.5 主进程插件操作状态：首次同步尚未完成时推迟自�
   await tick();
   assert.deepEqual(calls, [['update', '0.7.1']]);
 });
+
+test('0.2.0 WTF 备份 / 校验进行中（主进程推送的内存任务快照）：不自动弹出说明、不回执；任务结束后按原有的延迟判断继续提示；侧栏“下载并更新”照常授权', async () => {
+  const Cn = await freshNotes();
+  // 与 client-update.js 共用同一个 backup.js 模块实例（界面中备份任务状态的唯一来源）
+  const B = await import(path.join(web, 'backup.js'));
+  const task = {
+    id: 'bk-1', kind: 'verify', flavorId: 9, root: '/fixture/A/_forever_', snapshotId: '20260101-000000-00000000', phase: 'verifying',
+    filesDone: 1, filesTotal: 3, bytesDone: 10, bytesTotal: 30, cancelling: false, startedAt: 1,
+  };
+  reset();
+  S.state.activity = idle();
+  await show({ availableVersion: '0.8.0', availableBuild: '0.8.0' });
+  assert.equal(B.applyBackupTask({ rev: 1, task }), true);
+  Cn.maybePromptNotes();
+  assert.equal(openModals(dom).length, 0, '备份 / 校验进行中不自动弹出');
+  // 同一任务的进度推送：仍然延后
+  assert.equal(B.applyBackupTask({ rev: 2, task: { ...task, filesDone: 2 } }), true);
+  Cn.maybePromptNotes();
+  assert.equal(openModals(dom).length, 0);
+  sideButton('更新说明').click();
+  assert.equal(openModals(dom).length, 0, '手动打开说明同样等待');
+  await tick();
+  assert.deepEqual(calls, [], '没有回执，也没有更新');
+
+  // 任务结束：推送无任务后，不需要再手动触发，按原有的延迟判断继续提示
+  assert.equal(B.applyBackupTask({ rev: 3, task: null }), true);
+  for (let i = 0; i < 200 && openModals(dom).length === 0; i++) await new Promise((r) => setTimeout(r, 10));
+  assert.equal(openModals(dom).length, 1, '结束后继续提示');
+  assert.match(openModals(dom)[0].textContent, /v0\.8\.0/);
+  clickModalButton(dom, '稍后');
+  await tick();
+  assert.deepEqual(calls.map((c) => c[0]), ['ack'], '只回执，不更新');
+
+  // 备份进行中，用户明确点击侧栏“下载并更新”仍按原流程授权该构建（安装前由主进程的写入闸门等待备份结束）
+  reset();
+  assert.equal(B.applyBackupTask({ rev: 4, task: { ...task, id: 'bk-2' } }), true);
+  await show({ notice: false, availableVersion: '0.8.1', availableBuild: '0.8.1' });
+  sideButton('下载并更新').click();
+  await tick();
+  assert.deepEqual(calls, [['update', '0.8.1']]);
+  assert.equal(B.applyBackupTask({ rev: 5, task: null }), true);
+});

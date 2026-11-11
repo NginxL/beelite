@@ -6,6 +6,8 @@ import type { DirState, LocalFolder, LocalState, ManagedProjectView, OpResult, P
 import { SimulatedCrash, UserError, errorMessage, isTransientError } from './errors';
 import { canonicalFileId } from './file-id';
 import { getFlavor } from './flavors';
+import { scanAddonHealth, type HealthOptions } from './health';
+import type { HealthReport } from '../shared/health-types';
 import { inspectLayout, newTxId, pathExists, readFileNoFollow, syncDir, writableLayout, writeFileAtomic, type Layout } from './layout';
 import { downloadToFile, type DownloadOptions, type DownloadResult } from './net';
 import { foldKey, isValidModuleName, resolveInside } from './paths';
@@ -35,8 +37,17 @@ export interface ManagerOptions {
   hook?: StepHook;
 }
 
-/** 安装结果；installed 是本次提交到清单的记录，没有提交（已是最新、用户取消）时缺省 */
-export type InstallResult = OpResult & { installed?: ProjectRecord };
+/**
+ * 安装结果；installed 是本次提交到清单的记录，没有提交（已是最新、用户取消）时缺省；
+ * previous 是同一次目录锁内读到的旧记录（首次安装没有），只随 installed 一起给出
+ */
+export type InstallResult = OpResult & { installed?: ProjectRecord; previous?: ProjectRecord };
+/** 卸载已提交：removed 是提交前清单中的记录 */
+export type UninstallResult = OpResult & { removed: ProjectRecord };
+/** 恢复已提交：restored 是重新登记的项目（未托管目录的条目为 null），label 是回收站条目的名称 */
+export type RestoreResult = OpResult & { restored: ProjectRecord | null; label: string };
+/** 永久删除已提交：label 是回收站条目的名称 */
+export type PurgeResult = OpResult & { label: string };
 
 /**
  * 安装前在目录锁内核对的条件（读到当前清单之后、下载之前）。不满足时以 UserError('changed') 结束，不写入任何东西。
@@ -421,6 +432,7 @@ export class AddonManager {
               : `「${detail.name}」已更新到 ${latest.displayName}`,
           warnings,
           installed: { ...next.projects[modId], folders: [...zip.modules] },
+          ...(existing ? { previous: { ...existing, folders: [...existing.folders] } } : {}),
         };
       } catch (err) {
         // 没有残留 journal 说明没有进入或已完整回滚提交阶段：只清理本次下载的暂存内容与空的回收目录。
@@ -437,7 +449,7 @@ export class AddonManager {
 
   // ---------- 卸载 / 恢复 ----------
 
-  async uninstallProject(root: string, modId: string): Promise<OpResult> {
+  async uninstallProject(root: string, modId: string): Promise<UninstallResult> {
     return this.withLock(await this.lockKey(root), async () => {
       const { l, manifest } = await this.openForWrite(root);
       const project = manifest.projects[modId];
@@ -456,7 +468,11 @@ export class AddonManager {
       }
       await this.commit(l, txId, 'uninstall', planned, present.length ? [txId] : [], next, async () => undefined);
       const note = missing.length ? `（${missing.join('、')} 已不在 AddOns 中，不会被恢复）` : '';
-      return { ok: true, message: present.length ? `已卸载「${project.name}」，可在回收站恢复${note}` : `已移除「${project.name}」的记录（目录已不存在）` };
+      return {
+        ok: true,
+        message: present.length ? `已卸载「${project.name}」，可在回收站恢复${note}` : `已移除「${project.name}」的记录（目录已不存在）`,
+        removed: { ...project, folders: [...project.folders] },
+      };
     });
   }
 
@@ -482,7 +498,7 @@ export class AddonManager {
     });
   }
 
-  async restore(root: string, entryId: string): Promise<OpResult> {
+  async restore(root: string, entryId: string): Promise<RestoreResult> {
     return this.withLock(await this.lockKey(root), async () => {
       const { l, manifest } = await this.openForWrite(root);
       const entry = manifest.recovery.find((e) => e.id === entryId);
@@ -512,11 +528,12 @@ export class AddonManager {
       await this.commit(l, txId, 'restore', planned, [entry.id], next, async () => {
         await removeIfEmpty(resolveInside(l.trashDir, entry.id));
       });
-      return { ok: true, message: `已恢复：${entry.label}` };
+      const restored = entry.project ? next.projects[entry.project.modId] : null;
+      return { ok: true, message: `已恢复：${entry.label}`, restored: restored ? { ...restored, folders: [...restored.folders] } : null, label: entry.label };
     });
   }
 
-  async purge(root: string, entryId: string): Promise<OpResult> {
+  async purge(root: string, entryId: string): Promise<PurgeResult> {
     return this.withLock(await this.lockKey(root), async () => {
       const { l, manifest } = await this.openForWrite(root);
       const entry = manifest.recovery.find((e) => e.id === entryId);
@@ -527,7 +544,7 @@ export class AddonManager {
       await this.commit(l, newTxId(), 'purge', [], [], next, async () => {
         await this.drainPurgeQueue(l, next);
       });
-      return { ok: true, message: `已永久删除：${entry.label}` };
+      return { ok: true, message: `已永久删除：${entry.label}`, label: entry.label };
     });
   }
 
@@ -583,6 +600,21 @@ export class AddonManager {
   /** 读取 manifest（只读） */
   async readManifestFor(root: string): Promise<Manifest> {
     return this.readOnlyManifest(root);
+  }
+
+  /**
+   * 只读健康检查：在同一目录的写操作队列中执行，不与本应用的安装、更新、卸载、恢复交错；
+   * 只排队等待，不恢复事务、不清理暂存与回收站（不经过 openForWrite / recoverLocked / gc）。
+   * 目录布局本身无法检查（例如不存在、内部目录是符号链接）时拿不到队列键，直接交给扫描如实返回无法检查。
+   */
+  async health(root: string, flavorId: number, interfaceNumber: number | null, options?: HealthOptions): Promise<HealthReport> {
+    let key: string;
+    try {
+      key = await this.lockKey(root);
+    } catch {
+      return scanAddonHealth(root, flavorId, interfaceNumber, options);
+    }
+    return this.withLock(key, () => scanAddonHealth(root, flavorId, interfaceNumber, options));
   }
 
   /**

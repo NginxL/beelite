@@ -1,7 +1,7 @@
 // 沙箱 preload：只暴露固定的窄接口，界面拿不到 ipcRenderer、Node 或任何文件路径能力。
 // 注意：sandbox 模式下 preload 只能 require('electron')，因此本文件不引用项目内其他运行时模块。
 import { contextBridge, ipcRenderer, type IpcRendererEvent } from 'electron';
-import type { ActivitySnapshot, AddonWatchSnapshot, BeeLiteApi, ClientUpdateState, TaskEvent } from '../shared/types';
+import type { ActivitySnapshot, AddonWatchSnapshot, BackupTaskSnapshot, BeeLiteApi, ClientUpdateState, HistoryStatusView, TaskEvent } from '../shared/types';
 
 const invoke = (channel: string, ...args: unknown[]) => ipcRenderer.invoke(channel, ...args);
 
@@ -58,6 +58,35 @@ const api: BeeLiteApi = {
       ipcRenderer.removeListener('addon:activity', listener);
     };
   },
+  setPaused: (modId, flavorId, paused, root) => invoke('policy:set', modId, flavorId, paused, root),
+  reloadPolicy: () => invoke('policy:reload'),
+  historyList: (flavorId, root) => invoke('history:list', flavorId, root),
+  historyRetry: () => invoke('history:retry'),
+  historyStatus: () => invoke('history:status'),
+  healthCheck: (flavorId, root) => invoke('health:check', flavorId, root),
+  onHistoryStatus: (cb) => {
+    const listener = (_e: IpcRendererEvent, s: HistoryStatusView) => cb(s);
+    ipcRenderer.on('history:status', listener);
+    return () => {
+      ipcRenderer.removeListener('history:status', listener);
+    };
+  },
+  // WTF 配置备份：只传游戏版本、期望目录、备份编号与任务编号等标量；保存位置由主进程的选择框决定
+  backupTaskState: () => invoke('backup:taskState'),
+  onBackupTask: (cb) => {
+    const listener = (_e: IpcRendererEvent, s: BackupTaskSnapshot) => cb(s);
+    ipcRenderer.on('backup:task', listener);
+    return () => {
+      ipcRenderer.removeListener('backup:task', listener);
+    };
+  },
+  backupState: (flavorId, root) => invoke('backup:state', flavorId, root),
+  backupConfigure: (flavorId, root) => invoke('backup:configure', flavorId, root),
+  backupDisable: (flavorId, root) => invoke('backup:disable', flavorId, root),
+  backupRun: (flavorId, root) => invoke('backup:run', flavorId, root),
+  backupVerify: (flavorId, root, snapshotId) => invoke('backup:verify', flavorId, root, snapshotId),
+  backupCancel: (taskId, flavorId, root) => invoke('backup:cancel', taskId, flavorId, root),
+  backupReveal: (flavorId, root, snapshotId) => invoke('backup:reveal', flavorId, root, snapshotId),
 };
 
 contextBridge.exposeInMainWorld('beelite', api);

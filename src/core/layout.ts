@@ -3,10 +3,11 @@
 //   Interface/.beelite/         本应用的元数据（manifest、journal、staging、trash），与 AddOns 同卷，保证 rename 原子
 // 无论只读还是写入，凡是存在的内部目录都必须是真实目录（不是符号链接），元数据文件读取不跟随符号链接。
 import { constants } from 'node:fs';
-import { lstat, mkdir, open, realpath, rename, stat, unlink } from 'node:fs/promises';
+import { lstat, mkdir, open, realpath, rename, stat, unlink, type FileHandle } from 'node:fs/promises';
 import path from 'node:path';
 import { randomBytes } from 'node:crypto';
 import { UserError } from './errors';
+import { io, writeAll } from './fsio';
 
 export interface Layout {
   root: string;
@@ -182,19 +183,109 @@ export async function syncDir(dir: string): Promise<void> {
   }
 }
 
-/** 写临时文件（O_EXCL，不跟随已有链接）+ fsync + rename，保证读者只看到完整的旧内容或新内容 */
+/** 随机临时文件名与已有文件冲突时重新选择的次数 */
+const TEMP_ATTEMPTS = 5;
+
+/**
+ * 独占创建临时文件（O_EXCL，不跟随已有链接）。
+ * - 默认（随机名称）：绝不预先删除；名称已存在时换一个随机名称重试，有限次后以 EEXIST 失败，已有文件保持原样。
+ * - 显式 tmp：只有 manager 提交 manifest 时使用（Interface/.beelite/manifest.json.tmp.part），这是本应用在自己数据目录中
+ *   保留的固定路径，残留只可能是之前中断留下的半成品，因此沿用“先删除再独占创建”的语义。其他调用方不要传入 tmp。
+ */
+async function createTemp(target: string, tmp?: string): Promise<{ tmpPath: string; fh: FileHandle }> {
+  if (tmp !== undefined) {
+    await unlink(tmp).catch(() => undefined);
+    return { tmpPath: tmp, fh: await open(tmp, 'wx', 0o644) };
+  }
+  for (let attempt = 1; ; attempt++) {
+    const tmpPath = `${target}.${randomBytes(4).toString('hex')}.tmp`;
+    try {
+      return { tmpPath, fh: await open(tmpPath, 'wx', 0o644) };
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code !== 'EEXIST' || attempt >= TEMP_ATTEMPTS) throw err;
+    }
+  }
+}
+
+/**
+ * 写临时文件 + fsync + rename，保证读者只看到完整的旧内容或新内容。临时文件的创建规则见 createTemp。
+ * 写入、fsync 或 rename 失败时只删除本次创建、且身份（dev:ino）仍相同的临时文件；无法确认身份时保留，不删除任何其他文件。
+ */
 export async function writeFileAtomic(target: string, data: string, tmp?: string): Promise<void> {
-  const tmpPath = tmp ?? `${target}.${randomBytes(4).toString('hex')}.tmp`;
-  await unlink(tmpPath).catch(() => undefined);
-  const fh = await open(tmpPath, 'wx', 0o644);
+  const { tmpPath, fh } = await createTemp(target, tmp);
+  let created: string | null = null;
   try {
-    await fh.writeFile(data, 'utf8');
-    await fh.sync();
+    try {
+      const st = await fh.stat({ bigint: true });
+      created = `${st.dev}:${st.ino}`;
+      await writeAll(fh, Buffer.from(data, 'utf8'));
+      await io.sync(fh);
+    } finally {
+      await fh.close();
+    }
+    await rename(tmpPath, target);
+  } catch (err) {
+    if (created !== null && (await identityOf(tmpPath).catch(() => null)) === created) await unlink(tmpPath).catch(() => undefined);
+    throw err;
+  }
+  await syncDir(path.dirname(target));
+}
+
+/** readBoundedFile 失败的原因：symlink 符号链接；not-file 不是普通文件（含 FIFO、目录）；too-large 超过上限；io 读取失败 */
+export class BoundedReadError extends Error {
+  constructor(readonly reason: 'symlink' | 'not-file' | 'too-large' | 'io', message: string, readonly code?: string) {
+    super(message);
+    this.name = 'BoundedReadError';
+  }
+}
+
+const READ_CHUNK = 64 * 1024;
+
+/**
+ * 读取小型数据文件：O_NOFOLLOW | O_NONBLOCK 打开（符号链接立即失败，FIFO 不会等待写端），确认是普通文件后
+ * 最多读取 maxBytes + 1 字节；超过 maxBytes（包括读取期间增长）即拒绝，不按文件大小一次分配。文件不存在返回 null。
+ */
+export async function readBoundedFile(p: string, maxBytes: number): Promise<string | null> {
+  let fh;
+  try {
+    fh = await open(p, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
+  } catch (err) {
+    const code = (err as NodeJS.ErrnoException).code;
+    if (code === 'ENOENT') return null;
+    if (code === 'ELOOP') throw new BoundedReadError('symlink', '是符号链接', code);
+    throw new BoundedReadError('io', code ? `读取失败（${code}）` : String(err), code);
+  }
+  try {
+    let st;
+    try {
+      st = await fh.stat();
+    } catch (err) {
+      const code = (err as NodeJS.ErrnoException).code;
+      throw new BoundedReadError('io', code ? `读取失败（${code}）` : String(err), code);
+    }
+    if (!st.isFile()) throw new BoundedReadError('not-file', '不是普通文件');
+    if (st.size > maxBytes) throw new BoundedReadError('too-large', `超过 ${maxBytes} 字节的上限`);
+    const chunks: Buffer[] = [];
+    let total = 0;
+    for (;;) {
+      const want = Math.min(READ_CHUNK, maxBytes + 1 - total);
+      const buf = Buffer.alloc(want);
+      let n: number;
+      try {
+        n = (await fh.read(buf, 0, want, null)).bytesRead;
+      } catch (err) {
+        const code = (err as NodeJS.ErrnoException).code;
+        throw new BoundedReadError('io', code ? `读取失败（${code}）` : String(err), code);
+      }
+      if (n === 0) break;
+      chunks.push(n === want ? buf : buf.subarray(0, n));
+      total += n;
+      if (total > maxBytes) throw new BoundedReadError('too-large', `超过 ${maxBytes} 字节的上限`);
+    }
+    return Buffer.concat(chunks, total).toString('utf8');
   } finally {
     await fh.close();
   }
-  await rename(tmpPath, target);
-  await syncDir(path.dirname(target));
 }
 
 export function newTxId(): string {

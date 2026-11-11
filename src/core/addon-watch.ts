@@ -12,9 +12,13 @@
 // - 临时错误（网络、超时、服务器繁忙）按 5 / 15 / 60 分钟重试；其他错误按正常的每小时间隔；
 //   设置文件无法读取时等满一小时才再读（用户绑定或解绑会立即重读）。
 import { randomUUID } from 'node:crypto';
+// - 暂停更新不改动检查结果：快照生成时按当前策略标注 paused，待更新数量与提醒只计 actionableUpdate 成立的项目；
+//   策略变化后立即发布新快照（进行中的检查发布时也按当时的策略）。暂停项的新文件不记为已提醒；恢复时当前已知的新文件记为已提醒，不补发提醒。
 import type { AddonWatchEntry, AddonWatchSnapshot, AddonWatchStatus, UpdateCheckItem } from '../shared/types';
+import { actionableUpdate } from '../shared/update-policy';
 import { errorMessage, isTransientError, UserError } from './errors';
 import { getFlavor } from './flavors';
+import type { PolicyView } from './policy';
 import type { Manifest } from './store';
 
 export const CHECK_INTERVAL_MS = 60 * 60 * 1000;
@@ -56,7 +60,11 @@ export interface AddonWatchOptions {
   gate: { readonly activeCount: number; readonly frozen: boolean };
   clock?: WatchClock;
   onChange?: (s: AddonWatchSnapshot) => void;
+  /** 更新策略（最近一次读取的结果）；缺省时没有暂停项 */
+  policy?: { current(): PolicyView };
 }
+
+const NO_POLICY: PolicyView = { error: null, isPaused: () => false, pausedIn: () => [], all: () => [] };
 
 interface Entry {
   key: string;
@@ -163,20 +171,43 @@ export class AddonUpdateWatch {
   }
 
   snapshot(): AddonWatchSnapshot {
+    const policy = this.policy();
     const entries: AddonWatchEntry[] = [...this.entries.values()]
       .sort((a, b) => a.flavorId - b.flavorId)
-      .map((e) => ({
-        flavorId: e.flavorId,
-        root: e.root,
-        status: e.status,
-        items: e.items.map((i) => ({ ...i })),
-        pending: e.items.filter((i) => i.hasUpdate).length,
-        failed: e.items.filter((i) => i.error && !i.skipped).length,
-        checkedAt: e.checkedAt,
-        error: e.error,
-        nextCheckAt: this.started && !this.stopped && this.settingsRetryAt === null ? e.nextAt : null,
-      }));
-    return { instance: this.instance, rev: this.rev, entries, settingsError: this.settingsError, notice: this.currentNotice() };
+      .map((e) => {
+        const items = e.items.map((i) => (policy.isPaused(e.flavorId, e.root, i.modId) ? { ...i, paused: true } : { ...i }));
+        return {
+          flavorId: e.flavorId,
+          root: e.root,
+          status: e.status,
+          items,
+          pending: items.filter((i) => actionableUpdate(i, policy.error)).length,
+          paused: policy.pausedIn(e.flavorId, e.root),
+          failed: e.items.filter((i) => i.error && !i.skipped).length,
+          checkedAt: e.checkedAt,
+          error: e.error,
+          nextCheckAt: this.started && !this.stopped && this.settingsRetryAt === null ? e.nextAt : null,
+        };
+      });
+    return { instance: this.instance, rev: this.rev, entries, settingsError: this.settingsError, policyError: policy.error, pausedAll: policy.all(), notice: this.currentNotice() };
+  }
+
+  /**
+   * 更新策略已变化（暂停、恢复或重新读取）：立即发布按新策略计算的快照。
+   * resumed：刚恢复更新的插件，当前已知的新文件记为已提醒（不补发提醒，之后的新文件照常提醒）。
+   */
+  policyChanged(resumed?: { flavorId: number; root: string; modId: string }): void {
+    if (this.stopped) return;
+    if (resumed) {
+      const key = keyOf(resumed.flavorId, resumed.root);
+      const item = this.entries.get(key)?.items.find((i) => i.modId === resumed.modId);
+      if (item?.hasUpdate && item.latestFileId) this.seen.add(`${key}\n${item.modId}\n${item.latestFileId}`);
+    }
+    this.emit();
+  }
+
+  private policy(): PolicyView {
+    return this.o.policy?.current() ?? NO_POLICY;
   }
 
   /**
@@ -343,9 +374,11 @@ export class AddonUpdateWatch {
   private currentNotice(): AddonWatchSnapshot['notice'] {
     let count = 0;
     const flavorIds = new Set<number>();
+    const policy = this.policy();
     for (const k of this.noticeKeys) {
       const e = this.entries.get(k.entryKey);
-      if (!e || !e.items.some((i) => i.modId === k.modId && i.hasUpdate && i.latestFileId === k.fileId)) continue;
+      const paused = !!e && policy.isPaused(e.flavorId, e.root, k.modId);
+      if (!e || !e.items.some((i) => i.modId === k.modId && actionableUpdate({ hasUpdate: i.hasUpdate, paused }, policy.error) && i.latestFileId === k.fileId)) continue;
       count++;
       flavorIds.add(k.flavorId);
     }
@@ -654,8 +687,11 @@ export class AddonUpdateWatch {
   /** 同一 目录 + 插件 + 文件 只提醒一次；手动检查与全部更新的结果只记为已提醒（界面已有自己的提示） */
   private recordNotice(job: Job, items: UpdateCheckItem[]): void {
     const fresh: NoticeKey[] = [];
+    const policy = this.policy();
     for (const i of items) {
-      if (!i.hasUpdate || !i.latestFileId) continue;
+      // 暂停项（或策略未知）不提醒，也不记为已提醒
+      const paused = policy.isPaused(job.entry.flavorId, job.entry.root, i.modId);
+      if (!actionableUpdate({ hasUpdate: i.hasUpdate, paused }, policy.error) || !i.latestFileId) continue;
       const k = `${job.entry.key}\n${i.modId}\n${i.latestFileId}`;
       if (this.seen.has(k)) continue;
       this.seen.add(k);

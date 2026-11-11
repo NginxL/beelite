@@ -1,8 +1,11 @@
 // IPC 处理：校验发送方与每个参数，界面只传 flavorId / 插件编号 / 目录名等标量，路径全部由主进程解析。
-import { app, dialog, ipcMain, type BrowserWindow, type IpcMainInvokeEvent } from 'electron';
+import { app, dialog, ipcMain, shell, type BrowserWindow, type IpcMainInvokeEvent } from 'electron';
 import { stat } from 'node:fs/promises';
 import path from 'node:path';
-import type { ActivitySnapshot, AddonWatchSnapshot, AppConfig, ClientUpdateState, ExpectedRecord, FlavorInfo, InstalledRecord, LocalState, OpResult, ProfileInfo, SearchQuery, SortOrder, TaskEvent, TaskPhase } from '../shared/types';
+import type {
+  ActivityReservation, ActivitySnapshot, AddonWatchSnapshot, AppConfig, BackupOutcome, BackupState, BackupTaskSnapshot, ClientUpdateState, ExpectedRecord, FlavorInfo, HealthReport, HistoryKind, HistoryStatusView,
+  HistoryVersion, InstalledRecord, LocalState, OpResult, ProfileInfo, SearchQuery, SortOrder, TaskEvent, TaskPhase,
+} from '../shared/types';
 import { ActivityRegistry } from '../core/activity';
 import { AddonUpdateWatch, type WatchClock } from '../core/addon-watch';
 import { errorMessage, UserError } from '../core/errors';
@@ -11,11 +14,14 @@ import { DEFAULT_FLAVOR_ID, FLAVORS, getFlavor, interfaceFromVersion } from '../
 import { runUpdateAll } from '../core/batch';
 import { BUILD_RE, type ClientUpdater } from '../core/client-update';
 import { guardHandler, type MutationGate } from '../core/gate';
+import type { HistoryOutcome, HistoryStart, HistoryStore } from '../core/history';
 import { AddonManager, type InstallExpect, type InstallResult, type ManagerOptions } from '../core/manager';
 import { isValidModuleName } from '../core/paths';
+import type { PolicyStore } from '../core/policy';
 import { inspectPickedRoot, SettingsStore } from '../core/profiles';
 import { NewBeeBoxProvider } from '../core/provider';
 import { ID_RE, type ProjectRecord } from '../core/store';
+import { SNAPSHOT_ID_RE, WtfBackupService, type WtfBackupOptions } from '../core/wtf-backup';
 
 const ORDERS: readonly SortOrder[] = ['ranking', 'update', 'total_download', 'favourite'];
 const FINAL_PHASES: ReadonlySet<TaskPhase> = new Set(['done', 'failed', 'cancelled']);
@@ -49,6 +55,16 @@ function buildArg(v: unknown): string {
   if (typeof v !== 'string' || !BUILD_RE.test(v)) throw new UserError('版本参数无效');
   return v;
 }
+/** 备份编号：只接受核心生成的格式（不含路径分隔符） */
+function snapshotIdArg(v: unknown): string {
+  if (typeof v !== 'string' || !SNAPSHOT_ID_RE.test(v)) throw new UserError('备份编号无效');
+  return v;
+}
+/** 备份任务编号：只限制类型与长度，原样交给核心与活动任务比对 */
+function backupTaskIdArg(v: unknown): string {
+  if (typeof v !== 'string' || v.length === 0 || v.length > 64) throw new UserError('任务编号无效');
+  return v;
+}
 /** 更新 / 重装时界面看到的安装记录 */
 function expectedArg(v: unknown): ExpectedRecord {
   if (typeof v !== 'object' || v === null) throw new UserError('安装记录参数无效');
@@ -59,6 +75,36 @@ function expectedArg(v: unknown): ExpectedRecord {
 }
 function installedView(p: ProjectRecord): InstalledRecord {
   return { flavorId: p.flavorId, fileId: p.fileId, version: p.version, name: p.name, logo: p.logo, folders: [...p.folders], installedAt: p.installedAt };
+}
+function versionOf(p: ProjectRecord): HistoryVersion {
+  return { fileId: p.fileId, version: p.version };
+}
+/** 只返回界面需要的结果字段（不带提交回执） */
+function publicResult(r: OpResult): OpResult {
+  return { ok: r.ok, message: r.message, ...(r.warnings ? { warnings: r.warnings } : {}) };
+}
+/** 目录保护：回滚无法判定或目录已暂停写入。它的诊断优先于取消信号，不能被说成“已取消” */
+function isBlocked(err: unknown): boolean {
+  return err instanceof UserError && err.code === 'blocked';
+}
+
+/**
+ * 操作没有成功结束时的记录（成功回执由调用方先行处理）：目录保护只记为结果未确认并保留原诊断，不说已回滚，
+ * 优先于取消；用户取消为取消；前提已变化（没有做任何改动）为未处理；其他为失败
+ */
+function failureOutcome(err: unknown, cancelled = false): HistoryOutcome {
+  if (isBlocked(err)) return { status: 'unconfirmed', message: `结果未确认，请以当前插件列表为准：${errorMessage(err)}` };
+  const code = err instanceof UserError ? err.code : null;
+  if (cancelled || code === 'cancelled') return { status: 'cancelled', message: '已取消' };
+  const message = errorMessage(err);
+  if (code === 'changed') return { status: 'not-processed', message };
+  return { status: 'failed', message };
+}
+
+/** runInstall 的结果：changed 只在这次确实提交了新的清单记录时为 true（“已是最新”等没有改动） */
+interface InstallOutcome {
+  result: OpResult;
+  changed: boolean;
 }
 function queryArg(v: unknown): SearchQuery {
   if (typeof v !== 'object' || v === null) throw new UserError('搜索参数无效');
@@ -77,10 +123,32 @@ export interface ServiceDeps {
   settings: SettingsStore;
   provider: NewBeeBoxProvider;
   gate: MutationGate;
+  /** 操作记录（userData/operation-history.json；测试注入临时目录中的实例） */
+  history: HistoryStore;
+  /** 更新策略（userData/addon-policy.json；测试注入临时目录中的实例） */
+  policy: PolicyStore;
   /** 测试注入：替换插件下载实现，避免访问真实接口 */
   download?: ManagerOptions['download'];
   /** 测试注入：插件更新自动检查的时钟 */
   clock?: WatchClock;
+  /** WTF 配置备份的设置与目录解析（由 backupOptions 生成；测试注入临时目录、上限与阶段钩子） */
+  backup: BackupServiceOptions;
+}
+
+export type BackupServiceOptions = Omit<WtfBackupOptions, 'onChange'>;
+
+/**
+ * WTF 备份服务的依赖：独立设置文件 userData/wtf-backup-settings.json；受保护的应用数据目录只是本应用的 userData；
+ * 游戏目录只取自目录绑定（绑定时已规范化）
+ */
+export function backupOptions(settings: SettingsStore, userData: string, appVersion: string): BackupServiceOptions {
+  return {
+    settingsFile: path.join(userData, 'wtf-backup-settings.json'),
+    appDataDir: userData,
+    appVersion,
+    resolveRoot: async (flavorId) => (await settings.profile(flavorId)).root,
+    listBoundRoots: async () => Object.values((await settings.load()).bindings),
+  };
 }
 
 /** 完成后要让该目录已有的检查结果按新清单重校验的写通道（flavorId 为第 2 个参数、全部更新为第 1 个；期望目录为最后一个参数，新增参数只能加在它之前） */
@@ -97,8 +165,20 @@ export class AppService {
   /** 插件写操作的占用与进度（界面重新载入后据此恢复）；冲突判断在这里，不依赖界面 */
   readonly activity: ActivityRegistry;
   private clientUpdater: ClientUpdater | null = null;
+  /**
+   * 健康检查的适配参考值（按游戏版本）：只来自最近一次成功加载的插件库配置（不是本机游戏实测）；
+   * 加载失败或从未加载时为空。健康检查本身不加载配置、不联网，也不接受界面给出的参考值
+   */
+  private interfaceRefs = new Map<number, number | null>();
+  /** 进行中的健康检查（按 游戏版本 + 目录）：重复请求复用同一次检查，不并发扫描同一目录 */
+  private readonly healthRuns = new Map<string, Promise<HealthReport>>();
+  /** 可选的 WTF 配置备份（默认关闭）；退出时由 main 先调用 shutdown() 中止任务，再由退出保护等待闸门排空 */
+  readonly backup: WtfBackupService;
+  /** 最近一次推送的备份任务快照；只来自内存中的任务状态，不扫描备份位置 */
+  private backupTask: BackupTaskSnapshot = { rev: 0, task: null };
 
   constructor(private readonly deps: ServiceDeps) {
+    this.backup = new WtfBackupService({ ...deps.backup, onChange: () => this.pushBackupTask() });
     this.manager = new AddonManager({
       source: deps.provider,
       download: deps.download,
@@ -116,7 +196,129 @@ export class AppService {
       gate: deps.gate,
       clock: deps.clock,
       onChange: (s) => this.pushWatch(s),
+      policy: deps.policy,
     });
+    // 策略的读取结果变化（包括重新读取后出错或恢复）：立即发布按新策略计算的快照
+    deps.policy.onChange(() => this.watch.policyChanged());
+    deps.history.onStatus((s) => this.pushHistory(s));
+  }
+
+  private pushHistory(s: HistoryStatusView): void {
+    const win = this.deps.getWindow();
+    if (win && !win.isDestroyed()) win.webContents.send('history:status', s);
+  }
+
+  /** 操作记录目前有未保存的内容时给出单独提示（不改变操作结果） */
+  private withHistoryNote(r: OpResult): OpResult {
+    const s = this.deps.history.status();
+    const note = s.loadError
+      ? `操作记录文件无法读取，记录暂存在内存中：${s.loadError}`
+      : s.unsaved > 0
+        ? `有 ${s.unsaved} 条操作记录未能保存${s.saveError ? `：${s.saveError}` : ''}，可在「操作记录」中重试`
+        : null;
+    return note ? { ...r, historyError: note } : r;
+  }
+
+  /**
+   * 记录一项非安装类的写操作：受理时写入 accepted，结束时只按提交回执写入结果；记录保存失败不改变操作结果。
+   */
+  private async tracked<R extends OpResult>(start: HistoryStart, run: () => Promise<R>, done: (r: R) => HistoryOutcome): Promise<OpResult> {
+    const id = await this.deps.history.begin(start);
+    let r: R;
+    try {
+      r = await run();
+    } catch (err) {
+      await this.deps.history.finish(id, failureOutcome(err));
+      throw err;
+    }
+    await this.deps.history.finish(id, done(r));
+    return this.withHistoryNote(publicResult(r));
+  }
+
+  /** 更新与重装之前（已占用该插件）：读取策略文件确认没有暂停；策略无法读取时拒绝 */
+  private async assertUpdatable(flavorId: number, root: string, modId: string): Promise<void> {
+    if (await this.deps.policy.isPaused(flavorId, root, modId)) {
+      throw new UserError('这个插件已暂停更新（保留当前版本），没有做任何改动。如需更新或重装，请先点「恢复更新」', 'paused');
+    }
+  }
+
+  /**
+   * 暂停或恢复更新（已占用该插件：与它的更新、重装、卸载互斥，全部更新期间不受理）。
+   * 暂停要求插件按当前游戏版本托管在这个目录；恢复不要求（例如卸载后保留的暂停项）。
+   */
+  private async setPaused(flavorId: number, root: string, modId: string, paused: boolean): Promise<OpResult> {
+    let name = this.names.get(modId) ?? `插件 ${modId}`;
+    if (paused) {
+      const project = (await this.manager.readManifestFor(root)).projects[modId];
+      if (!project) throw new UserError('该插件不在这个目录的艾泽魔方管理列表中，无法暂停更新');
+      if (project.flavorId !== flavorId) throw new UserError(`「${project.name}」按其他游戏版本安装，本来就不会检查或更新，无需暂停`);
+      name = project.name;
+    } else {
+      const project = await this.manager.readManifestFor(root).then((m) => m.projects[modId], () => undefined);
+      if (project) name = project.name;
+    }
+    const result = await this.tracked(
+      { flavorId, root, kind: paused ? 'pause' : 'resume', modId, name },
+      async () => ({ ok: true, message: '', changed: await this.deps.policy.set(flavorId, root, modId, paused) }),
+      (r) => ({ status: r.changed ? 'succeeded' : 'unchanged', message: paused ? '暂停更新' : '恢复更新' }),
+    ).then((r) => ({
+      ...r,
+      message: paused
+        ? `已暂停「${name}」的更新：保留当前版本。仍会检查并显示新版本，但不会被更新、重装或全部更新处理，也不计入更新提醒；卸载后重新安装仍保持暂停，需要时点「恢复更新」`
+        : `已恢复「${name}」的更新`,
+    }));
+    this.watch.policyChanged(paused ? undefined : { flavorId, root, modId });
+    return result;
+  }
+
+  /** 备份任务开始、阶段变化、进度（核心已限频）与结束时调用：只读取内存中的任务状态（不调用 state()，不扫描备份位置） */
+  private pushBackupTask(): void {
+    this.backupTask = { rev: this.backupTask.rev + 1, task: this.backup.taskState() };
+    const win = this.deps.getWindow();
+    if (win && !win.isDestroyed()) win.webContents.send('backup:task', this.backupTaskSnapshot());
+  }
+
+  /** 最近一次推送的任务快照（克隆） */
+  backupTaskSnapshot(): BackupTaskSnapshot {
+    const { rev, task } = this.backupTask;
+    return { rev, task: task ? { ...task } : null };
+  }
+
+  /**
+   * 启用备份：先确认目标仍是当前绑定、没有进行中的任务，再由主进程弹出文件夹选择框；保存位置只来自选择框。
+   * 用户取消时返回 null，不调用核心。选择之后由核心在设置标记内再次复核绑定与所选目录
+   */
+  private async configureBackup(flavorId: number, expected: string): Promise<BackupState | null> {
+    await this.targetRoot(flavorId, expected);
+    if (this.backup.taskState()) throw new UserError('已有备份或校验任务正在进行，请等待完成或取消后再试', 'backup-busy');
+    const win = this.deps.getWindow();
+    const opts: Electron.OpenDialogOptions = {
+      title: '选择 WTF 配置备份的保存位置',
+      message: '将在所选文件夹中新建一个专属的备份文件夹。艾泽魔方不会主动上传；若选择云盘同步的文件夹，副本可能会被云盘同步',
+      properties: ['openDirectory', 'createDirectory'],
+      buttonLabel: '选择',
+    };
+    const picked = win ? await dialog.showOpenDialog(win, opts) : await dialog.showOpenDialog(opts);
+    if (picked.canceled || !picked.filePaths[0]) return null;
+    return this.backup.configure(flavorId, expected, picked.filePaths[0]);
+  }
+
+  /**
+   * 备份 / 校验的结构化结果：核心正常返回即 completed（即使任务最后收到取消请求）；只有明确的 backup-cancelled 错误才是 cancelled，
+   * 并保留完整说明；其他错误照常抛出
+   */
+  private async backupOutcome<T>(run: () => Promise<T>): Promise<BackupOutcome<T>> {
+    try {
+      return { status: 'completed', result: await run() };
+    } catch (err) {
+      if (err instanceof UserError && err.code === 'backup-cancelled') return { status: 'cancelled', message: errorMessage(err) };
+      throw err;
+    }
+  }
+
+  /** 在访达中显示：路径只取自核心返回的已登记备份位置或其中已发布的备份 */
+  private async revealBackup(flavorId: number, expected: string, snapshotId: string | null): Promise<void> {
+    shell.showItemInFolder(await this.backup.revealPath(flavorId, expected, snapshotId));
   }
 
   private pushActivity(s: ActivitySnapshot): void {
@@ -161,8 +363,11 @@ export class AppService {
         const remote = cfg.flavors.find((r) => r.id === f.id);
         return { id: f.id, name: remote?.name || f.name, versions: remote?.versions ?? [], interfaceNumber: remote?.versions[0] ? interfaceFromVersion(remote.versions[0]) : null, online: !!remote };
       });
+      this.interfaceRefs = new Map(flavors.map((f) => [f.id, f.interfaceNumber]));
       return { flavors, categories: cfg.categories, defaultFlavorId: DEFAULT_FLAVOR_ID, configError: null };
     } catch (err) {
+      // 配置不可用：健康检查的适配参考值未知，不沿用旧值
+      this.interfaceRefs = new Map();
       const flavors = FLAVORS.map((f) => ({ id: f.id, name: f.name, versions: [], interfaceNumber: null, online: false }));
       return { flavors, categories: [], defaultFlavorId: DEFAULT_FLAVOR_ID, configError: `无法获取插件库配置：${errorMessage(err)}。本地插件管理仍可使用。` };
     }
@@ -222,6 +427,22 @@ export class AppService {
     return profile;
   }
 
+  /**
+   * 只读健康检查：目标只取自该版本当前绑定的目录（期望目录只做比对）；在 manager 的同目录队列中执行，
+   * 不恢复事务、不清理、不刷新本地状态。同一目录已有进行中的检查时直接复用它的结果
+   */
+  async healthCheck(flavorId: number, expected: string): Promise<HealthReport> {
+    const root = await this.targetRoot(flavorId, expected);
+    const key = `${flavorId}\n${root}`;
+    const running = this.healthRuns.get(key);
+    if (running) return running;
+    const run = this.manager.health(root, flavorId, this.interfaceRefs.get(flavorId) ?? null).finally(() => {
+      if (this.healthRuns.get(key) === run) this.healthRuns.delete(key);
+    });
+    this.healthRuns.set(key, run);
+    return run;
+  }
+
   async localState(flavorId: number): Promise<LocalState> {
     const profile = await this.deps.settings.profile(flavorId);
     if (!profile.root) return { flavorId, profile, dir: null, managed: [], unmanaged: [], recovery: [], error: null };
@@ -237,7 +458,7 @@ export class AppService {
    * 单个插件的写操作：目标目录已解析，在下一个 await 之前同步占用（与全部更新、同一插件的其他写操作互斥），
    * 由这一次调用在 finally 中释放。
    */
-  private async single<T>(flavorId: number, root: string, modId: string, kind: 'install' | 'update' | 'uninstall', fn: () => Promise<T>): Promise<T> {
+  private async single<T>(flavorId: number, root: string, modId: string, kind: ActivityReservation['kind'], fn: () => Promise<T>): Promise<T> {
     const release = this.activity.reserveProject(flavorId, root, modId, kind);
     try {
       return await fn();
@@ -261,7 +482,7 @@ export class AppService {
     force: boolean,
     root: string,
     o: { expect: InstallExpect; batch?: { taskId: string; batchId: string }; syncWatch?: boolean },
-  ): Promise<OpResult> {
+  ): Promise<InstallOutcome> {
     const taskId = o.batch?.taskId ?? this.newTaskId();
     const label = this.names.get(modId) ?? `插件 ${modId}`;
     const ac = new AbortController();
@@ -275,6 +496,11 @@ export class AppService {
     let phaseNow: TaskPhase = 'queued';
     let r: InstallResult | null = null;
     let failure: unknown = null;
+    // 受理时写入操作记录（保存失败不影响安装）；旧 / 新版本只取自提交回执，受理时的文件编号只作为“请求时”的参考
+    const kind: HistoryKind = force ? 'reinstall' : o.expect.kind === 'absent' ? 'install' : 'update';
+    const hid = await this.deps.history.begin({
+      flavorId, root, kind, modId, name: label, batchId: o.batch?.batchId ?? null, expectedFileId: o.expect.kind === 'record' ? o.expect.fileId : null,
+    });
     try {
       // 终态统一在下面发送，这里只转发进行中的阶段；阶段变化推送快照，下载字节数只随事件发送
       r = await this.manager.install(root, flavorId, modId, {
@@ -306,16 +532,26 @@ export class AppService {
       this.activity.publish();
     };
     if (r) {
-      const { installed, ...result } = r;
+      // 已有结果优先于取消信号：已提交的安装不会被记为取消
+      const { installed, previous, ...rest } = r;
+      const result = publicResult(rest);
       end(result.ok ? 'done' : 'cancelled', { message: result.message, ...(installed ? { installed: installedView(installed) } : {}) });
-      return result;
+      await this.deps.history.finish(hid, installed
+        ? { status: 'succeeded', message: result.message, warnings: result.warnings, name: installed.name, previous: previous ? versionOf(previous) : null, installed: versionOf(installed) }
+        : result.ok
+          ? { status: 'unchanged', message: result.message, warnings: result.warnings }
+          : { status: 'cancelled', message: result.message });
+      return { result: this.withHistoryNote(result), changed: !!installed };
     }
-    const cancelled = ac.signal.aborted;
+    // 没有结果：目录保护的诊断优先于取消信号（取消与回滚无法判定同时发生时，不能只说已取消）
+    const blocked = isBlocked(failure);
+    const cancelled = !blocked && ac.signal.aborted;
     const message = cancelled ? '已取消' : errorMessage(failure);
     // 前置条件不满足：没有做任何改动，行内显示为未处理（不是失败）
     const changed = !cancelled && failure instanceof UserError && failure.code === 'changed';
     end(cancelled || changed ? 'cancelled' : 'failed', { message });
-    // 保留错误码：全部更新据此区分取消、排队期间变化与失败
+    await this.deps.history.finish(hid, failureOutcome(failure, cancelled));
+    // 保留错误码：全部更新据此区分取消、排队期间变化、结果未确认与失败
     if (cancelled) throw new UserError(message, 'cancelled');
     if (failure instanceof UserError) throw new UserError(message, failure.code);
     throw new Error(message);
@@ -332,10 +568,12 @@ export class AppService {
     /** 已排入计划、尚未开始的项目 */
     const waiting = new Map<string, { taskId: string; label: string }>();
     try {
-      return await runUpdateAll({
+      const result = await runUpdateAll({
         manager: this.manager,
         root,
         flavorId,
+        // 批次已占用该目录：期间不受理暂停与恢复，检查前读取一次即可；策略无法读取时整个批次不开始
+        paused: () => this.deps.policy.pausedIn(flavorId, root),
         isStillBound: async () => (await this.deps.settings.profile(flavorId)).root === root,
         // 批次已在写入闸门内：强制新检查排在自动检查之前、不等待闸门，避免与自动检查叠加并发
         check: (r, f) => this.watch.check(f, r, { fresh: true }),
@@ -350,23 +588,33 @@ export class AppService {
           const rev = this.activity.planBatch(batch, items);
           for (const it of items) this.emit({ taskId: it.taskId, label: it.label, phase: 'queued', flavorId, root, modId: it.modId, rev });
         },
-        installOne: (p, fixedRoot) => {
+        installOne: async (p, fixedRoot) => {
           const t = waiting.get(p.modId);
           waiting.delete(p.modId);
           if (!t) throw new Error(`计划中没有 ${p.modId}`);
-          return this.runInstall(p.modId, flavorId, false, fixedRoot, {
+          const o = await this.runInstall(p.modId, flavorId, false, fixedRoot, {
             batch: { taskId: t.taskId, batchId: batch.batchId },
             syncWatch: true,
             expect: { kind: 'record', fileId: p.fileId, installedAt: p.installedAt },
           });
+          // 结构化地告诉批次这一项是否真的提交了改动（不解析说明文字）
+          return { ...o.result, changed: o.changed };
         },
       });
+      return this.withHistoryNote(result);
     } finally {
       // 批次停止（绑定变更）或中止：尚未开始的项目结束等待，它们没有执行任何操作
-      for (const [modId, t] of waiting) {
+      const stopped = [...waiting];
+      for (const [modId, t] of stopped) {
         this.emit({ ...t, phase: 'cancelled', flavorId, root, modId, message: '全部更新已停止，这一项未处理', rev: this.activity.endTask(t.taskId) });
       }
       batch.release();
+      for (const [modId, t] of stopped) {
+        await this.deps.history.record(
+          { flavorId, root, kind: 'update', modId, name: t.label, batchId: batch.batchId },
+          { status: 'not-processed', message: '全部更新已停止，这一项未处理' },
+        );
+      }
     }
   }
 
@@ -447,7 +695,7 @@ export class AppService {
       const modId = modArg(m);
       const flavorId = flavorArg(f);
       const target = await this.targetRoot(flavorId, expectedRootArg(root));
-      return this.single(flavorId, target, modId, 'install', () => this.runInstall(modId, flavorId, false, target, { expect: { kind: 'absent' } }));
+      return this.single(flavorId, target, modId, 'install', async () => (await this.runInstall(modId, flavorId, false, target, { expect: { kind: 'absent' } })).result);
     });
     handle('addon:update', async (m, f, force, expected, root) => {
       if (typeof force !== 'boolean') throw new UserError('参数无效');
@@ -455,21 +703,98 @@ export class AppService {
       const flavorId = flavorArg(f);
       const record = expectedArg(expected);
       const target = await this.targetRoot(flavorId, expectedRootArg(root));
-      return this.single(flavorId, target, modId, 'update', () => this.runInstall(modId, flavorId, force, target, { expect: { kind: 'record', ...record } }));
+      // 占用之后再读取策略：暂停 / 恢复也占用同一插件，两者不会交错；暂停项（包括 force 重装）与策略未知时拒绝
+      return this.single(flavorId, target, modId, 'update', async () => {
+        await this.assertUpdatable(flavorId, target, modId);
+        return (await this.runInstall(modId, flavorId, force, target, { expect: { kind: 'record', ...record } })).result;
+      });
     });
     handle('addon:updateAll', (f, root) => this.updateAll(flavorArg(f), expectedRootArg(root)));
     handle('addon:uninstall', async (m, f, root) => {
       const modId = modArg(m);
       const flavorId = flavorArg(f);
       const target = await this.targetRoot(flavorId, expectedRootArg(root));
-      return this.single(flavorId, target, modId, 'uninstall', () => this.manager.uninstallProject(target, modId));
+      // 卸载不受暂停影响，也不清除暂停（重新安装后仍保持暂停）
+      return this.single(flavorId, target, modId, 'uninstall', () => this.tracked(
+        { flavorId, root: target, kind: 'uninstall', modId, name: this.names.get(modId) ?? `插件 ${modId}` },
+        () => this.manager.uninstallProject(target, modId),
+        (r) => ({ status: 'succeeded', message: r.message, name: r.removed.name, previous: versionOf(r.removed) }),
+      ));
     });
-    handle('addon:uninstallFolder', async (name, f, root) => this.manager.uninstallFolder(await this.targetRoot(flavorArg(f), expectedRootArg(root)), folderArg(name)));
-    handle('trash:restore', async (id, f, root) => this.manager.restore(await this.targetRoot(flavorArg(f), expectedRootArg(root)), entryArg(id)));
-    handle('trash:purge', async (id, f, root) => this.manager.purge(await this.targetRoot(flavorArg(f), expectedRootArg(root)), entryArg(id)));
+    handle('addon:uninstallFolder', async (name, f, root) => {
+      const folder = folderArg(name);
+      const flavorId = flavorArg(f);
+      const target = await this.targetRoot(flavorId, expectedRootArg(root));
+      return this.tracked(
+        { flavorId, root: target, kind: 'uninstall-folder', target: folder, name: folder },
+        () => this.manager.uninstallFolder(target, folder),
+        (r) => ({ status: 'succeeded', message: r.message }),
+      );
+    });
+    handle('trash:restore', async (id, f, root) => {
+      const entryId = entryArg(id);
+      const flavorId = flavorArg(f);
+      const target = await this.targetRoot(flavorId, expectedRootArg(root));
+      return this.tracked(
+        { flavorId, root: target, kind: 'restore', target: entryId, name: `回收站条目 ${entryId}` },
+        () => this.manager.restore(target, entryId),
+        (r) => ({ status: 'succeeded', message: r.message, name: r.label, modId: r.restored?.modId ?? null, installed: r.restored ? versionOf(r.restored) : null }),
+      );
+    });
+    handle('trash:purge', async (id, f, root) => {
+      const entryId = entryArg(id);
+      const flavorId = flavorArg(f);
+      const target = await this.targetRoot(flavorId, expectedRootArg(root));
+      return this.tracked(
+        { flavorId, root: target, kind: 'purge', target: entryId, name: `回收站条目 ${entryId}` },
+        () => this.manager.purge(target, entryId),
+        (r) => ({ status: 'succeeded', message: r.message, name: r.label }),
+      );
+    });
     handle('task:cancel', async (id) => {
       if (typeof id === 'string') this.tasks.get(id)?.abort();
     });
+    // 暂停 / 恢复更新：目标解析之后同步占用同一插件（与它的更新、重装、卸载以及全部更新互斥），再读写策略文件
+    handle('policy:set', async (m, f, p, root) => {
+      if (typeof p !== 'boolean') throw new UserError('参数无效');
+      const modId = modArg(m);
+      const flavorId = flavorArg(f);
+      const target = await this.targetRoot(flavorId, expectedRootArg(root));
+      return this.single(flavorId, target, modId, 'policy', () => this.setPaused(flavorId, target, modId, p));
+    });
+    // 重新读取策略文件（只读），返回按新策略计算的快照
+    handle('policy:reload', async () => {
+      await this.deps.policy.reload();
+      return this.watch.snapshot();
+    });
+    // 操作记录：只返回当前绑定目录的记录
+    handle('history:list', async (f, root) => {
+      const flavorId = flavorArg(f);
+      return this.deps.history.list(flavorId, await this.targetRoot(flavorId, expectedRootArg(root)));
+    });
+    handle('history:status', async () => this.deps.history.status());
+    handle('history:retry', async () => this.deps.history.retry());
+    // 只读健康检查：只接收游戏版本与期望目录（比对用），不接受任何路径或参考值
+    handle('health:check', async (f, root) => this.healthCheck(flavorArg(f), expectedRootArg(root)));
+    // WTF 配置备份：不经过插件写操作的占用与本地状态刷新；启用 / 关闭 / 备份 / 校验在闸门内（整个 Promise 含收尾），取消不入闸
+    handle('backup:taskState', async () => this.backupTaskSnapshot());
+    handle('backup:state', async (f, root) => this.backup.state(flavorArg(f), expectedRootArg(root)));
+    handle('backup:configure', (f, root) => this.configureBackup(flavorArg(f), expectedRootArg(root)));
+    handle('backup:disable', async (f, root) => this.backup.disable(flavorArg(f), expectedRootArg(root)));
+    handle('backup:run', async (f, root) => {
+      const flavorId = flavorArg(f);
+      const target = expectedRootArg(root);
+      return this.backupOutcome(() => this.backup.run(flavorId, target));
+    });
+    handle('backup:verify', async (f, root, id) => {
+      const flavorId = flavorArg(f);
+      const target = expectedRootArg(root);
+      const snapshotId = snapshotIdArg(id);
+      return this.backupOutcome(() => this.backup.verify(flavorId, target, snapshotId));
+    });
+    // 取消按任务受理时的原值匹配，不要求与当前绑定相同；只影响编号、版本与目录都一致的那个任务
+    handle('backup:cancel', async (id, f, root) => this.backup.cancel(backupTaskIdArg(id), flavorArg(f), expectedRootArg(root)));
+    handle('backup:reveal', async (f, root, id) => this.revealBackup(flavorArg(f), expectedRootArg(root), id === null ? null : snapshotIdArg(id)));
   }
 
   /** 只接受主窗口中本地页面发出的调用 */

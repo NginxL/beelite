@@ -6,6 +6,7 @@
 // - 只有点击“下载并更新”才授权更新，并带上弹窗中展示的构建号，构建已变化时不会更新。
 import type { ClientUpdateState } from '../shared/types';
 import { byId, confirmDialog, h, modalOpen, mount, onModalClosed, toast } from './dom.js';
+import { backupActive } from './backup.js';
 import { errMsg } from './format.js';
 import { activityBusy, activityUnknown, api, on, state } from './state.js';
 
@@ -33,11 +34,11 @@ let promptTimer: ReturnType<typeof setTimeout> | null = null;
 const PROMPT_DELAY_MS = 400;
 
 /**
- * 有进行中的操作：本界面已发起的请求，或主进程已知的插件写操作（任意目录；界面重新载入后只能从后者得知）。
- * 只影响是否展示更新说明，不影响侧栏“下载并更新”。
+ * 有进行中的操作：本界面已发起的请求，主进程已知的插件写操作，或进行中的 WTF 备份 / 校验（任意目录；界面重新载入后只能从后两者得知）。
+ * 只影响是否自动展示更新说明，不影响侧栏“下载并更新”（安装前由主进程的写入闸门等待这些操作结束）。
  */
 function operationsActive(): boolean {
-  return state.busy.size > 0 || activityBusy();
+  return state.busy.size > 0 || activityBusy() || backupActive();
 }
 
 /** 采用较新的状态：rev 更小的（过时的回复或事件）丢弃 */
@@ -131,7 +132,7 @@ function statusText(s: ClientUpdateState): string {
     case 'extracting':
       return '正在校验并解压…';
     case 'waiting':
-      return s.message ?? '等待插件操作完成…';
+      return s.message ?? '等待正在进行的操作结束…';
     case 'installing':
       return '正在安装并重新启动…';
     case 'error':

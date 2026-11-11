@@ -1,9 +1,10 @@
 // 全局状态：当前 flavor、本地状态、更新检查结果、进行中的写操作。各页面通过 on() 订阅变化。
 
 import type {
-  ActivitySnapshot, ActivityTask, AddonWatchEntry, AddonWatchSnapshot, AppConfig, BeeLiteApi, FlavorInfo, InstalledRecord, LocalState, ManagedProjectView, OpResult, TaskEvent, TaskPhase,
-  UpdateCheckItem,
+  ActivitySnapshot, ActivityTask, AddonWatchEntry, AddonWatchSnapshot, AppConfig, BeeLiteApi, FlavorInfo, HistoryStatusView, InstalledRecord, LocalState, ManagedProjectView, OpResult,
+  TaskEvent, TaskPhase, UpdateCheckItem,
 } from '../shared/types';
+import { actionableUpdate } from '../shared/update-policy.js';
 import { confirmDialog, toast } from './dom.js';
 import { errMsg } from './format.js';
 
@@ -17,9 +18,9 @@ export const api = (): BeeLiteApi => window.beelite;
 
 /**
  * flavor：切换版本；local：本地状态或按钮状态变化；watch：主进程插件更新检查快照变化；
- * progress：进行中任务的下载百分比变化（只需就地更新进度文字，不重绘页面）
+ * progress：进行中任务的下载百分比变化（只需就地更新进度文字，不重绘页面）；history：操作记录的保存状态变化
  */
-type EventName = 'flavor' | 'local' | 'watch' | 'progress';
+type EventName = 'flavor' | 'local' | 'watch' | 'progress' | 'history';
 const listeners = new Map<EventName, Set<() => void>>();
 
 export function on(ev: EventName, fn: () => void): void {
@@ -51,6 +52,8 @@ export const state = {
   updatesFor: null as Target | null,
   /** 主进程插件更新检查快照（所有已绑定目录） */
   watch: null as AddonWatchSnapshot | null,
+  /** 尚未取得任何快照时，最近一次获取失败的原因（可重试） */
+  watchError: null as string | null,
   /** 进行中的操作键，用于禁用按钮防止重复点击 */
   busy: new Set<string>(),
   /**
@@ -62,6 +65,10 @@ export const state = {
   activityError: null as string | null,
   /** 失败与取消的行内说明，按 目标（版本 + 目录）+ 插件编号 记录；只在本界面中保留 */
   notes: new Map<string, { taskId: string; phase: 'failed' | 'cancelled'; message: string | null }>(),
+  /** 主进程操作记录的保存状态（未取得为 null） */
+  history: null as HistoryStatusView | null,
+  /** 本界面看到的插件写操作结束次数（发起的写操作、任务终态、主进程结束的占用）：健康检查结果据此标为可能过期 */
+  writeEpoch: 0,
 };
 
 export interface RowTask {
@@ -145,8 +152,48 @@ export function projectHasUpdate(p: ManagedProjectView): boolean {
   return !!u && u.hasUpdate && u.latestFileId !== p.fileId;
 }
 
+/**
+ * 更新策略不可用的原因：主进程快照尚未取得（获取失败时页面提供重试），或主进程无法读取策略文件。
+ * 非 null 时任何插件都不能更新或重装（主进程同样拒绝），但已知的新版本仍照常显示。
+ * 快照带有全部暂停项，不要求当前目录已有检查条目（在别处换绑后也能立即按新目录判断）
+ */
+export function policyBlock(): string | null {
+  if (state.watch?.policyError) return `更新策略无法读取，已停止所有插件更新：${state.watch.policyError}`;
+  if (!state.watch) return state.watchError ? `插件更新状态未能同步，暂时不能更新：${state.watchError}` : '正在同步插件更新状态，完成后可更新';
+  return null;
+}
+
+/** 这个插件在当前目标（版本 + 目录）上已暂停更新（按主进程快照中的全部暂停项） */
+export function isPaused(modId: string): boolean {
+  const t = currentTarget();
+  if (!t || !state.watch) return false;
+  const all = state.watch.pausedAll;
+  if (all) return all.some((r) => r.flavorId === t.flavorId && r.root === t.root && r.modId === modId);
+  return !!currentWatchEntry()?.paused?.includes(modId);
+}
+
+/**
+ * 主动获取主进程的更新检查快照（启动时与用户重试）。尚未取得任何快照时记录失败原因（页面显示并可重试），
+ * 不覆盖已收到的快照；apply 默认按 rev 合并
+ */
+export async function syncWatch(apply: (s: AddonWatchSnapshot) => unknown = applyWatch): Promise<void> {
+  try {
+    apply(await api().watchState());
+  } catch (err) {
+    if (!state.watch) {
+      state.watchError = errMsg(err);
+      emit('local');
+    }
+  }
+}
+
+/** 可以更新：有新版本、没有暂停、策略可用（与主进程的待更新数量、提醒与全部更新使用同一判定） */
+export function projectActionable(p: ManagedProjectView): boolean {
+  return projectHasUpdate(p) && actionableUpdate({ hasUpdate: true, paused: isPaused(p.modId) }, policyBlock());
+}
+
 export function updateCount(): number {
-  return (state.local?.managed ?? []).filter(projectHasUpdate).length;
+  return (state.local?.managed ?? []).filter(projectActionable).length;
 }
 
 /** 当前目标在快照中的条目 */
@@ -154,6 +201,71 @@ export function currentWatchEntry(): AddonWatchEntry | undefined {
   const t = currentTarget();
   if (!t) return undefined;
   return state.watch?.entries.find((e) => e.flavorId === t.flavorId && e.root === t.root);
+}
+
+/** 重新读取更新策略（策略无法读取时用户点击重试） */
+export async function reloadPolicy(): Promise<void> {
+  if (isBusy('policy')) return;
+  state.busy.add('policy');
+  emit('local');
+  try {
+    applyWatch(await api().reloadPolicy());
+    if (state.watch?.policyError) toast(`更新策略仍无法读取：${state.watch.policyError}`, 'error');
+    else toast('更新策略已重新读取', 'success');
+  } catch (err) {
+    toast(errMsg(err), 'error');
+  } finally {
+    state.busy.delete('policy');
+    emit('local');
+  }
+}
+
+// ---------- 操作记录的保存状态 ----------
+
+/** 主进程推送或主动获取的状态：同一个记录文件只接受不更旧的状态 */
+export function applyHistoryStatus(s: HistoryStatusView): void {
+  const prev = state.history;
+  if (prev && prev.file === s.file && s.rev < prev.rev) return;
+  state.history = s;
+  emit('history');
+  emit('local');
+}
+
+export async function syncHistoryStatus(): Promise<void> {
+  try {
+    applyHistoryStatus(await api().historyStatus());
+  } catch {
+    // 获取失败时保持原状态；操作结果中仍会单独提示
+  }
+}
+
+/** 重新读取记录文件并保存尚未写入的记录 */
+export async function retryHistory(): Promise<void> {
+  if (isBusy('history')) return;
+  state.busy.add('history');
+  emit('local');
+  try {
+    const s = await api().historyRetry();
+    applyHistoryStatus(s);
+    if (s.loadError || s.unsaved > 0) toast(`操作记录仍未能保存：${s.loadError ?? s.saveError ?? '原因未知'}`, 'error');
+    else toast('操作记录已保存', 'success');
+  } catch (err) {
+    toast(errMsg(err), 'error');
+  } finally {
+    state.busy.delete('history');
+    emit('local');
+  }
+}
+
+/** 操作记录需要提示的问题（无法读取、未保存、已丢弃）；没有问题为 null */
+export function historyProblem(): string | null {
+  const s = state.history;
+  if (!s) return null;
+  if (s.loadError) return `操作记录文件无法读取：${s.loadError}`;
+  const parts: string[] = [];
+  if (s.unsaved > 0) parts.push(`${s.unsaved} 条操作记录尚未保存${s.saveError ? `（${s.saveError}）` : ''}，重启后可能缺失`);
+  if (s.dropped > 0) parts.push(`${s.dropped} 条未保存的记录因数量上限已丢弃`);
+  return parts.length ? parts.join('；') : null;
 }
 
 /**
@@ -197,6 +309,7 @@ export function syncUpdatesFromWatch(): void {
 export function applyWatch(s: AddonWatchSnapshot): boolean {
   if (state.watch && s.instance === state.watch.instance && s.rev <= state.watch.rev) return false;
   state.watch = s;
+  state.watchError = null;
   syncUpdatesFromWatch();
   emit('watch');
   emit('local');
@@ -372,6 +485,7 @@ function markEndedTargets(prev: ActivitySnapshot, s: ActivitySnapshot): void {
     if (!still && !isBusy(modKey(r, r.modId))) ended.push(r);
   }
   if (ended.length === 0) return;
+  state.writeEpoch++;
   for (const t of ended) staleTargets.set(targetKey(t), localSeq);
   // 当前显示的目标已结束、且没有进行中的读取：立即重新读取；有进行中的读取时，由它的回复决定是否再读
   const t = currentTarget();
@@ -404,6 +518,7 @@ export function applyTask(e: TaskEvent): void {
   if (isFinalPhase(e.phase)) {
     if (settledTasks.has(e.taskId)) return;
     settledTasks.add(e.taskId);
+    state.writeEpoch++;
     if (!state.activity || e.rev > state.activity.rev) endedTasks.set(e.taskId, e.rev);
     progressByTask.delete(e.taskId);
     if (e.phase === 'done') {
@@ -598,10 +713,13 @@ export async function runWrite(key: string, fn: () => Promise<OpResult>): Promis
     // toast 最多保留 5 条（其中一条是结果）：提示更多时合并为一条可滚动的提示，避免前面的被挤掉
     if (warnings.length > MAX_SEPARATE_WARNINGS) toast(warnings.join('\n'), 'warn', MERGED_WARNINGS_MS, true);
     else for (const w of warnings) toast(w, 'warn');
+    // 操作本身的结果不变；记录未保存单独提示（页面上的提示条会一直显示到保存成功）
+    if (result.historyError) toast(result.historyError, 'warn');
   } catch (err) {
     toast(errMsg(err), 'error');
   } finally {
     state.busy.delete(key);
+    state.writeEpoch++;
     await refreshLocal();
   }
   return result;
@@ -626,14 +744,31 @@ export async function checkUpdates(silent = false): Promise<void> {
     if (seq !== updateSeq || !now || now.flavorId !== t.flavorId || now.root !== t.root) return;
     const items = currentWatchEntry()?.items ?? [];
     if (!silent) {
-      const n = updateCount();
+      const managed = state.local?.managed ?? [];
       const checked = items.filter((i) => !i.skipped);
       const errors = checked.filter((i) => i.error).length;
       const skipped = items.length - checked.length;
       const skipNote = skipped ? `；${skipped} 个其他游戏版本来源的插件未检查` : '';
-      if (errors === 0) toast(`${n > 0 ? `发现 ${n} 个插件可更新` : checked.length ? '所有插件均为最新' : '没有可检查的插件'}${skipNote}`, 'success');
-      else if (errors === checked.length) toast(`检查更新失败（${errors} 个插件），请检查网络后重试${skipNote}`, 'error');
-      else toast(`${n > 0 ? `发现 ${n} 个插件可更新，` : ''}${errors} 个插件检查失败，其余已是最新${skipNote}`, 'warn');
+      if (errors > 0 && errors === checked.length) {
+        toast(`检查更新失败（${errors} 个插件），请检查网络后重试${skipNote}`, 'error');
+      } else if (state.watch?.policyError) {
+        // 更新策略不可用：无法确认可更新状态，绝不说“均为最新”；真实的新版本数量照常列出
+        const known = managed.filter(projectHasUpdate).length;
+        const parts = ['更新策略不可用，无法确认可更新状态'];
+        if (known) parts.push(`${known} 个插件有新版本`);
+        if (errors) parts.push(`${errors} 个插件检查失败`);
+        toast(`${parts.join('；')}${skipNote}`, 'warn');
+      } else {
+        // 分别列出数量：可更新、已暂停但有新版本、检查失败；都没有时才说均为最新
+        const n = updateCount();
+        const paused = managed.filter((p) => projectHasUpdate(p) && isPaused(p.modId)).length;
+        const parts: string[] = [];
+        if (n) parts.push(`发现 ${n} 个插件可更新`);
+        if (paused) parts.push(`${paused} 个已暂停更新的插件有新版本`);
+        if (errors) parts.push(`${errors} 个插件检查失败`);
+        const head = parts.length ? parts.join('；') : checked.length ? '所有插件均为最新' : '没有可检查的插件';
+        toast(`${head}${skipNote}`, errors ? 'warn' : 'success');
+      }
     }
   } catch (err) {
     if (seq === updateSeq) toast(errMsg(err), 'error');

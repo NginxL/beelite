@@ -138,7 +138,7 @@ test('一次点击完成全流程：下载→等待写操作排空→安装；�
   downloadToReady(u);
   await tick();
   assert.equal(u.getState().status, 'waiting');
-  assert.match(u.getState().message ?? '', /等待插件操作完成/);
+  assert.match(u.getState().message ?? '', /等待正在进行的操作结束/);
   assert.equal(bridge.count('installNow'), 0, '写操作未结束不得安装');
   assert.throws(() => gate.enter(), /正在更新或退出/, '等待期间拒绝新的写操作');
   release();

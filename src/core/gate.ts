@@ -21,7 +21,7 @@ export class MutationGate {
 
   /** 受理一个写操作；返回只生效一次的释放函数 */
   enter(): () => void {
-    if (this.frozen) throw new UserError('客户端正在更新或退出，暂时不能修改插件，请稍后再试', 'frozen');
+    if (this.frozen) throw new UserError('客户端正在更新或退出，暂时不能执行此操作，请稍后再试', 'frozen');
     this.active++;
     let released = false;
     return () => {
@@ -62,8 +62,17 @@ export class MutationGate {
   }
 }
 
-/** 会写入游戏目录或设置的 IPC 通道；整个回调在闸门内执行 */
+/**
+ * 会写入游戏目录、设置、更新策略、操作记录或 WTF 备份位置的 IPC 通道；整个回调在闸门内执行（退出与客户端更新等待它们收尾）。
+ * 备份的重新校验也会写占用标记，因此同样计入；取消备份不入闸
+ */
 export const MUTATING_CHANNELS: ReadonlySet<string> = new Set([
+  'backup:configure',
+  'backup:disable',
+  'backup:run',
+  'backup:verify',
+  'policy:set',
+  'history:retry',
   'profile:bind',
   'profile:unbind',
   'local:state',

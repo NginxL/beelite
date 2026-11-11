@@ -1,5 +1,31 @@
 // 主进程与界面之间传递的数据结构。界面只拿到这些已规范化的对象，不接触路径之外的系统能力。
 
+import type { BackupRunResult, BackupState, BackupTaskInfo, BackupVerifyResult } from './backup-types';
+import type { HealthReport } from './health-types';
+
+/** 只读插件健康检查的结果类型 */
+export type { HealthIssue, HealthIssueKind, HealthReport, HealthSeverity, HealthStatus, HealthUnavailableReason } from './health-types';
+/** 可选本地 WTF 配置备份的数据类型 */
+export type {
+  BackupAnomaly, BackupAnomalyKind, BackupLimits, BackupPhase, BackupRunResult, BackupSnapshotInfo, BackupSnapshotStatus, BackupState, BackupStatus,
+  BackupTaskInfo, BackupTaskKind, BackupUsage, BackupVerifyRecord, BackupVerifyResult,
+} from './backup-types';
+
+/**
+ * 备份 / 校验任务的纯内存快照（不扫描备份位置）：rev 单调递增，界面据此丢弃过时的推送或查询结果；
+ * task 为全局活动任务，可能属于其他游戏版本或目录
+ */
+export interface BackupTaskSnapshot {
+  rev: number;
+  task: BackupTaskInfo | null;
+}
+
+/**
+ * 备份 / 校验的结构化结果：只有任务确实以取消结束才是 cancelled（message 为完整说明，可能含收尾时保留现场的提示）；
+ * 已完成的结果即使之后收到取消请求也是 completed。其他失败照常以错误返回
+ */
+export type BackupOutcome<T> = { status: 'completed'; result: T } | { status: 'cancelled'; message: string };
+
 export type SortOrder = 'ranking' | 'update' | 'total_download' | 'favourite';
 
 export interface FlavorInfo {
@@ -152,6 +178,11 @@ export interface UpdateCheckItem {
   stale?: boolean;
   /** 这条结果对应的检查完成时间（毫秒） */
   checkedAt?: number;
+  /**
+   * 该插件在这个目录已暂停更新（快照生成时按当前策略标注）。hasUpdate / latest* 仍是真实的检查结果，
+   * 是否可以更新以 actionableUpdate 判断
+   */
+  paused?: boolean;
 }
 
 export type AddonWatchStatus = 'pending' | 'checking' | 'ok' | 'partial' | 'error';
@@ -162,8 +193,10 @@ export interface AddonWatchEntry {
   root: string;
   status: AddonWatchStatus;
   items: UpdateCheckItem[];
-  /** 可更新的插件数 */
+  /** 可以更新的插件数（有新版本、未暂停，且更新策略可读取） */
   pending: number;
+  /** 这个目录（游戏版本 + 目录）已暂停更新的插件编号，包括当前未安装的 */
+  paused: string[];
   /** 检查失败的插件数（不含跳过的） */
   failed: number;
   /** 最近一次检查完成的时间；从未完成为 null */
@@ -181,6 +214,13 @@ export interface AddonWatchSnapshot {
   rev: number;
   entries: AddonWatchEntry[];
   settingsError: string | null;
+  /** 更新策略（暂停列表）无法读取的原因：此时所有插件更新都被拒绝，不能显示为已是最新 */
+  policyError: string | null;
+  /**
+   * 主进程最近一次读取到的全部暂停项（按 游戏版本 + 目录 + 插件；有数量上限）。界面按当前目标判断，
+   * 不依赖该目录是否已有检查条目（例如在别处换绑之后、检查协调器尚未同步目录列表时）
+   */
+  pausedAll: { flavorId: number; root: string; modId: string }[];
   /** 最近一次自动检查新发现的可更新插件（同一目录、插件与文件只提醒一次） */
   notice: { seq: number; count: number; flavorIds: number[] } | null;
 }
@@ -251,7 +291,8 @@ export interface ActivityReservation {
   flavorId: number;
   root: string;
   modId: string;
-  kind: 'install' | 'update' | 'uninstall';
+  /** policy：暂停或恢复更新（与同一插件的其他写操作互斥，全部更新期间不受理） */
+  kind: 'install' | 'update' | 'uninstall' | 'policy';
 }
 
 /**
@@ -270,6 +311,73 @@ export interface OpResult {
   ok: boolean;
   message: string;
   warnings?: string[];
+  /** 操作本身的结果不受影响，但操作记录目前有未保存的内容（单独提示，不混入 warnings） */
+  historyError?: string;
+}
+
+// ---------- 操作记录 ----------
+
+export type HistoryKind = 'install' | 'update' | 'reinstall' | 'uninstall' | 'uninstall-folder' | 'restore' | 'purge' | 'pause' | 'resume';
+
+/**
+ * accepted：已受理、尚未结束（之前某次运行留下的 accepted 读取时显示为 unconfirmed）；
+ * succeeded：确认已提交；unchanged：没有改动（例如已是最新）；cancelled：用户取消；
+ * not-processed：前提已变化或批次停止，没有处理；failed：失败；unconfirmed：结果未确认（运行中断或目录保护）
+ */
+export type HistoryStatus = 'accepted' | 'succeeded' | 'unchanged' | 'cancelled' | 'not-processed' | 'failed' | 'unconfirmed';
+
+export interface HistoryVersion {
+  fileId: string;
+  version: string;
+}
+
+export interface HistoryEntry {
+  id: string;
+  flavorId: number;
+  root: string;
+  kind: HistoryKind;
+  status: HistoryStatus;
+  modId: string | null;
+  /** 未托管目录名或回收站条目编号 */
+  target: string | null;
+  name: string;
+  batchId: string | null;
+  startedAt: number;
+  finishedAt: number | null;
+  /** 受理时界面看到的文件编号（只是请求，不代表实际旧版本） */
+  expectedFileId: string | null;
+  /** 目录锁内读到的旧版本（来自提交回执） */
+  previous: HistoryVersion | null;
+  /** 本次提交的新版本（来自提交回执） */
+  installed: HistoryVersion | null;
+  message: string;
+  warnings: string[];
+  /** 名称、说明或提示超过上限，已截断 */
+  truncated: boolean;
+  /** 这条记录（或它的最新状态）尚未写入磁盘 */
+  unsaved?: boolean;
+}
+
+export interface HistoryStatusView {
+  /** 单调递增（同一次运行内） */
+  rev: number;
+  /** 记录文件无法读取（损坏、过大、符号链接等）；不会被覆盖 */
+  loadError: string | null;
+  /** 最近一次保存失败的原因 */
+  saveError: string | null;
+  /** 尚未写入磁盘的记录数 */
+  unsaved: number;
+  /** 因未保存的记录过多而丢弃的条数 */
+  dropped: number;
+  file: string;
+}
+
+export interface HistoryView {
+  flavorId: number;
+  root: string;
+  /** 新的在前 */
+  entries: HistoryEntry[];
+  status: HistoryStatusView;
 }
 
 export type ClientUpdateStatus =
@@ -352,4 +460,36 @@ export interface BeeLiteApi {
   /** 主进程当前的插件写操作状态（只读） */
   activityState(): Promise<ActivitySnapshot>;
   onActivity(cb: (s: ActivitySnapshot) => void): () => void;
+  /** 暂停（true）或恢复（false）某个插件在该目录的更新 */
+  setPaused(modId: string, flavorId: number, paused: boolean, root: string): Promise<OpResult>;
+  /** 重新读取更新策略，返回更新检查快照（含暂停列表与策略错误） */
+  reloadPolicy(): Promise<AddonWatchSnapshot>;
+  historyList(flavorId: number, root: string): Promise<HistoryView>;
+  /** 重新读取并保存尚未写入的操作记录 */
+  historyRetry(): Promise<HistoryStatusView>;
+  historyStatus(): Promise<HistoryStatusView>;
+  onHistoryStatus(cb: (s: HistoryStatusView) => void): () => void;
+  /**
+   * 只读健康检查：root 为界面记录的期望目录（只做比对）。只在用户点击时调用；不恢复事务、不清理、不联网，
+   * 适配参考值取自主进程已加载的插件库配置
+   */
+  healthCheck(flavorId: number, root: string): Promise<HealthReport>;
+  // WTF 配置备份：root 为界面记录的期望目录（只做比对）；保存位置只由主进程弹出的选择框决定，界面不传任何路径
+  /** 当前备份 / 校验任务的内存快照（不读取 WTF，也不扫描备份位置） */
+  backupTaskState(): Promise<BackupTaskSnapshot>;
+  onBackupTask(cb: (s: BackupTaskSnapshot) => void): () => void;
+  /** 只读：未启用时只读备份设置；已启用时扫描已登记的备份位置，不读取 WTF */
+  backupState(flavorId: number, root: string): Promise<BackupState>;
+  /** 主进程弹出文件夹选择框并在其中新建备份位置后启用；用户取消选择时返回 null，不做任何改动 */
+  backupConfigure(flavorId: number, root: string): Promise<BackupState | null>;
+  /** 关闭该目录的备份：只改设置，不删除已有备份 */
+  backupDisable(flavorId: number, root: string): Promise<BackupState>;
+  /** 手动备份：结束时句柄、临时内容与占用标记都已收尾；取消以 cancelled 返回，其他失败报错 */
+  backupRun(flavorId: number, root: string): Promise<BackupOutcome<BackupRunResult>>;
+  /** 按清单完整校验一份备份的内容；内容不一致为 completed 且 ok:false */
+  backupVerify(flavorId: number, root: string, snapshotId: string): Promise<BackupOutcome<BackupVerifyResult>>;
+  /** 取消任务：taskId、flavorId 与 root 均为任务受理时的原值（不要求与当前绑定相同）；不匹配时返回 false */
+  backupCancel(taskId: string, flavorId: number, root: string): Promise<boolean>;
+  /** 在访达中显示已登记的备份位置（snapshotId 为 null）或其中一份备份 */
+  backupReveal(flavorId: number, root: string, snapshotId: string | null): Promise<void>;
 }

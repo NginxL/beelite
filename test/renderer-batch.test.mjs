@@ -221,8 +221,9 @@ test('全部更新：第一项提交、第二项下载 35% 时，第一行立即
     const [first, second] = [ctl.started[0], ctl.started[0] === '100' ? '200' : '100'];
     assert.match(rowText(second), /等待中/, '第二项在等待');
     // 按钮本身显示进度：原“更新”按钮的位置替换为禁用的状态按钮
-    assert.deepEqual(buttonMap(first), { '下载中 35%': true, 重装: true, 卸载: true });
-    assert.deepEqual(buttonMap(second), { 等待中: true, 重装: true, 卸载: true });
+    // 0.2.0：每行多一个“暂停更新”，处理中同样禁用
+    assert.deepEqual(buttonMap(first), { '下载中 35%': true, 暂停更新: true, 重装: true, 卸载: true });
+    assert.deepEqual(buttonMap(second), { 等待中: true, 暂停更新: true, 重装: true, 卸载: true });
     for (const id of [first, second]) assert.equal(A_.modActionButton({ id, accessible: true }).textContent, '处理中');
     assert.doesNotMatch(rowText('300'), /等待中|下载中/, '不在计划中的插件不显示进度');
     assert.equal(cards().length, 1, '等待中的项目不占任务卡片');
@@ -254,7 +255,7 @@ test('全部更新：第一项提交、第二项下载 35% 时，第一行立即
     assert.ok(buttons(first).every((b) => b.disabled), '批次未结束：仍受批次占用');
     assert.match(rowText(second), /版本 v1/);
     assert.match(rowText(second), /下载中 35%/);
-    assert.deepEqual(buttonMap(second), { '下载中 35%': true, 重装: true, 卸载: true });
+    assert.deepEqual(buttonMap(second), { '下载中 35%': true, 暂停更新: true, 重装: true, 卸载: true });
     assert.equal(S.updateCount(), 1);
     assert.equal(S.currentWatchEntry().pending, 1, '全局待更新数逐项减少');
     assert.equal(H.ipcCalls.filter((c) => c.channel === 'local:state').length, 0, '没有等待整页刷新');

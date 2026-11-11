@@ -4,13 +4,15 @@ import { readFile } from 'node:fs/promises';
 import path from 'node:path';
 import { ClientUpdater } from '../core/client-update';
 import { createQuitGuard, MutationGate } from '../core/gate';
+import { HistoryStore } from '../core/history';
+import { PolicyStore } from '../core/policy';
 import { BRAND_NAME, displayName, resolveUserData } from '../core/identity';
 import { inspectPickedRoot, SettingsStore } from '../core/profiles';
 import { NewBeeBoxProvider } from '../core/provider';
 import { FLAVORS } from '../core/flavors';
 import { recoverBoundRoots } from '../core/startup';
 import { loadSparkleBridge } from './client-update';
-import { APP_ORIGIN, AppService } from './ipc';
+import { APP_ORIGIN, AppService, backupOptions } from './ipc';
 
 const WEB_ROOT = path.join(__dirname, '..', '..', 'web');
 const PRELOAD = path.join(__dirname, '..', 'preload', 'preload.js');
@@ -156,15 +158,34 @@ async function start(): Promise<void> {
   registerAppProtocol();
   hardenSession();
   app.on('web-contents-created', (_e, contents) => hardenContents(contents));
-  // 手动退出与更新安装引起的退出都先等待已受理的插件写操作结束
-  app.on('before-quit', createQuitGuard(gate, () => app.quit()));
   buildMenu();
 
-  const settings = new SettingsStore(path.join(app.getPath('userData'), 'settings.json'));
-  const service = new AppService({ getWindow: () => mainWindow, settings, provider: new NewBeeBoxProvider(), gate });
+  const userData = app.getPath('userData');
+  const settings = new SettingsStore(path.join(userData, 'settings.json'));
+  // 操作记录与更新策略：与目录绑定分开的独立文件，只由主进程读写
+  const history = new HistoryStore(path.join(userData, 'operation-history.json'));
+  const policy = new PolicyStore(path.join(userData, 'addon-policy.json'));
+  const service = new AppService({
+    getWindow: () => mainWindow,
+    settings,
+    provider: new NewBeeBoxProvider(),
+    gate,
+    history,
+    policy,
+    backup: backupOptions(settings, userData, app.getVersion()),
+  });
   service.register();
+  // 退出（手动或更新安装引起）：先让备份服务拒绝新任务并中止进行中的备份 / 校验（同一次 before-quit 中、在等待之前），
+  // 再由退出保护冻结并等待已受理的写操作（插件写操作与备份的启用、关闭、备份、校验，含句柄关闭、临时内容与占用标记收尾）全部结束。
+  // 两个监听都在任何 await 之前注册，启动恢复期间的退出同样受保护
+  app.on('before-quit', () => void service.backup.shutdown().catch(() => undefined));
+  app.on('before-quit', createQuitGuard(gate, () => app.quit()));
   // 退出时停止插件更新检查：中止进行中的请求，迟到的结果不发布
   app.on('before-quit', () => service.watch.stop());
+  // 窗口创建与更新检查之前读取一次：策略读取之前（或读取失败时）所有插件更新都被拒绝，界面不会先开放更新按钮；
+  // 记录文件无法读取时状态立即可见（都只读，不写入）
+  await policy.reload();
+  await history.retry();
 
   // 测试绑定与启动恢复（残留的未完成事务）也计入写操作；全部完成后才启用客户端更新。
   // 设置无法读取时跳过恢复但不中断启动，窗口与客户端更新照常可用

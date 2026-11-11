@@ -4,12 +4,19 @@ import type { ManagedProjectView } from '../shared/types';
 import { h, spinner } from './dom.js';
 import { toast } from './dom.js';
 import {
-  activityUnknown, api, batchHoldText, clearTaskNotes, currentTarget, ensureBound, findManaged, isBlocked, isBusy, isFinalPhase, isOtherFlavor, isReserved, modBusy,
-  modKey, projectHasUpdate, requireTarget, rowTask, runWrite, state,
+  activityUnknown, api, batchHoldText, clearTaskNotes, currentTarget, ensureBound, findManaged, isBlocked, isBusy, isFinalPhase, isOtherFlavor, isPaused, isReserved, modBusy,
+  modKey, policyBlock, projectHasUpdate, requireTarget, rowTask, runWrite, state, stillTarget,
 } from './state.js';
 
 /** 全部更新进行中时插件写入口的说明 */
 export const BATCH_REASON = '正在全部更新，完成后可操作';
+/** 暂停更新的插件在更新 / 重装位置上的说明 */
+export const PAUSED_REASON = '已暂停更新（保留当前版本）。如需更新或重装，请先点「恢复更新」';
+
+/** 更新 / 重装此刻不可用的原因（暂停或策略不可用）；可用时为 null。主进程另有同样的判断 */
+export function updateBlock(modId: string): string | null {
+  return policyBlock() ?? (isPaused(modId) ? PAUSED_REASON : null);
+}
 
 export async function installMod(modId: string): Promise<void> {
   const fid = state.flavorId;
@@ -31,10 +38,25 @@ export async function updateProject(p: ManagedProjectView, force: boolean): Prom
     return;
   }
   if (modBusy(p.modId)) return;
+  // 暂停的插件与策略不可用时不发出请求（按钮之外的入口同样拦截；主进程也会拒绝）
+  const block = updateBlock(p.modId);
+  if (block) {
+    toast(block, 'warn');
+    return;
+  }
   clearTaskNotes(t, p.modId);
   // 界面看到的安装记录：主进程在目录锁内核对，期间被卸载、重装或更新时不做改动
   const expected = { fileId: p.fileId, installedAt: p.installedAt };
   await runWrite(modKey(t, p.modId), () => api().update(p.modId, t.flavorId, force, expected, t.root));
+}
+
+/** 暂停（保留当前版本）或恢复某个插件在当前目录的更新；与它的其他写操作互斥 */
+export async function setPaused(p: ManagedProjectView, paused: boolean): Promise<void> {
+  const t = requireTarget();
+  if (!t || modBusy(p.modId)) return;
+  if (paused && p.flavorId !== t.flavorId) return;
+  if (!stillTarget(t)) return;
+  await runWrite(modKey(t, p.modId), () => api().setPaused(p.modId, t.flavorId, paused, t.root));
 }
 
 /**
@@ -64,6 +86,10 @@ export function modActionButton(mod: { id: string; accessible: boolean }, block:
   }
   if (p) {
     if (projectHasUpdate(p)) {
+      // 暂停或策略不可用：显示原因，不提供更新（恢复在「我的插件」中进行）
+      if (isPaused(p.modId)) return h('button', { class: 'btn btn-sm', disabled: true, title: `${PAUSED_REASON}（在「我的插件」中操作）` }, '已暂停更新');
+      const policy = policyBlock();
+      if (policy) return h('button', { class: 'btn btn-sm', disabled: true, title: policy }, '暂不可更新');
       const hold = batchHoldText();
       if (hold) return h('button', { class: 'btn btn-sm btn-busy', disabled: true, title: BATCH_REASON }, spinner(true), hold);
       const reason = blocked ?? block;
@@ -81,10 +107,12 @@ export function modActionButton(mod: { id: string; accessible: boolean }, block:
   }
   // 全部更新计划确定之前，主进程不受理这个目录的新安装
   const reason = blocked ?? block ?? (t && modBusy(mod.id) ? BATCH_REASON : null);
+  // 卸载后保留的暂停项：可以安装，安装后仍保持暂停
+  const pausedNote = t && isPaused(mod.id) ? '；这个插件在当前目录已暂停更新，安装后仍保持暂停' : '';
   return h('button', {
     class: 'btn btn-sm btn-primary',
     disabled: !!reason,
-    title: reason ?? '安装到当前游戏版本',
+    title: reason ?? `安装到当前游戏版本${pausedNote}`,
     on: { click: stop(() => void installMod(mod.id)) },
   }, '安装');
 }

@@ -14,12 +14,18 @@ function deferred<T = void>() {
 
 const tick = () => new Promise((r) => setImmediate(r));
 
-test('写通道清单：恰好 10 个，包含会触发恢复的 local:state，不含只读通道', () => {
-  assert.equal(MUTATING_CHANNELS.size, 10);
-  for (const c of ['profile:bind', 'profile:unbind', 'local:state', 'addon:install', 'addon:update', 'addon:updateAll', 'addon:uninstall', 'addon:uninstallFolder', 'trash:restore', 'trash:purge']) {
+test('写通道清单：恰好 16 个，包含会触发恢复的 local:state、写更新策略、操作记录与 WTF 备份（含会写占用标记的重新校验）的通道，不含只读通道与备份取消', () => {
+  assert.equal(MUTATING_CHANNELS.size, 16);
+  for (const c of [
+    'profile:bind', 'profile:unbind', 'local:state', 'addon:install', 'addon:update', 'addon:updateAll', 'addon:uninstall', 'addon:uninstallFolder', 'trash:restore', 'trash:purge', 'policy:set', 'history:retry',
+    'backup:configure', 'backup:disable', 'backup:run', 'backup:verify',
+  ]) {
     assert.ok(MUTATING_CHANNELS.has(c), c);
   }
-  for (const c of ['addon:check', 'config:get', 'mods:search', 'profile:list', 'task:cancel', 'client:update']) assert.ok(!MUTATING_CHANNELS.has(c), c);
+  for (const c of [
+    'addon:check', 'config:get', 'mods:search', 'profile:list', 'task:cancel', 'client:update', 'policy:reload', 'history:list', 'history:status', 'health:check',
+    'backup:taskState', 'backup:state', 'backup:cancel', 'backup:reveal',
+  ]) assert.ok(!MUTATING_CHANNELS.has(c), c);
 });
 
 test('包装后的写操作在调用当下同步入闸，覆盖首个 await 之前的阶段', async () => {

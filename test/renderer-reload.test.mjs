@@ -18,6 +18,7 @@ const { addonEntries, cleanup, FakeSource, makeGameRoot, makeManager, makeZip, t
 const F = 9;
 const OTHER = 6;
 const web = path.join(here, '..', 'dist', 'web', 'renderer');
+const webShared = path.join(here, '..', 'dist', 'web', 'shared');
 const dom = installFakeDom(null);
 const MODS = { 100: 'Alpha', 200: 'Beta', 300: 'Gamma', 999: 'NewOne' };
 const zipOf = (id, v) => makeZip(addonEntries(MODS[id], v));
@@ -145,8 +146,11 @@ async function freshRenderer(h, base, raw = h.api) {
   currentPage = page;
   const api = page.api;
   h.stub.listeners.clear(); // 旧页面销毁：它的订阅全部失效
-  const dir = path.join(base, `renderer-${++rendererSeq}`);
+  // 与 dist/web 相同的布局：renderer/ 与它引用的 shared/（主进程共用的判定）一起复制，每次载入互不共享模块
+  const pageDir = path.join(base, `renderer-${++rendererSeq}`);
+  const dir = path.join(pageDir, 'renderer');
   await cp(web, dir, { recursive: true });
+  await cp(webShared, path.join(pageDir, 'shared'), { recursive: true });
   for (const id of ['test-local', 'task-panel', 'modal-root', 'toast-root', 'activity-warning']) document.getElementById(id).replaceChildren();
   globalThis.window.beelite = api;
   const S = await import(path.join(dir, 'state.js'));
@@ -311,9 +315,12 @@ test('R6 下载 35% 时重新载入：只凭活动快照立即恢复同一个任
   try {
     ctl.holdIds.add('100');
     const R0 = await freshRenderer(h, base);
+    // 与 main.ts 启动一致：取得活动快照与更新检查快照（暂停策略在后者中；未取得时更新入口保持关闭）
     await R0.S.syncActivity();
+    await R0.S.syncWatch();
     await R0.S.refreshLocal();
     const p = R0.S.state.local.managed.find((x) => x.modId === '100');
+    assert.equal(R0.S.policyBlock(), null, '已取得更新策略，可以发起更新');
     void R0.A.updateProject(p, false);
     const [backendRun] = R0.backend('update');
     await until(() => ctl.holds.has('100'), '下载 35%');

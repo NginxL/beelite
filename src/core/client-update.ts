@@ -6,7 +6,7 @@
 //   停止宽限（STOP_GRACE_MS）到期仍未结束时如实提示退出并重新打开艾泽魔方，此后若该周期结束仍会解除屏障。不自动重试。
 // - update()：用户点击“下载并更新”时唯一的授权入口；原生侧只在本次授权内才同意下载与安装。
 // - 下载、验签、解压完成（ready）后：同步冻结写操作 → 等待已受理的写操作全部结束 → 复核本次尝试仍有效 → 才通知原生安装并重启。
-// - 取消只在原生确认确有取消手段时生效（下载中、等待插件操作完成时）；解压阶段不提供取消。
+// - 取消只在原生确认确有取消手段时生效（下载中、等待正在进行的操作结束时）；解压阶段不提供取消。
 // - 取消、出错或会话中已无新版本后，进入 ending 屏障：直到旧的用户检查周期真正结束（cycle-finished）才允许重新检查或更新，
 //   避免旧周期的结束事件覆盖新的会话。取消或出错也会使当前尝试失效，早先等待排空的异步延续不会再触发安装。
 // - 可更新的版本以“条目”保存：构建号、显示版本与纯文本更新说明来自原生同一事件、同一个已验证的 appcast 条目，整体替换，
@@ -482,7 +482,7 @@ export class ClientUpdater {
     this.releaseFreeze();
     this.token = token;
     const waiting = this.opts.gate.activeCount > 0;
-    this.set('waiting', { percent: null, message: waiting ? '等待插件操作完成…' : '准备安装…' });
+    this.set('waiting', { percent: null, message: waiting ? '等待正在进行的操作结束…' : '准备安装…' });
     await drained;
     // 等待期间若已取消、出错或开始了新的尝试，则不安装
     if (gen !== this.attempt || this.status !== 'waiting' || this.session !== 'update' || !this.bridge) return;

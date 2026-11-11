@@ -1,14 +1,17 @@
 // 我的插件页：已托管 / 未托管 / 回收站
 
 import type { LocalFolder, LocalState, ManagedProjectView, RecoveryEntryView, TaskPhase } from '../shared/types';
-import { BATCH_REASON, updateProject } from './actions.js';
+import { BATCH_REASON, PAUSED_REASON, setPaused, updateBlock, updateProject } from './actions.js';
 import { ACTIVITY_BLOCKED_TEXT } from './activity-notice.js';
+import { backupTabBadge, noteBackupTarget, renderBackup, resetBackup, setBackupTabOpen } from './backup.js';
 import { confirmDialog, h, modIcon, mount, spinner } from './dom.js';
 import { cleanTocText, formatDateTime } from './format.js';
+import { noteHealthTarget, renderHealth, resetHealth } from './health.js';
+import { loadHistory, renderHistory, resetHistory } from './history.js';
 import {
-  activityUnknown, anyModBusy, api, batchHoldText, bindDirectory, checkUpdates, clearTaskNotes, currentFlavor, currentTarget, currentWatchEntry, flavorName, isBlocked, isBusy,
-  isFinalPhase, isOtherFlavor, isReserved, modBusy, modKey, on, projectHasUpdate, refreshLocal, requireTarget, rowTask, runWrite, state, stillTarget, targetKey,
-  updateAllKey, updateCount, updateFor, updatingAll, type RowTask, type Target,
+  activityUnknown, anyModBusy, api, batchHoldText, bindDirectory, checkUpdates, clearTaskNotes, currentFlavor, currentTarget, currentWatchEntry, flavorName, historyProblem, isBlocked,
+  isBusy, isFinalPhase, isOtherFlavor, isPaused, isReserved, modBusy, modKey, on, policyBlock, projectHasUpdate, refreshLocal, reloadPolicy, requireTarget, retryHistory, rowTask,
+  runWrite, state, stillTarget, syncWatch, targetKey, updateAllKey, updateCount, updateFor, updatingAll, type RowTask, type Target,
 } from './state.js';
 
 /** 活动状态未知时插件写入口的说明 */
@@ -16,7 +19,7 @@ const SYNC_REASON = '后台任务状态尚未取得（正在同步或获取失�
 /** 未托管目录写操作的占用键（按目标区分：不同目录中的同名目录互不影响） */
 const folderKey = (t: Target, name: string): string => `folder:${targetKey(t)}\n${name}`;
 
-type Tab = 'managed' | 'unmanaged' | 'recovery';
+type Tab = 'managed' | 'unmanaged' | 'recovery' | 'history' | 'health' | 'backup';
 
 const KIND_TEXT: Record<RecoveryEntryView['kind'], string> = {
   uninstall: '卸载',
@@ -82,7 +85,13 @@ export function initLocal(root: HTMLElement): void {
   unmanagedListEl = h('div', { class: 'row-list' });
   mount(root, toolbarEl, bodyEl);
 
-  on('local', render);
+  on('local', () => {
+    // 目标变化（含同一版本换绑、解除绑定、外部修改设置后刷新、读取失败）都会经过这里：健康检查结果随之作废
+    noteHealthTarget(currentTarget());
+    // 备份状态同样随目标变化作废；标签页打开时读取新目标
+    noteBackupTarget(currentTarget());
+    render();
+  });
   on('progress', () => {
     for (const [modId, els] of progressEls) {
       const r = rowTask(modId);
@@ -94,7 +103,16 @@ export function initLocal(root: HTMLElement): void {
   on('flavor', () => {
     filter = '';
     filterInput.value = '';
+    // 旧目标的记录与健康检查结果不再显示，回复到达时也被丢弃
+    resetHistory();
+    resetHealth();
+    resetBackup();
     render();
+  });
+  // 记录保存状态变化（每次写入之后）：正在查看操作记录时重新读取
+  on('history', () => {
+    const t = currentTarget();
+    if (tab === 'history' && t) void loadHistory(t);
   });
   render();
 }
@@ -129,7 +147,15 @@ function renderToolbar(): void {
       h('button', {
         class: 'btn btn-primary',
         disabled: !hasRoot || blocked || n === 0 || batch || modsBusy,
-        title: blocked ? '游戏目录当前不可写入' : activityUnknown() ? SYNC_REASON : modsBusy && !batch ? '有插件正在处理，完成后再全部更新' : '',
+        title: blocked
+          ? '游戏目录当前不可写入'
+          : activityUnknown()
+            ? SYNC_REASON
+            : modsBusy && !batch
+              ? '有插件正在处理，完成后再全部更新'
+              : state.watch?.policyError
+                ? (policyBlock() ?? '')
+                : '',
         on: { click: () => void doUpdateAll() },
       }, batch ? [spinner(true), '更新中'] : `全部更新 (${n})`),
       h('button', {
@@ -160,6 +186,16 @@ function checkInfo(): { text: string; title: string; error: boolean } | null {
 export function showManagedTab(): void {
   if (tab === 'managed') return;
   tab = 'managed';
+  setBackupTabOpen(false);
+  if (bodyEl) renderBody();
+}
+
+/** 切换标签页；进入操作记录时读取当前目标的记录，进入配置备份时读取当前目标的备份状态（不读取 WTF） */
+export function showTab(id: Tab): void {
+  tab = id;
+  const t = currentTarget();
+  if (id === 'history' && t) void loadHistory(t);
+  setBackupTabOpen(id === 'backup');
   if (bodyEl) renderBody();
 }
 
@@ -199,6 +235,29 @@ function renderBody(): void {
   const banners: HTMLElement[] = [];
   if (state.localError) banners.push(h('div', { class: 'banner banner-warn', text: `刷新失败，显示的是上次结果：${state.localError}` }));
   if (local.error) banners.push(h('div', { class: 'banner banner-error', text: local.error }));
+  // 更新检查快照未能取得：暂停状态未知，插件更新保持关闭；提供重试
+  if (!state.watch && state.watchError) {
+    banners.push(h('div', { class: 'banner banner-warn' },
+      h('span', { text: `插件更新状态未能同步，暂时不能更新插件：${state.watchError}` }),
+      h('button', { class: 'btn btn-sm', on: { click: () => void syncWatch() } }, '重新同步'),
+    ));
+  }
+  // 更新策略无法读取：所有插件更新都被拒绝（已知的新版本仍显示），一直提示到重新读取成功
+  if (state.watch?.policyError) {
+    banners.push(h('div', { class: 'banner banner-error banner-pre' },
+      h('div', { class: 'banner-title', text: '更新策略无法读取，已停止所有插件更新' }),
+      h('div', { text: state.watch.policyError }),
+      h('button', { class: 'btn btn-sm', disabled: isBusy('policy'), on: { click: () => void reloadPolicy() } }, isBusy('policy') ? '读取中' : '重试'),
+    ));
+  }
+  // 操作记录无法读取或未保存：不影响插件操作，但一直提示到保存成功
+  const problem = historyProblem();
+  if (problem) {
+    banners.push(h('div', { class: 'banner banner-warn' },
+      h('span', { text: `${problem}。插件操作本身的结果不受影响。` }),
+      h('button', { class: 'btn btn-sm', disabled: isBusy('history'), on: { click: () => void retryHistory() } }, isBusy('history') ? '保存中' : '重试保存记录'),
+    ));
+  }
   // 获取失败的原因与重试在页面顶部的全局提示中（所有页面可见）；这里只说明仍在同步
   if (activityUnknown() && !state.activityError) {
     banners.push(h('div', { class: 'banner banner-warn', text: `正在同步后台任务状态，完成前${ACTIVITY_BLOCKED_TEXT}…` }));
@@ -210,23 +269,35 @@ function renderBody(): void {
     ));
   }
 
-  const tabs: [Tab, string, number][] = [
+  const tabs: [Tab, string, number | null][] = [
     ['managed', '已托管', local.managed.length],
     ['unmanaged', '未托管', local.unmanaged.length],
     ['recovery', '回收站', local.recovery.length],
+    ['history', '操作记录', null],
+    ['health', '健康检查', null],
+    ['backup', '配置备份', null],
   ];
+  const backupBadge = backupTabBadge();
   const tabBar = h('div', { class: 'tabs' }, tabs.map(([id, label, count]) =>
     h('button', {
       class: id === tab ? 'tab active' : 'tab',
-      on: { click: () => { tab = id; renderBody(); } },
-    }, label, h('span', { class: 'tab-count', text: String(count) })),
+      on: { click: () => showTab(id) },
+    }, label,
+    count === null ? null : h('span', { class: 'tab-count', text: String(count) }),
+    id === 'backup' && backupBadge ? h('span', { class: 'tab-count tab-count-accent', text: backupBadge }) : null),
   ));
 
   let content: HTMLElement;
   progressEls.clear();
+  const t = currentTarget();
   if (tab === 'managed') content = renderManaged(local);
   else if (tab === 'unmanaged') content = renderUnmanaged(local);
-  else content = renderRecovery(local);
+  else if (tab === 'recovery') content = renderRecovery(local);
+  // 健康检查：打开标签页不读取，只有点击按钮才检查
+  else if (tab === 'health') content = renderHealth(t);
+  // 配置备份：不经过本地状态读取与插件写操作；打开时只读取已登记的备份位置
+  else if (tab === 'backup') content = renderBackup(t);
+  else content = t ? renderHistory(t) : h('div', { class: 'tab-content scroll' }, emptyState('暂时无法显示操作记录', '本地插件状态刷新后可查看。'));
 
   const prevScroll = bodyEl.querySelector('.tab-content')?.scrollTop ?? 0;
   mount(bodyEl, banners, tabBar, content);
@@ -266,13 +337,23 @@ function managedRow(p: ManagedProjectView): HTMLElement {
   const missing = p.folders.filter((f) => !f.present).length;
   const otherFlavor = isOtherFlavor(p);
   const otherTitle = `该插件按「${flavorName(p.flavorId)}」版本安装，与当前游戏版本不同：可以卸载（卸载后可恢复），但不会检查更新、更新或重装。如需改用当前版本，请先卸载再安装。`;
+  const paused = isPaused(p.modId);
+  const policy = policyBlock();
+  /** 更新 / 重装此刻不可用的原因（暂停或策略不可用） */
+  const held = updateBlock(p.modId);
 
   let status: HTMLElement | null = null;
+  const pausedTag = paused ? h('span', { class: 'tag tag-warn', text: '已暂停更新', title: PAUSED_REASON }) : null;
   if (active) {
     status = trackProgress(p.modId, h('span', { class: 'tag tag-accent tag-task', text: taskText(task) }));
-  } else if (hasUpdate) status = h('span', { class: 'tag tag-accent', text: `可更新到 ${u?.latestVersion ?? '新版本'}`, title: u?.stale ? (u.error ?? '') : '' });
+  } else if (hasUpdate && paused) {
+    // 暂停不掩盖真实的新版本
+    status = h('span', { class: 'tag tag-muted', text: `有新版本 ${u?.latestVersion ?? ''}`.trim(), title: '已暂停更新：保留当前版本，不会被更新或计入全部更新' });
+  } else if (hasUpdate) status = h('span', { class: 'tag tag-accent', text: `可更新到 ${u?.latestVersion ?? '新版本'}`, title: policy ?? (u?.stale ? (u.error ?? '') : '') });
   else if (u?.skipped) status = h('span', { class: 'tag tag-muted', text: '不检查更新', title: u.skipped });
   else if (u?.error) status = h('span', { class: 'small-error', text: u.error, title: u.error });
+  // 更新策略不可用：无法确认可更新状态，不显示“已是最新”
+  else if (state.updatesChecked && u && state.watch?.policyError) status = h('span', { class: 'tag tag-warn', text: '无法确认可更新状态', title: policy ?? '' });
   else if (state.updatesChecked && u) status = h('span', { class: 'tag tag-muted', text: '已是最新' });
   const note = task && !active
     ? h('span', { class: task.phase === 'failed' ? 'small-error' : 'tag tag-muted', text: taskNote(task), title: task.message ?? '' })
@@ -296,10 +377,25 @@ function managedRow(p: ManagedProjectView): HTMLElement {
   let updateBtn: HTMLElement | null = null;
   if (active) updateBtn = busyButton(taskText(task), disabledTitle || '正在处理这个插件', p.modId);
   else if (pending) updateBtn = busyButton('处理中', '正在处理这个插件');
-  else if (hasUpdate && !otherFlavor) {
+  else if (hasUpdate && !otherFlavor && !paused) {
     updateBtn = hold
       ? busyButton(hold, activityUnknown() ? SYNC_REASON : BATCH_REASON)
-      : h('button', { class: 'btn btn-sm btn-primary', disabled: blocked || busy, title: disabledTitle, on: { click: () => void updateProject(p, false) } }, '更新');
+      : policy
+        ? h('button', { class: 'btn btn-sm', disabled: true, title: policy }, '暂不可更新')
+        : h('button', { class: 'btn btn-sm btn-primary', disabled: blocked || busy, title: disabledTitle, on: { click: () => void updateProject(p, false) } }, '更新');
+  }
+  // 暂停 / 恢复更新：只改更新策略，不写游戏目录；与这个插件的其他写操作互斥。已暂停的项目总能恢复
+  let pauseBtn: HTMLElement | null = null;
+  if (paused || !otherFlavor) {
+    const pauseOff = busy || (policy !== null && !paused);
+    pauseBtn = h('button', {
+      class: 'btn btn-sm',
+      disabled: busy || (paused ? !!state.watch?.policyError : pauseOff),
+      title: busy ? disabledTitle || '正在处理这个插件' : paused
+        ? '恢复后会按正常规则检查并允许更新'
+        : policy ?? '保留当前版本：仍检查并显示新版本，但不会被更新、重装或全部更新处理，也不计入更新提醒；卸载后重新安装仍保持暂停',
+      on: { click: () => void setPaused(p, !paused) },
+    }, paused ? '恢复更新' : '暂停更新');
   }
   return h('div', { class: 'row' },
     modIcon(p.logo, p.name, 'sm'),
@@ -307,6 +403,7 @@ function managedRow(p: ManagedProjectView): HTMLElement {
       h('div', { class: 'row-title' },
         h('span', { class: 'row-name', text: p.name }),
         h('span', { class: otherFlavor ? 'tag tag-warn' : 'tag', text: flavorName(p.flavorId), title: otherFlavor ? otherTitle : '' }),
+        pausedTag,
         status,
         note,
       ),
@@ -318,8 +415,9 @@ function managedRow(p: ManagedProjectView): HTMLElement {
     ),
     h('div', { class: 'row-actions' },
       updateBtn,
+      pauseBtn,
       h('button', {
-        class: 'btn btn-sm', disabled: blocked || busy || otherFlavor, title: disabledTitle || (otherFlavor ? otherTitle : '重新下载并安装最新文件'),
+        class: 'btn btn-sm', disabled: blocked || busy || otherFlavor || !!held, title: disabledTitle || (otherFlavor ? otherTitle : held ?? '重新下载并安装最新文件'),
         on: { click: () => void updateProject(p, true) },
       }, '重装'),
       h('button', {
