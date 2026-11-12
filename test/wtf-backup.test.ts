@@ -9,7 +9,7 @@ import path from 'node:path';
 import { UserError } from '../src/core/errors';
 import { io, type WriteFn } from '../src/core/fsio';
 import { CONTAINER_PREFIX, LOCK_NAME, MANIFEST_NAME, MARKER_NAME, WtfBackupService, type BackupStep } from '../src/core/wtf-backup';
-import type { BackupLimits, BackupState } from '../src/shared/backup-types';
+import type { BackupConfigResult, BackupLimits } from '../src/shared/backup-types';
 
 function deferred<T>() {
   let resolve!: (v: T) => void;
@@ -146,9 +146,9 @@ test('默认关闭：state / taskState 不读取 WTF、不创建容器；configu
     assert.equal(f.svc.taskState(), null);
     assert.deepEqual(await readdir(f.picked), []);
     const enabled = await f.svc.configure(9, f.root, f.picked);
-    assert.equal(enabled.status, 'ready');
-    assert.equal(enabled.snapshots.length, 0);
-    assert.equal(enabled.canCreate, true);
+    assert.equal(enabled.state?.status, 'ready');
+    assert.equal(enabled.state?.snapshots.length, 0);
+    assert.equal(enabled.state?.canCreate, true);
     assert.deepEqual(spy.calls, [], '启用前后都不应访问 WTF');
   } finally {
     spy.restore();
@@ -542,7 +542,7 @@ test('位置规则：拒绝当前与其他已绑定游戏目录内、应用数�
   await symlink(path.join(f.root, 'Interface'), sneaky);
   const wtfLink = path.join(f.base, 'wtf-link');
   await symlink(f.wtf, wtfLink);
-  assert.equal((await f.svc.configure(9, f.root, f.picked)).status, 'ready');
+  assert.equal((await f.svc.configure(9, f.root, f.picked)).state?.status, 'ready');
   const settings = path.join(f.appData, 'wtf-backup.json');
   const saved = await readFile(settings);
 
@@ -945,9 +945,9 @@ test('设置占用标记：两个实例同时修改时后者被拒；释放时�
     } finally {
       p.release();
     }
-    assert.equal(((await first) as BackupState).status, 'ready');
+    assert.equal(((await first) as BackupConfigResult).state?.status, 'ready');
     f.ctx.current = f.root2;
-    assert.equal((await other.configure(9, f.root2, f.picked2)).status, 'ready');
+    assert.equal((await other.configure(9, f.root2, f.picked2)).state?.status, 'ready');
     let saved = JSON.parse(await readFile(settings, 'utf8')) as { targets: { root: string; enabled: boolean }[] };
     assert.deepEqual(saved.targets.map((t) => t.root).sort(), [f.root, f.root2].sort(), '两个实例的启用记录都保存');
 
@@ -955,7 +955,13 @@ test('设置占用标记：两个实例同时修改时后者被拒；释放时�
       await unlink(lockPath);
       await writeFile(lockPath, 'replaced');
     });
-    await assert.rejects(other.disable(9, f.root2), (err: unknown) => isCode('backup-lock')(err) && /备份设置已保存/.test((err as Error).message) && /未能正常释放/.test((err as Error).message));
+    // 已保存但标记无法释放：结果如实是“已保存”，并带上标记保留、之后不能再修改的警告（不当作失败，也不丢掉警告）
+    const off = await other.disable(9, f.root2);
+    assert.equal(off.enabled, false);
+    assert.equal(off.state?.status, 'disabled');
+    assert.equal(off.warnings.length, 1);
+    assert.match(off.warnings[0], /^备份设置已保存，但设置的占用标记未能正常释放：/);
+    assert.match(off.warnings[0], /处理该文件之前无法再次修改备份设置/);
     f.pause.onStep = null;
     assert.ok(fired());
     saved = JSON.parse(await readFile(settings, 'utf8')) as typeof saved;
@@ -970,6 +976,18 @@ test('设置占用标记：两个实例同时修改时后者被拒；释放时�
     await assert.rejects(other.configure(9, f.root2, f.picked2), isCode('backup-lock'));
     assert.deepEqual(await readFile(settings), frozen, '残留标记存在时不得修改设置');
     assert.deepEqual(await readdir(f.picked2), pickedBefore, '残留标记存在时不得新建容器');
+
+    // 用户在访达中处理了残留标记之后；这一次没有保存任何改动（本来就已关闭），标记无法释放时仍报错，不说已保存
+    await unlink(lockPath);
+    const fired2 = onceAt(f.pause, 'before-lock-release', async () => {
+      await unlink(lockPath);
+      await writeFile(lockPath, 'replaced again');
+    });
+    await assert.rejects(other.disable(9, f.root2), (err: unknown) => isCode('backup-lock')(err) && /^备份设置未改变，但设置的占用标记未能正常释放/.test((err as Error).message));
+    f.pause.onStep = null;
+    assert.ok(fired2());
+    assert.deepEqual(await readFile(settings), frozen);
+    assert.equal(await readFile(lockPath, 'utf8'), 'replaced again', '外来标记保留');
   } finally {
     f.pause.onStep = null;
     await f.done();

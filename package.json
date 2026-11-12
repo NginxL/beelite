@@ -1,7 +1,7 @@
 {
   "name": "beelite",
   "productName": "BeeLite",
-  "version": "0.2.1",
+  "version": "0.2.2",
   "description": "艾泽魔方 · AzerCube：精简的魔兽世界插件搜索、安装与管理工具（macOS）",
   "private": true,
   "main": "dist/app/main/main.js",

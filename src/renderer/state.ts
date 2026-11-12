@@ -700,15 +700,18 @@ export async function ensureBound(): Promise<boolean> {
 const MAX_SEPARATE_WARNINGS = 4;
 const MERGED_WARNINGS_MS = 15000;
 
-/** 执行写操作：防重复、toast 结果与警告、完成后刷新本地状态 */
-export async function runWrite(key: string, fn: () => Promise<OpResult>): Promise<OpResult | null> {
+/**
+ * 执行写操作：防重复、toast 结果与警告、完成后刷新本地状态。
+ * tone：成功结果的显示方式（缺省为成功）；用于本身已提交、但带提示说明目的尚未完全达成的结果
+ */
+export async function runWrite(key: string, fn: () => Promise<OpResult>, tone?: (r: OpResult) => 'success' | 'warn'): Promise<OpResult | null> {
   if (isBusy(key)) return null;
   state.busy.add(key);
   emit('local');
   let result: OpResult | null = null;
   try {
     result = await fn();
-    if (result.ok) toast(result.message || '操作完成', 'success');
+    if (result.ok) toast(result.message || '操作完成', tone?.(result) ?? 'success');
     else if (result.message) toast(result.message, 'info');
     const warnings = result.warnings ?? [];
     // toast 最多保留 5 条（其中一条是结果）：提示更多时合并为一条可滚动的提示，避免前面的被挤掉

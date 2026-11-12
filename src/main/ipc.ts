@@ -3,7 +3,7 @@ import { app, dialog, ipcMain, shell, type BrowserWindow, type IpcMainInvokeEven
 import { stat } from 'node:fs/promises';
 import path from 'node:path';
 import type {
-  ActivityReservation, ActivitySnapshot, AddonWatchSnapshot, AppConfig, BackupOutcome, BackupScope, BackupState, BackupTaskSnapshot, ClientUpdateState, ExpectedRecord, FlavorInfo, HealthReport, HistoryKind, HistoryStatusView,
+  ActivityReservation, ActivitySnapshot, AddonWatchSnapshot, AppConfig, BackupOutcome, BackupConfigResult, BackupScope, BackupTaskSnapshot, ClientUpdateState, ExpectedRecord, FlavorInfo, HealthReport, HistoryKind, HistoryStatusView,
   HistoryVersion, InstalledRecord, LocalState, OpResult, ProfileInfo, SearchQuery, SortOrder, TaskEvent, TaskPhase,
 } from '../shared/types';
 import { ActivityRegistry } from '../core/activity';
@@ -296,7 +296,7 @@ export class AppService {
    * 启用备份：先确认目标仍是当前绑定、没有进行中的任务，再由主进程弹出文件夹选择框；保存位置只来自选择框。
    * 用户取消时返回 null，不调用核心。选择之后由核心在设置标记内再次复核绑定与所选目录
    */
-  private async configureBackup(flavorId: number, expected: string): Promise<BackupState | null> {
+  private async configureBackup(flavorId: number, expected: string): Promise<BackupConfigResult | null> {
     await this.targetRoot(flavorId, expected);
     if (this.backup.taskState()) throw new UserError('已有备份或校验任务正在进行，请等待完成或取消后再试', 'backup-busy');
     const win = this.deps.getWindow();
@@ -453,7 +453,7 @@ export class AppService {
 
   async localState(flavorId: number): Promise<LocalState> {
     const profile = await this.deps.settings.profile(flavorId);
-    if (!profile.root) return { flavorId, profile, dir: null, managed: [], unmanaged: [], recovery: [], error: null };
+    if (!profile.root) return { flavorId, profile, dir: null, managed: [], unmanaged: [], recovery: [], cleanup: null, error: null };
     return this.manager.localState({ ...profile, root: profile.root }, flavorId);
   }
 
@@ -726,7 +726,7 @@ export class AppService {
       return this.single(flavorId, target, modId, 'uninstall', () => this.tracked(
         { flavorId, root: target, kind: 'uninstall', modId, name: this.names.get(modId) ?? `插件 ${modId}` },
         () => this.manager.uninstallProject(target, modId),
-        (r) => ({ status: 'succeeded', message: r.message, name: r.removed.name, previous: versionOf(r.removed) }),
+        (r) => ({ status: 'succeeded', message: r.message, warnings: r.warnings, name: r.removed.name, previous: versionOf(r.removed) }),
       ));
     });
     handle('addon:uninstallFolder', async (name, f, root) => {
@@ -736,7 +736,7 @@ export class AppService {
       return this.tracked(
         { flavorId, root: target, kind: 'uninstall-folder', target: folder, name: folder },
         () => this.manager.uninstallFolder(target, folder),
-        (r) => ({ status: 'succeeded', message: r.message }),
+        (r) => ({ status: 'succeeded', message: r.message, warnings: r.warnings }),
       );
     });
     handle('trash:restore', async (id, f, root) => {
@@ -746,7 +746,7 @@ export class AppService {
       return this.tracked(
         { flavorId, root: target, kind: 'restore', target: entryId, name: `回收站条目 ${entryId}` },
         () => this.manager.restore(target, entryId),
-        (r) => ({ status: 'succeeded', message: r.message, name: r.label, modId: r.restored?.modId ?? null, installed: r.restored ? versionOf(r.restored) : null }),
+        (r) => ({ status: 'succeeded', message: r.message, warnings: r.warnings, name: r.label, modId: r.restored?.modId ?? null, installed: r.restored ? versionOf(r.restored) : null }),
       );
     });
     handle('trash:purge', async (id, f, root) => {
@@ -755,8 +755,9 @@ export class AppService {
       const target = await this.targetRoot(flavorId, expectedRootArg(root));
       return this.tracked(
         { flavorId, root: target, kind: 'purge', target: entryId, name: `回收站条目 ${entryId}` },
+        // 已提交即记为成功（条目已注销、不能再恢复）；磁盘删除未完成时说明文字与提示如实写明
         () => this.manager.purge(target, entryId),
-        (r) => ({ status: 'succeeded', message: r.message, name: r.label }),
+        (r) => ({ status: 'succeeded', message: r.message, warnings: r.warnings, name: r.label }),
       );
     });
     handle('task:cancel', async (id) => {

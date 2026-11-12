@@ -256,6 +256,30 @@ function renderBody(): void {
   if (activityUnknown() && !state.activityError) {
     banners.push(h('div', { class: 'banner banner-warn', text: `正在同步后台任务状态，完成前${ACTIVITY_BLOCKED_TEXT}…` }));
   }
+  // 已提交操作之后的清理未完成，一直提示到清理完成：目录可以写入时不影响插件管理，刷新会重试清理；
+  // 目录暂停写入时不会执行清理（待清理数只来自清单登记），只说明情况，先处理下方的目录保护原因
+  const cleanup = local.cleanup;
+  if (cleanup) {
+    const dirBlocked = local.dir?.status === 'blocked';
+    const parts: string[] = [];
+    if (cleanup.pending) {
+      parts.push(cleanup.checked
+        ? `${cleanup.pending} 项已申请永久删除的回收站内容尚未清理完成（已不能恢复）`
+        : `${cleanup.pending} 项已申请永久删除、登记待清理（已不能恢复），磁盘上的内容尚未检查确认`);
+    }
+    if (cleanup.unsaved) parts.push(`${cleanup.unsaved} 项已从磁盘删除，但清理状态尚未保存`);
+    const detail = parts.length ? `：${parts.join('；')}` : '';
+    banners.push(h('div', { class: 'banner banner-warn banner-pre' },
+      h('div', { class: 'banner-title', text: dirBlocked ? `有未完成的清理${detail}` : `清理未完成，不影响插件管理${detail}` }),
+      cleanup.problems.map((p) => h('div', { text: p })),
+      dirBlocked
+        ? h('div', { text: '这个目录当前暂停写入（原因见下方），清理不会进行；请先处理目录保护的原因，之后刷新时会继续清理。' })
+        : [
+          h('div', { text: '修复权限或重新连接磁盘后点击“重试清理”；之后写入这个目录时也会自动重试。' }),
+          h('button', { class: 'btn btn-sm', disabled: state.localLoading, on: { click: () => void refreshLocal() } }, state.localLoading ? '读取中' : '重试清理'),
+        ],
+    ));
+  }
   if (local.dir?.status === 'blocked') {
     banners.push(h('div', { class: 'banner banner-error banner-pre' },
       h('div', { class: 'banner-title', text: '游戏目录当前不可写入，已禁用所有写操作' }),
@@ -517,7 +541,11 @@ export async function trashFolder(f: LocalFolder): Promise<void> {
 function renderRecovery(local: LocalState): HTMLElement {
   const box = h('div', { class: 'tab-content scroll' });
   if (local.recovery.length === 0) {
-    mount(box, emptyState('回收站是空的', '卸载、更新前备份以及安装时接管的目录会保存在这里，可以随时恢复。'));
+    // 已申请永久删除、尚未清理完成的内容不是可恢复条目，单独说明（原因与重试在页面顶部的提示中）
+    const pending = local.cleanup?.pending ?? 0;
+    mount(box, pending
+      ? emptyState('没有可恢复的条目', `另有 ${pending} 项已申请永久删除、尚未清理完成的内容（不能恢复），见上方提示。`)
+      : emptyState('回收站是空的', '卸载、更新前备份以及安装时接管的目录会保存在这里，可以随时恢复。'));
     return box;
   }
   const list = [...local.recovery].sort((a, b) => b.createdAt - a.createdAt);
@@ -577,7 +605,8 @@ export async function purge(r: RecoveryEntryView): Promise<void> {
     danger: true,
   });
   if (!second || !stillTarget(t)) return;
-  await runWrite(`recovery:${r.id}`, () => api().purge(r.id, t.flavorId, t.root));
+  // 有提示时（例如磁盘删除尚未完成）结果不显示为成功
+  await runWrite(`recovery:${r.id}`, () => api().purge(r.id, t.flavorId, t.root), (res) => (res.warnings?.length ? 'warn' : 'success'));
 }
 
 function emptyState(title: string, msg: string): HTMLElement {

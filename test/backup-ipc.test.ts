@@ -101,7 +101,7 @@ async function enable(f: Awaited<ReturnType<typeof setup>>): Promise<string> {
   f.h.stub.pick = f.picked;
   const s = await f.h.api.backupConfigure(F, f.A);
   f.h.stub.pick = null;
-  assert.ok(s && s.status === 'ready' && s.containerPath);
+  assert.ok(s && s.state?.status === 'ready' && s.containerPath);
   return s.containerPath;
 }
 
@@ -170,7 +170,7 @@ test('默认关闭：启动、任务快照与查看状态都不读取 WTF、不�
     // 明确启用：选择框返回位置后新建备份位置；启用与之后查看状态（扫描备份位置）都不读取 WTF
     h.stub.pick = picked;
     const on = await h.api.backupConfigure(F, A);
-    assert.equal(on?.status, 'ready');
+    assert.equal(on?.state?.status, 'ready');
     const ready = await h.api.backupState(F, A);
     assert.equal(ready.status, 'ready');
     assert.equal(ready.canCreate, true);
@@ -311,14 +311,14 @@ test('启用：保存位置只来自主进程的文件夹选择框；取消返�
     // 界面多传一个路径：只用选择框返回的位置
     h.stub.pick = f.picked;
     const s = await h.invoke('backup:configure', F, A, f.other) as Awaited<ReturnType<typeof h.api.backupConfigure>>;
-    assert.ok(s && s.status === 'ready');
+    assert.ok(s && s.state?.status === 'ready');
     assert.equal(path.dirname(s.containerPath!), f.picked);
     assert.deepEqual(await readdir(f.other), [], '界面给出的路径没有被使用');
     assert.equal(coreCalls, 1);
 
     // 关闭：只改设置，备份位置保留
     const off = await h.api.backupDisable(F, A);
-    assert.equal(off.status, 'disabled');
+    assert.equal(off.state?.status, 'disabled');
     assert.equal(off.containerPath, s.containerPath);
     assert.ok(await exists(s.containerPath!));
     assert.equal(h.gate.activeCount, 0);

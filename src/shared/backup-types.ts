@@ -163,6 +163,22 @@ export interface BackupState {
   activeTask: BackupTaskInfo | null;
 }
 
+/**
+ * 启用 / 关闭备份的设置已保存：flavorId、root、enabled、containerPath 取自本次保存的记录（发起时的原目录）；
+ * state 是保存后对原目录读取的状态，可能为 unavailable（备份设置文件无法读取，或备份位置缺失、标记不符）；
+ * 无法取得状态时为 null（保存后绑定已变化，或无法确认当前绑定），原因在 stateError。两种情况设置本身都已保存
+ */
+export interface BackupConfigResult {
+  flavorId: number;
+  root: string;
+  enabled: boolean;
+  containerPath: string | null;
+  state: BackupState | null;
+  stateError: string | null;
+  /** 设置已保存但收尾有异常（例如设置的占用标记未能释放） */
+  warnings: string[];
+}
+
 export interface BackupRunResult {
   taskId: string;
   snapshot: BackupSnapshotInfo;

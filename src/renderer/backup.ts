@@ -16,7 +16,7 @@
 // - 备份 / 校验的结果按发起时的目标给出，带原目标说明，常驻显示到用户关闭（警告不会随刷新消失）。
 // - 所有路径、名称、清单信息与错误说明都按纯文本显示（textContent），列表有界、可滚动。
 
-import type { BackupAnomalyKind, BackupCatalog, BackupPhase, BackupScope, BackupSnapshotInfo, BackupState, BackupTaskInfo, BackupTaskSnapshot } from '../shared/types';
+import type { BackupAnomalyKind, BackupCatalog, BackupConfigResult, BackupPhase, BackupScope, BackupSnapshotInfo, BackupState, BackupTaskInfo, BackupTaskSnapshot } from '../shared/types';
 import { MAX_BACKUP_SCOPE_CHARACTERS } from '../shared/backup-types.js';
 import { confirmDialog, h, mount, spinner, toast, type Child } from './dom.js';
 import { errMsg, formatDateTime } from './format.js';
@@ -387,13 +387,13 @@ function scopeDraft(t: Target): { scope: BackupScope | null; text: string } {
   if (catalogLoad?.key === key) return { scope: null, text: '正在读取账号与角色…' };
   const c = catalog?.key === key ? catalog : null;
   if (!c) return { scope: null, text: '请先点击“读取账号与角色”，再选择要备份的账号或角色' };
-  if (!c.data) return { scope: null, text: '账号与角色读取失败，暂时不能按账号或角色备份；可以重新读取，或改用全部 WTF' };
+  if (!c.data) return { scope: null, text: '账号与角色读取失败，暂时不能按账号或角色备份（原因见上方），处理后可以重新读取' };
   const acct = sel.account === null ? undefined : c.data.accounts.find((a) => a.account === sel.account);
   if (!acct) return { scope: null, text: '请选择账号' };
   if (sel.kind === 'account') {
     return { scope: { kind: 'account', account: acct.account }, text: `将备份：账号「${acct.account}」的完整目录（含该账号下所有角色与账号共享配置）` };
   }
-  if (acct.characterError) return { scope: null, text: '这个账号的角色无法完整列出，不能按角色备份；可改用指定账号或全部 WTF' };
+  if (acct.characterError) return { scope: null, text: '这个账号的角色无法完整列出，不能按角色备份（原因见上方）' };
   const characters = acct.realms.flatMap((r) => r.characters.filter((ch) => sel.chars.has(charKey(r.realm, ch))).map((character) => ({ realm: r.realm, character })));
   if (characters.length === 0) return { scope: null, text: '请至少选择一个角色' };
   // 独立于勾选限制的兜底：超过上限不组装范围，也不会发送
@@ -484,17 +484,31 @@ export async function enableBackup(t: Target, oldPath: string | null, replacing:
   }
   await busy(BUSY.configure, async () => {
     try {
-      const s = await api().backupConfigure(t.flavorId, t.root);
-      if (!s) return;
-      adopt(t, s);
-      report(t, 'success', '已启用 WTF 配置备份', [
-        `保存位置：${s.containerPath ?? ''}`,
+      const r = await api().backupConfigure(t.flavorId, t.root);
+      if (!r) return;
+      const after = afterSaved(t, r);
+      report(t, after.length ? 'warn' : 'success', '已启用 WTF 配置备份', [
+        `保存位置：${r.containerPath ?? ''}`,
+        ...after,
         '之后只有点击“创建备份”才会读取并复制 WTF 中的配置文件；按账号或角色备份前点击“读取账号与角色”，只会读取目录名称、文件类型等元信息，不读取配置内容。',
       ]);
     } catch (err) {
       report(t, 'error', '未能启用备份', [errMsg(err)]);
     }
   });
+}
+
+/**
+ * 设置已保存之后：采用返回的原目录状态（目标已变化时 adopt 自行丢弃）；状态未能读取时当前目录仍是原目录则重新读取。
+ * 返回需要说明的情况（设置本身已保存）
+ */
+function afterSaved(t: Target, r: BackupConfigResult): string[] {
+  if (r.state) adopt(t, r.state);
+  else if (stillTarget(t)) refreshBackup(t);
+  const out = [...r.warnings];
+  if (r.stateError) out.push(`设置已保存；${r.stateError}`);
+  else if (r.state?.status === 'unavailable') out.push(`设置已保存，但备份状态当前不可用：${r.state.error ?? '原因未知'}`);
+  return out;
 }
 
 /** 关闭：只停止向这个位置备份，不删除已有备份 */
@@ -509,8 +523,10 @@ export async function disableBackup(t: Target, path: string | null): Promise<voi
   if (!ok || !stillTarget(t)) return;
   await busy(BUSY.disable, async () => {
     try {
-      adopt(t, await api().backupDisable(t.flavorId, t.root));
-      report(t, 'info', '已关闭 WTF 配置备份，已有备份仍保留', path ? [`保留位置：${path}`] : []);
+      const r = await api().backupDisable(t.flavorId, t.root);
+      const after = afterSaved(t, r);
+      const kept = r.containerPath ?? path;
+      report(t, after.length ? 'warn' : 'info', '已关闭 WTF 配置备份，已有备份仍保留', [...(kept ? [`保留位置：${kept}`] : []), ...after]);
     } catch (err) {
       report(t, 'error', '未能关闭备份', [errMsg(err)]);
     }
@@ -653,6 +669,12 @@ let focusKeys = new WeakMap<Element, string>();
 let focusEls = new Map<string, HTMLElement>();
 /** 角色列表（有界滚动）；重绘时保持滚动位置 */
 let charsEl: HTMLElement | null = null;
+/**
+ * 「备份限制」的展开状态（本次界面会话）：主体重绘前从当前节点读取，新节点按它创建；
+ * toggle 事件是异步派发的，只采用当前节点的事件，已被重绘替换的旧节点晚到的事件忽略
+ */
+let limitsOpen = false;
+let limitsEl: HTMLDetailsElement | null = null;
 
 function fk<T extends HTMLElement>(key: string, el: T): T {
   focusKeys.set(el, key);
@@ -682,9 +704,11 @@ function renderBody(): void {
   const active = (document as { activeElement?: Element | null }).activeElement ?? null;
   const key = active ? focusKeys.get(active) : undefined;
   const charsScroll = charsEl?.scrollTop ?? 0;
+  if (limitsEl) limitsOpen = limitsEl.open;
   focusKeys = new WeakMap();
   focusEls = new Map();
   charsEl = null;
+  limitsEl = null;
   const t = currentTarget();
   mount(headEl, headParts(t));
   mount(bodyEl, bodyParts(t));
@@ -944,7 +968,7 @@ function catalogParts(t: Target, lock: boolean, stale: string | null): Child[] {
           : '会读取 WTF 中账号、服务器与角色的目录名称，不读取文件内容',
     }),
   ));
-  if (c?.error) out.push(h('div', { class: 'banner banner-error', text: `账号与角色读取失败：${c.error}。暂时不能按账号或角色备份，可以重新读取，或改用全部 WTF。` }));
+  if (c?.error) out.push(h('div', { class: 'banner banner-error', text: `账号与角色读取失败：${c.error}。暂时不能按账号或角色备份，处理后可以重新读取。` }));
   if (lost.length) {
     out.push(h('div', { class: 'banner banner-warn' },
       h('div', { text: '重新读取后，部分之前的选择已失效：' }),
@@ -955,7 +979,8 @@ function catalogParts(t: Target, lock: boolean, stale: string | null): Child[] {
   if (!data) return out;
   if (data.warnings.length) {
     out.push(h('div', { class: 'banner banner-warn' },
-      h('div', { text: '读取时有以下情况，相关目录不会出现在列表中（需要时可改用指定账号或全部 WTF）：' }),
+      // 每条提示自带它对各备份范围的影响；扩大范围不能绕过被跳过的条目
+      h('div', { text: '读取时有以下情况，相关条目不会出现在列表中：' }),
       h('div', { class: 'backup-lines' }, data.warnings.map((w) => h('div', { text: w }))),
     ));
   }
@@ -980,10 +1005,10 @@ function catalogParts(t: Target, lock: boolean, stale: string | null): Child[] {
 
 function characterParts(acct: BackupCatalog['accounts'][number], lock: boolean): Child[] {
   if (acct.characterError) {
-    return [h('div', { class: 'banner banner-warn', text: `这个账号的角色无法完整列出：${acct.characterError}。可以改用指定账号（完整账号目录）或全部 WTF。` })];
+    return [h('div', { class: 'banner banner-warn', text: `这个账号的角色无法完整列出：${acct.characterError}。` })];
   }
   if (acct.realms.length === 0) {
-    return [h('div', { class: 'state-box small', text: '这个账号下没有识别到角色目录。可以改用指定账号，备份完整账号目录。' })];
+    return [h('div', { class: 'state-box small', text: '这个账号下没有识别到角色目录，不能按角色备份。可以选择指定账号备份完整账号目录（上方若提示这个账号有被跳过的条目，整账号备份同样会停止）。' })];
   }
   // 跨服务器统计已选数量；达到上限后未选的角色暂不可勾选，已选的仍可取消
   const count = acct.realms.reduce((n, r) => n + r.characters.filter((ch) => sel.chars.has(charKey(r.realm, ch))).length, 0);
@@ -1062,8 +1087,14 @@ function snapshotRow(t: Target, x: BackupSnapshotInfo, active: boolean, stale: s
 
 function limitsBox(s: BackupState): HTMLElement {
   const l = s.limits;
-  return h('details', { class: 'backup-limits' },
-    h('summary', { text: '备份限制' }),
+  const el: HTMLDetailsElement = h('details', {
+    class: 'backup-limits',
+    open: limitsOpen,
+    on: { toggle: () => {
+      if (el === limitsEl) limitsOpen = el.open;
+    } },
+  },
+    fk('limits', h('summary', { text: '备份限制' })),
     h('div', { class: 'backup-meta' },
       h('div', { text: `每个保存位置最多 ${l.maxSnapshots} 份、共 ${bytesText(l.maxTotalBytes)}（全部 WTF 与按账号、角色的备份合计）；单份最多 ${bytesText(l.maxSnapshotBytes)}、${l.maxEntries} 个文件与文件夹；单个文件最多 ${bytesText(l.maxFileBytes)}。` }),
       h('div', { text: '达到上限后不能再创建备份，艾泽魔方不会自动删除旧备份；请在访达中自行整理，或更换保存位置。' }),
@@ -1071,4 +1102,6 @@ function limitsBox(s: BackupState): HTMLElement {
       h('div', { text: '所选账号或角色在读取列表后被移动、改名或删除时，本次备份会停止，不会改为备份全部 WTF；重新读取后再选择即可。' }),
     ),
   );
+  limitsEl = el;
+  return el;
 }

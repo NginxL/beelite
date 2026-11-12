@@ -1,8 +1,10 @@
 // 可选本地 WTF 配置备份：用户主动启用、选择本地位置、手动创建、重新校验、在访达中查看。
 // - 默认关闭；未启用时不访问 WTF，也不访问备份位置。不检测游戏是否运行，不提供恢复、定时、云端或自动删除。
 // - 备份位置是用户所选目录下新建的专属容器「AzerCube WTF Backup-<随机编号>」，带标记文件；不接管已有目录。
-// - 范围：全部 WTF（清单 schema 1）、单个账号或同一账号的多个角色（schema 2）。缩小范围时只在所选路径上下降，
-//   未选的账号 / 服务器 / 角色只读取名字，不 lstat、不进入；账号与角色目录列表只在已启用且用户请求时读取名称。
+// - 范围：全部 WTF（清单 schema 1）、单个账号或同一账号的多个角色（schema 2）。缩小范围时只在所选路径上下降：
+//   未选的账号、所选服务器下未选的角色只读取名字，不 lstat、不进入；按角色备份时账号目录的每个直属条目（含未选的服务器目录）
+//   都会 lstat 并严格分类，其中的链接、特殊文件、跨卷、名称不受支持或冲突同样使整份失败，未选的服务器目录只是不进入。
+//   账号与角色目录列表只在已启用且用户请求时读取名称。
 // - 所选范围内遇到符号链接、多硬链接文件、特殊文件、名称冲突或超出上限时整份失败；复制期间源发生变化直接失败，不自动重试。
 // - 发布前双向核对：重算源文件校验值，按清单完整校验本次临时目录，最后再复核源与目标的集合及每项身份 / 大小 / 时间。
 //   这些检查能发现常规的写入与替换，但不是瞬时的文件系统快照：最后一次复核与发布之间仍有极短的窗口。
@@ -15,6 +17,7 @@ import path from 'node:path';
 import type {
   BackupAnomaly,
   BackupCatalog,
+  BackupConfigResult,
   BackupLimits,
   BackupRunResult,
   BackupScope,
@@ -362,16 +365,20 @@ async function unlinkIfSame(p: string, id: string): Promise<boolean> {
   }
 }
 
-/** 排他新建 0600 文件并完整写入、fsync；失败时只删除本次创建的文件。返回文件身份 */
-async function writeNewFile(p: string, data: Uint8Array): Promise<string> {
+/**
+ * 排他新建 0600 文件并完整写入、fsync；失败时只删除本次创建的文件。返回文件身份。
+ * onCreated 在取得身份后、写入之前同步调用；身份无法确认时不删除（无法确认是本次创建的文件），在错误中说明保留
+ */
+async function writeNewFile(p: string, data: Uint8Array, onCreated?: (id: string) => void): Promise<string> {
   const fh = await open(p, CREATE_FLAGS, 0o600);
   let id: string;
   try {
     id = idOf(await fh.stat({ bigint: true }));
   } catch (err) {
     await fh.close().catch(() => undefined);
-    throw err;
+    throw withNotes(err, [`新建的文件 ${p} 无法确认身份，已保留，请在访达中检查`]);
   }
+  onCreated?.(id);
   try {
     await writeAll(fh, data);
     await fh.sync();
@@ -578,8 +585,9 @@ async function walkSubtree(base: string, rel: string, out: WalkEntry[], o: WalkO
 /**
  * 按冻结范围枚举 WTF。all 与原行为相同；其余范围每次都从 WTF 重新按名称定位，只在所选路径上下降：
  * - account：WTF、Account 为途经目录；Account/<账号> 严格完整子树。
- * - characters：Account/<账号> 的直属条目逐项严格分类（普通文件全部纳入，SavedVariables 完整子树，所选服务器作途经目录，
- *   其他目录跳过不进入）；所选服务器下只定位所选角色，角色目录严格完整子树，顶层须有识别文件（普通文件）。
+ * - characters：Account/<账号> 的直属条目（含未选的服务器目录）全部 lstat 并逐项严格分类：链接、特殊文件、跨卷、多硬链接、
+ *   名称不受支持或冲突即失败；普通文件全部纳入，SavedVariables 完整子树，所选服务器作途经目录，其他目录不进入。
+ *   所选服务器下只定位所选角色，角色目录严格完整子树，顶层须有识别文件（普通文件）。
  * 父目录总是先于子项出现在结果中。
  */
 async function walkScopedSource(wtf: string, scope: BackupScope, o: WalkOptions): Promise<WalkEntry[]> {
@@ -1009,12 +1017,12 @@ function settingsBusy(p: string): UserError {
   );
 }
 
-/** 排他创建占用标记；已存在一律保留并报错，不判断也不回收旧标记 */
-async function acquireLock(p: string, info: Record<string, unknown>, busy: (p: string) => UserError): Promise<HeldLock> {
+/** 排他创建占用标记；已存在一律保留并报错，不判断也不回收旧标记。onCreated 同 writeNewFile */
+async function acquireLock(p: string, info: Record<string, unknown>, busy: (p: string) => UserError, onCreated?: (id: string) => void): Promise<HeldLock> {
   const token = randomBytes(16).toString('hex');
   const data = Buffer.from(JSON.stringify({ format: FORMAT, kind: 'lock', token, createdAt: Date.now(), ...info }));
   try {
-    const id = await writeNewFile(p, data);
+    const id = await writeNewFile(p, data, onCreated);
     return { path: p, id, token };
   } catch (err) {
     if (errCode(err) === 'EEXIST') throw busy(p);
@@ -1071,10 +1079,11 @@ class ConfigStore {
   }
 
   /**
-   * 在跨实例排他标记内执行 load→修改→save。标记总是在收尾时释放；
-   * 已保存但标记无法释放时明确报告“设置已保存”，不当作成功也不假称未保存。
+   * 在跨实例排他标记内执行 load→修改→save。标记总是在收尾时释放（只删除本次创建的标记，外来标记一律保留）。
+   * 已保存但标记无法释放时随结果返回 warnings（设置已保存，标记保留并阻止之后的修改），不丢掉已保存的事实；
+   * 没有保存（失败或无需改动）时标记无法释放仍报错。
    */
-  async transact<T>(fn: (cfg: BackupConfig) => Promise<ConfigChange<T>>): Promise<T> {
+  async transact<T>(fn: (cfg: BackupConfig) => Promise<ConfigChange<T>>): Promise<{ value: T; warnings: string[] }> {
     const lock = await acquireLock(`${this.file}.lock`, { kind: 'settings' }, settingsBusy);
     let failure: unknown = null;
     let saved = false;
@@ -1097,10 +1106,9 @@ class ConfigStore {
     await this.step('before-lock-release').catch(() => undefined);
     const note = await releaseLock(lock);
     if (failure) throw withNotes(failure, note ? [note] : []);
-    if (note) {
-      throw new UserError(`${saved ? '备份设置已保存' : '备份设置未改变'}，但设置的占用标记未能正常释放：${note}。处理该文件之前无法再次修改备份设置`, 'backup-lock');
-    }
-    return value as T;
+    if (note && !saved) throw new UserError(`备份设置未改变，但设置的占用标记未能正常释放：${note}。处理该文件之前无法再次修改备份设置`, 'backup-lock');
+    const warnings = note ? [`备份设置已保存，但设置的占用标记未能正常释放：${note}。处理该文件之前无法再次修改备份设置`] : [];
+    return { value: value as T, warnings };
   }
 
   private async save(next: BackupConfig): Promise<void> {
@@ -1221,10 +1229,13 @@ interface ContainerScan {
 
 interface ScanContext {
   limits: BackupLimits;
-  /** 本实例正在持有的占用标记身份，不列为异常 */
-  ownLockId: string | null;
-  /** 本实例正在写入的临时目录名，计入份数与占用但不列为异常 */
-  ownPartial: string | null;
+  /**
+   * 扫描到的占用标记（abs 的 lstat 结果 st）是否为本实例正在取得或持有的那一个，按扫描到它时的实例状态与精确身份判断；
+   * 本实例正在这个位置取得标记且身份尚未确认时，等身份确认（或取得失败）后重新核对
+   */
+  ownLock(abs: string, st: BigIntStats): Promise<boolean>;
+  /** 本实例正在写入的临时目录名（扫描到该条目时）：计入份数与占用但不列为异常 */
+  ownPartial(name: string): boolean;
   lastVerify(snapshotId: string): BackupVerifyRecord | null;
   /** 备份位置登记的游戏版本；清单的 flavorId 必须与之一致 */
   flavorId: number;
@@ -1337,7 +1348,7 @@ async function scanContainer(container: string, ctx: ScanContext): Promise<Conta
       }
       if (name === LOCK_NAME) {
         if (st.isFile() && st.nlink === 1n) bytes += Number(st.size);
-        if (!st.isFile() || idOf(st) !== ctx.ownLockId) note(name, 'lock', '存在占用标记：其他艾泽魔方可能正在使用此位置，或上次备份意外中断');
+        if (!(await ctx.ownLock(abs, st))) note(name, 'lock', '存在占用标记：其他艾泽魔方可能正在使用此位置，或上次备份意外中断');
         continue;
       }
       if (st.isDirectory() && SNAPSHOT_ID_RE.test(name)) {
@@ -1353,7 +1364,7 @@ async function scanContainer(container: string, ctx: ScanContext): Promise<Conta
       const size = await measure(abs, st, ctx, budget);
       if (size === null) confirmed = false;
       else bytes += size;
-      if (isPartial && name === ctx.ownPartial) continue;
+      if (isPartial && ctx.ownPartial(name)) continue;
       if (isPartial) note(name, 'incomplete', '未完成的备份（可能是中断遗留），不能当作可用备份');
       else note(name, 'foreign', '不认识的内容，艾泽魔方不会使用或删除它');
     }
@@ -1400,6 +1411,8 @@ function catalogLimitError(what: string): UserError {
  * 有界列出 Account/<账号>/<服务器>/<角色>：只读取目录项名称并对候选做 lstat，不打开任何文件、不递归角色目录。
  * 候选角色目录只做一次浅层读取名称，识别文件按 foldKey 匹配（同名冲突则跳过该角色），唯一匹配者须是单一硬链接的普通文件。
  * 链接、跨卷、名称不受支持或冲突的条目跳过并写入提示；Account 缺失或无法读取时报错，不当作没有账号。
+ * 备份不会跳过这些条目：提示按条目所在位置说明它会使哪些范围的备份停止（与 walkScopedSource 的严格检查一致），
+ * 不把扩大范围当作通用的解决办法。
  */
 async function scanCatalog(wtf: string, limits: CatalogLimits): Promise<{ accounts: BackupCatalog['accounts']; warnings: string[] }> {
   const dev = (await lstat(wtf, { bigint: true })).dev;
@@ -1412,6 +1425,11 @@ async function scanCatalog(wtf: string, limits: CatalogLimits): Promise<{ accoun
     else hidden++;
   };
   const show = (name: string) => JSON.stringify(name.length > 64 ? `${name.slice(0, 64)}…` : name);
+  // 被跳过的条目对各范围的影响：Account 下（与账号同级）只在全部 WTF 时被遍历；账号直属条目在按角色备份时也逐项严格检查；
+  // 服务器目录下与角色目录内的条目只在整账号与全部 WTF 时被遍历
+  const AT_ACCOUNT_ROOT = '全部 WTF 备份会因此停止；按账号或角色备份其他账号不受影响';
+  const AT_ACCOUNT = '这个账号的按角色备份、整账号备份与全部 WTF 备份都会因此停止';
+  const IN_REALM = '按角色备份这个账号的其他角色不受影响；整账号备份与全部 WTF 备份会因此停止';
 
   const readNames = async (abs: string): Promise<string[]> => {
     const out: string[] = [];
@@ -1429,12 +1447,12 @@ async function scanCatalog(wtf: string, limits: CatalogLimits): Promise<{ accoun
   };
 
   /** 名称安全、不以 . 开头、同目录内 foldKey 唯一的名字（排序）；冲突与不受支持的名字写入提示 */
-  const candidates = (names: string[], where: string, exclude: string | null): string[] => {
+  const candidates = (names: string[], where: string, exclude: string | null, effect: string): string[] => {
     const groups = new Map<string, string[]>();
     for (const n of names) {
       if (n.startsWith('.')) continue;
       if (!isSafeSegment(n)) {
-        warn(`已跳过名称不受支持的条目：${where}/${show(n)}`);
+        warn(`已跳过名称不受支持的条目：${where}/${show(n)}。${effect}`);
         continue;
       }
       const k = foldKey(n);
@@ -1445,31 +1463,31 @@ async function scanCatalog(wtf: string, limits: CatalogLimits): Promise<{ accoun
     }
     const out: string[] = [];
     for (const list of groups.values()) {
-      if (list.length > 1) warn(`已跳过仅大小写或 Unicode 形式不同的同名条目：${where}/${list.map(show).join('、')}`);
+      if (list.length > 1) warn(`已跳过仅大小写或 Unicode 形式不同的同名条目：${where}/${list.map(show).join('、')}。${effect}`);
       else out.push(list[0]);
     }
     return out.sort();
   };
 
-  const kindOf = async (abs: string, label: string): Promise<'dir' | 'file' | 'skip'> => {
+  const kindOf = async (abs: string, label: string, effect: string): Promise<'dir' | 'file' | 'skip'> => {
     let st: BigIntStats;
     try {
       st = await lstat(abs, { bigint: true });
     } catch {
-      warn(`无法读取：${label}`);
+      warn(`无法读取：${label}。${effect}`);
       return 'skip';
     }
     if (st.isSymbolicLink()) {
-      warn(`已跳过符号链接：${label}`);
+      warn(`已跳过符号链接：${label}。${effect}`);
       return 'skip';
     }
     if (st.dev !== dev) {
-      warn(`已跳过位于其他磁盘卷的条目：${label}`);
+      warn(`已跳过位于其他磁盘卷的条目：${label}。${effect}`);
       return 'skip';
     }
     if (st.isDirectory()) return 'dir';
     if (st.isFile()) return 'file';
-    warn(`已跳过特殊文件：${label}`);
+    warn(`已跳过特殊文件：${label}。${effect}`);
     return 'skip';
   };
 
@@ -1479,7 +1497,7 @@ async function scanCatalog(wtf: string, limits: CatalogLimits): Promise<{ accoun
       names = await readNames(charAbs);
     } catch (err) {
       if (err instanceof CatalogStop) throw err;
-      warn(`无法读取角色目录：${label}`);
+      warn(`无法读取角色目录：${label}。${IN_REALM}`);
       return false;
     }
     const groups = new Map<string, string[]>();
@@ -1491,25 +1509,43 @@ async function scanCatalog(wtf: string, limits: CatalogLimits): Promise<{ accoun
       else groups.set(k, [n]);
     }
     if ([...groups.values()].some((l) => l.length > 1)) {
-      warn(`已跳过识别文件名称冲突的角色目录：${label}`);
+      warn(`已跳过识别文件名称冲突的角色目录：${label}。${IN_REALM}`);
       return false;
     }
-    // 所有匹配到的识别文件都必须是单一硬链接的同卷普通文件；任一不受支持则跳过（备份时整棵角色目录也会因此失败）
+    // 角色识别：所有匹配到的识别文件都必须是单一硬链接的同卷普通文件，否则跳过。识别条件与备份的安全检查分开说明：
+    // 链接、多硬链接、特殊文件、跨卷与无法读取在整账号与全部 WTF 备份时同样被拒绝；识别文件是文件夹（或已不存在）只是不能识别为角色，
+    // 整棵目录在整账号与全部 WTF 备份时按实际内容检查
     if (groups.size === 0) return false;
+    let unrecognized = false;
     for (const [n] of groups.values()) {
-      const st = await lstat(path.join(charAbs, n), { bigint: true }).catch(() => null);
-      if (!st || st.isSymbolicLink() || !st.isFile() || st.nlink !== 1n || st.dev !== dev) {
-        warn(`已跳过识别文件不受支持（链接、多硬链接、特殊文件或无法读取）的角色目录：${label}`);
+      let st: BigIntStats;
+      try {
+        st = await lstat(path.join(charAbs, n), { bigint: true });
+      } catch (err) {
+        if (errCode(err) === 'ENOENT') {
+          unrecognized = true;
+          continue;
+        }
+        warn(`已跳过识别文件无法读取的角色目录：${label}。${IN_REALM}`);
         return false;
       }
+      if (st.isSymbolicLink() || st.dev !== dev || (st.isFile() ? st.nlink !== 1n : !st.isDirectory())) {
+        warn(`已跳过识别文件不受支持（链接、多硬链接、特殊文件或位于其他磁盘卷）的角色目录：${label}。${IN_REALM}`);
+        return false;
+      }
+      if (!st.isFile()) unrecognized = true;
+    }
+    if (unrecognized) {
+      warn(`未识别为角色：${label}（识别文件不是普通文件，例如是文件夹），不能按角色选择它；整账号与全部 WTF 备份时按实际内容检查`);
+      return false;
     }
     return true;
   };
 
   const listRealms = async (acctAbs: string, label: string): Promise<Array<{ realm: string; characters: string[] }>> => {
     const realmNames: string[] = [];
-    for (const n of candidates(await readNames(acctAbs), label, SAVED_VARIABLES_KEY)) {
-      if ((await kindOf(path.join(acctAbs, n), `${label}/${show(n)}`)) !== 'dir') continue;
+    for (const n of candidates(await readNames(acctAbs), label, SAVED_VARIABLES_KEY, AT_ACCOUNT)) {
+      if ((await kindOf(path.join(acctAbs, n), `${label}/${show(n)}`, AT_ACCOUNT)) !== 'dir') continue;
       if (realmNames.length >= limits.maxRealmsPerAccount) throw new CatalogStop(`服务器超过 ${limits.maxRealmsPerAccount} 个，未列出角色，只能整账号备份`, false);
       realmNames.push(n);
     }
@@ -1522,13 +1558,13 @@ async function scanCatalog(wtf: string, limits: CatalogLimits): Promise<{ accoun
         names = await readNames(realmAbs);
       } catch (err) {
         if (err instanceof CatalogStop) throw err;
-        warn(`无法读取服务器目录：${realmLabel}`);
+        warn(`无法读取服务器目录：${realmLabel}。${IN_REALM}`);
         continue;
       }
       const characters: string[] = [];
       let directFiles = 0;
-      for (const n of candidates(names, realmLabel, SAVED_VARIABLES_KEY)) {
-        const kind = await kindOf(path.join(realmAbs, n), `${realmLabel}/${show(n)}`);
+      for (const n of candidates(names, realmLabel, SAVED_VARIABLES_KEY, IN_REALM)) {
+        const kind = await kindOf(path.join(realmAbs, n), `${realmLabel}/${show(n)}`, IN_REALM);
         if (kind === 'file') directFiles++;
         if (kind !== 'dir' || !(await hasMarker(path.join(realmAbs, n), `${realmLabel}/${show(n)}`))) continue;
         if (characters.length >= limits.maxCharactersPerRealm) throw new CatalogStop(`服务器 ${show(realm)} 的角色超过 ${limits.maxCharactersPerRealm} 个，只能整账号备份`, false);
@@ -1549,18 +1585,27 @@ async function scanCatalog(wtf: string, limits: CatalogLimits): Promise<{ accoun
     } catch (err) {
       if (err instanceof CatalogStop) throw catalogLimitError(`读取的目录项超过 ${limits.maxNames} 个`);
       const c = errCode(err);
-      throw new UserError(`无法读取 ${what}${c ? `（${c}）` : ''}，无法列出账号；可改用全部 WTF 备份`, 'backup-catalog');
+      throw new UserError(`无法读取 ${what}${c ? `（${c}）` : ''}，无法列出账号；全部 WTF 备份同样需要读取它，请先在访达中检查权限`, 'backup-catalog');
     }
   };
   const hits = (await readTop(wtf, 'WTF 目录')).filter((n) => foldKey(n) === ACCOUNT_KEY);
-  if (hits.length > 1) throw new UserError('WTF 中有多个仅大小写或 Unicode 形式不同的 Account 目录，无法确定账号目录；可改用全部 WTF 备份', 'backup-catalog');
+  if (hits.length > 1) throw new UserError('WTF 中有多个仅大小写或 Unicode 形式不同的 Account 目录，无法确定账号目录；全部 WTF 备份也会因同名冲突停止，请先在访达中处理', 'backup-catalog');
   if (hits.length === 0) throw new UserError('WTF 中没有 Account 目录，未发现账号；可改用全部 WTF 备份', 'backup-catalog');
   const accountRoot = path.join(wtf, hits[0]);
   const ast = await lstat(accountRoot, { bigint: true });
-  if (ast.isSymbolicLink() || !ast.isDirectory() || ast.dev !== dev) throw new UserError('WTF/Account 不是同一磁盘上的普通文件夹，无法列出账号；可改用全部 WTF 备份', 'backup-catalog');
+  // 链接、跨卷、特殊文件与多硬链接的普通文件在全部 WTF 备份时同样被拒绝；只有它是单一硬链接的普通文件（没有账号目录）时全部 WTF 可用
+  const bad = ast.isSymbolicLink()
+    ? '是符号链接'
+    : ast.dev !== dev
+      ? '位于其他磁盘卷'
+      : ast.isFile()
+        ? ast.nlink !== 1n ? '有多个硬链接' : null
+        : !ast.isDirectory() ? '是特殊文件' : null;
+  if (bad) throw new UserError(`WTF/Account ${bad}，无法列出账号；全部 WTF 备份也会因此停止，请先在访达中检查`, 'backup-catalog');
+  if (!ast.isDirectory()) throw new UserError('WTF/Account 不是文件夹，没有可列出的账号；可改用全部 WTF 备份', 'backup-catalog');
   const accountNames: string[] = [];
-  for (const n of candidates(await readTop(accountRoot, 'Account 目录'), hits[0], SAVED_VARIABLES_KEY)) {
-    if ((await kindOf(path.join(accountRoot, n), `${hits[0]}/${show(n)}`)) !== 'dir') continue;
+  for (const n of candidates(await readTop(accountRoot, 'Account 目录'), hits[0], SAVED_VARIABLES_KEY, AT_ACCOUNT_ROOT)) {
+    if ((await kindOf(path.join(accountRoot, n), `${hits[0]}/${show(n)}`, AT_ACCOUNT_ROOT)) !== 'dir') continue;
     if (accountNames.length >= limits.maxAccounts) throw catalogLimitError(`账号超过 ${limits.maxAccounts} 个`);
     accountNames.push(n);
   }
@@ -1580,7 +1625,7 @@ async function scanCatalog(wtf: string, limits: CatalogLimits): Promise<{ accoun
         accounts.push({ account, realms: [], characterError: err.message });
       } else {
         const c = errCode(err);
-        accounts.push({ account, realms: [], characterError: `无法读取该账号目录${c ? `（${c}）` : ''}，只能整账号备份` });
+        accounts.push({ account, realms: [], characterError: `无法读取该账号目录${c ? `（${c}）` : ''}，这个账号的按角色备份与整账号备份都无法进行，请先在访达中检查权限` });
       }
     }
   }
@@ -1635,6 +1680,11 @@ export class WtfBackupService {
   private lastEmit = 0;
   /** 本实例在某个备份位置持有的占用标记与临时目录，state 据此不把它们列为异常 */
   private held: { container: string; lockId: string; partial: string | null } | null = null;
+  /**
+   * 本实例正在某个备份位置取得占用标记（排他创建到写入、fsync 完成之间）：id 在取得文件身份后登记；
+   * identified 在身份确认或取得失败时完成。取得成功时先登记 held 再清除这里，两者之间没有空档
+   */
+  private acquiring: { container: string; id: string | null; identified: Promise<void> } | null = null;
   /** 本次运行期间的校验结果（备份位置 + 编号）；不持久化 */
   private readonly verified = new Map<string, BackupVerifyRecord>();
 
@@ -1844,11 +1894,11 @@ export class WtfBackupService {
    * 取得设置标记后、创建前与提交前都复核当前绑定与所选目录各级身份；新容器按已存在位置再做一次位置检查。
    * 只对当前 flavor + 当前绑定目录生效；用户取消选择时 main 不调用本方法。不读取 WTF。
    */
-  async configure(flavorId: number, expectedRoot: string, pickedParent: string): Promise<BackupState> {
+  async configure(flavorId: number, expectedRoot: string, pickedParent: string): Promise<BackupConfigResult> {
     const f = flavorArg(flavorId);
     const expected = pathArg(expectedRoot, '目标目录');
     const picked = pathArg(pickedParent, '保存位置');
-    await this.exclusiveConfig(async () => {
+    const saved = await this.exclusiveConfig(async () => {
       const root = await this.checkTarget(f, expected);
       let parent: string;
       try {
@@ -1865,7 +1915,7 @@ export class WtfBackupService {
         const now = await chainIds(parent).catch(() => null);
         if (!now || !sameChain(now, parentChain)) throw parentMoved();
       };
-      await this.config.transact(async (cfg): Promise<ConfigChange<undefined>> => {
+      return this.config.transact(async (cfg): Promise<ConfigChange<TargetRecord>> => {
         await this.checkTarget(f, expected);
         await checkParent();
         await this.step('configure-before-create');
@@ -1901,34 +1951,52 @@ export class WtfBackupService {
           const cchain = await chainIds(container).catch(() => null);
           if (!cchain || cchain[0] !== idOf(cst) || !sameChain(cchain.slice(1), parentChain)) throw parentMoved();
           await this.assertLocation(container, root, true);
+          const rec: TargetRecord = { flavorId: f, root, enabled: true, containerPath: container, containerId, createdAt };
           const targets = cfg.targets.filter((t) => !(t.flavorId === f && t.root === root));
-          targets.push({ flavorId: f, root, enabled: true, containerPath: container, containerId, createdAt });
+          targets.push(rec);
           if (targets.length > MAX_TARGETS) throw new UserError('备份记录过多，未保存', 'backup-limit');
-          return { next: { ...cfg, targets }, value: undefined, undo };
+          return { next: { ...cfg, targets }, value: rec, undo };
         } catch (err) {
           const left = await undo().catch(() => `未启用备份；新建的备份位置已保留于 ${container}，请在访达中检查后自行处理`);
           throw withNotes(err, left ? [left] : []);
         }
       });
     });
-    return this.state(f, expected);
+    return this.configResult(f, saved.value.root, true, saved.value.containerPath, saved.warnings);
   }
 
   /** 关闭当前目录的备份：只改设置，不访问 WTF，不删除任何备份。取得设置标记后复核绑定 */
-  async disable(flavorId: number, expectedRoot: string): Promise<BackupState> {
+  async disable(flavorId: number, expectedRoot: string): Promise<BackupConfigResult> {
     const f = flavorArg(flavorId);
     const expected = pathArg(expectedRoot, '目标目录');
-    await this.exclusiveConfig(async () => {
+    const saved = await this.exclusiveConfig(async () => {
       await this.checkTarget(f, expected);
-      await this.config.transact(async (cfg): Promise<ConfigChange<undefined>> => {
+      return this.config.transact(async (cfg): Promise<ConfigChange<{ root: string; containerPath: string | null }>> => {
         const root = await this.checkTarget(f, expected);
         const rec = cfg.targets.find((t) => t.flavorId === f && t.root === root);
-        if (!rec || !rec.enabled) return { next: null, value: undefined };
+        if (!rec || !rec.enabled) return { next: null, value: { root, containerPath: rec?.containerPath ?? null } };
         const targets = cfg.targets.map((t) => (t === rec ? { ...t, enabled: false } : t));
-        return { next: { ...cfg, targets }, value: undefined };
+        return { next: { ...cfg, targets }, value: { root, containerPath: rec.containerPath } };
       });
     });
-    return this.state(f, expected);
+    return this.configResult(f, saved.value.root, false, saved.value.containerPath, saved.warnings);
+  }
+
+  /**
+   * 设置已保存之后：再读取一次原目录的状态（不改变已保存的事实）。设置或备份位置读取失败由 state 自身返回 unavailable；
+   * 只有无法确认原目录仍是当前绑定（绑定已变化或无法读取绑定）时 state 为 null，stateError 按“保存后读取状态”说明，
+   * 不沿用“未做任何改动”的目标错误
+   */
+  private async configResult(f: number, root: string, enabled: boolean, containerPath: string | null, warnings: string[]): Promise<BackupConfigResult> {
+    const base = { flavorId: f, root, enabled, containerPath, warnings };
+    try {
+      return { ...base, state: await this.state(f, root), stateError: null };
+    } catch (err) {
+      const stateError = err instanceof UserError && err.code === 'target'
+        ? '保存之后，这个游戏版本绑定的目录已变更，没有读取原目录当前的备份状态'
+        : `保存之后无法确认当前绑定的游戏目录，没有读取备份状态：${errorMessage(err)}`;
+      return { ...base, state: null, stateError };
+    }
   }
 
   // ---------- 状态 ----------
@@ -1937,12 +2005,55 @@ export class WtfBackupService {
     return this.active ? { ...this.active.info } : null;
   }
 
+  /** 本实例此刻在 container 中正在取得或持有的占用标记身份 */
+  private ownLockId(container: string): string | null {
+    if (this.held?.container === container) return this.held.lockId;
+    if (this.acquiring?.container === container) return this.acquiring.id;
+    return null;
+  }
+
+  /**
+   * 占用标记是否属于本实例：本实例正在这个位置取得标记、身份尚未确认时，等确认后重新 lstat 核对同一个文件（不等写入与 fsync）；
+   * 之后按此刻登记的精确身份判断。不因有进行中的任务就认领任何标记
+   */
+  private async isOwnLock(container: string, abs: string, st: BigIntStats): Promise<boolean> {
+    if (!st.isFile()) return false;
+    const a = this.acquiring;
+    if (a && a.container === container && a.id === null) {
+      await a.identified;
+      const again = await lstat(abs, { bigint: true }).catch(() => null);
+      if (!again || !again.isFile() || idOf(again) !== idOf(st)) return false;
+    }
+    return idOf(st) === this.ownLockId(container);
+  }
+
+  /**
+   * 在 container 中取得任务的占用标记：从排他创建之前到 held 登记之间，扫描能识别它；取得失败时清除登记
+   * （写入失败时本次创建的文件已删除；身份未能确认时文件保留，扫描会把它列为异常）
+   */
+  private async acquireTaskLock(container: string, info: Record<string, unknown>): Promise<HeldLock> {
+    let settle!: () => void;
+    const identified = new Promise<void>((r) => (settle = r));
+    const a = { container, id: null as string | null, identified };
+    this.acquiring = a;
+    try {
+      const lock = await acquireLock(path.join(container, LOCK_NAME), info, locationBusy, (id) => {
+        a.id = id;
+        settle();
+      });
+      this.held = { container, lockId: lock.id, partial: null };
+      return lock;
+    } finally {
+      if (this.acquiring === a) this.acquiring = null;
+      settle();
+    }
+  }
+
   private scanCtx(container: string, flavorId: number, signal?: AbortSignal): ScanContext {
-    const held = this.held && this.held.container === container ? this.held : null;
     return {
       limits: this.limits,
-      ownLockId: held?.lockId ?? null,
-      ownPartial: held?.partial ?? null,
+      ownLock: (abs, st) => this.isOwnLock(container, abs, st),
+      ownPartial: (name) => this.held?.container === container && this.held.partial === name,
       lastVerify: (id) => this.verified.get(this.verifyKey(container, id)) ?? null,
       flavorId,
       signal,
@@ -2030,8 +2141,7 @@ export class WtfBackupService {
     const ctr = await this.openContainer(rec, signal);
     await this.assertLocation(ctr.path, root, true);
     throwIfAborted(signal);
-    const lock = await acquireLock(path.join(ctr.path, LOCK_NAME), { taskKind: 'run', taskId: info.id, appVersion: this.opts.appVersion }, locationBusy);
-    this.held = { container: ctr.path, lockId: lock.id, partial: null };
+    const lock = await this.acquireTaskLock(ctr.path, { taskKind: 'run', taskId: info.id, appVersion: this.opts.appVersion });
     const box: { partial: PartialTracker | null } = { partial: null };
     let snapshot: BackupSnapshotInfo | null = null;
     let failure: unknown = null;
@@ -2300,8 +2410,7 @@ export class WtfBackupService {
     // 与备份相同的位置保护：在写入占用标记之前拒绝已位于游戏目录或应用数据目录内（或包含它们）的位置
     await this.assertLocation(ctr.path, root, true);
     throwIfAborted(signal);
-    const lock = await acquireLock(path.join(ctr.path, LOCK_NAME), { taskKind: 'verify', taskId: info.id, appVersion: this.opts.appVersion }, locationBusy);
-    this.held = { container: ctr.path, lockId: lock.id, partial: null };
+    const lock = await this.acquireTaskLock(ctr.path, { taskKind: 'verify', taskId: info.id, appVersion: this.opts.appVersion });
     let out: { ok: boolean; reason: string | null; files: number; bytes: number } | null = null;
     let failure: unknown = null;
     try {

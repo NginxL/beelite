@@ -1,13 +1,13 @@
 // 主进程与界面之间传递的数据结构。界面只拿到这些已规范化的对象，不接触路径之外的系统能力。
 
-import type { BackupCatalog, BackupRunResult, BackupScope, BackupState, BackupTaskInfo, BackupVerifyResult } from './backup-types';
+import type { BackupCatalog, BackupConfigResult, BackupRunResult, BackupScope, BackupState, BackupTaskInfo, BackupVerifyResult } from './backup-types';
 import type { HealthReport } from './health-types';
 
 /** 只读插件健康检查的结果类型 */
 export type { HealthIssue, HealthIssueKind, HealthReport, HealthSeverity, HealthStatus, HealthUnavailableReason } from './health-types';
 /** 可选本地 WTF 配置备份的数据类型 */
 export type {
-  BackupAnomaly, BackupAnomalyKind, BackupCatalog, BackupLimits, BackupPhase, BackupRunResult, BackupScope, BackupSnapshotInfo, BackupSnapshotStatus, BackupState,
+  BackupAnomaly, BackupAnomalyKind, BackupCatalog, BackupConfigResult, BackupLimits, BackupPhase, BackupRunResult, BackupScope, BackupSnapshotInfo, BackupSnapshotStatus, BackupState,
   BackupStatus, BackupTaskInfo, BackupTaskKind, BackupUsage, BackupVerifyRecord, BackupVerifyResult,
 } from './backup-types';
 
@@ -150,6 +150,26 @@ export interface DirState {
   message: string | null;
 }
 
+/**
+ * 已提交操作之后的清理（回收站中登记永久删除的条目、下载暂存）尚未完成；不影响插件列表与写操作，
+ * 每次刷新本地状态或写入这个目录时自动重试
+ */
+export interface CleanupState {
+  /**
+   * 本次是否实际执行了清理。false：目录暂停写入等原因没有执行，pending 只是清单中登记的待删除数，磁盘上是否还有内容尚未确认
+   */
+  checked: boolean;
+  /**
+   * 已申请永久删除（已从回收站注销、不能再恢复）但尚未清理完成的条目数：checked 时是本次删除失败的条目（可能已删除一部分），
+   * 否则是清单中登记的待删除数
+   */
+  pending: number;
+  /** 已从磁盘删除、但待删除记录还没能保存的条目数（下次清理时确认移除） */
+  unsaved: number;
+  /** 最近一次清理遇到的问题（条数有上限） */
+  problems: string[];
+}
+
 export interface LocalState {
   flavorId: number;
   profile: ProfileInfo;
@@ -157,6 +177,8 @@ export interface LocalState {
   managed: ManagedProjectView[];
   unmanaged: LocalFolder[];
   recovery: RecoveryEntryView[];
+  /** 没有待清理内容（或目录尚无艾泽魔方数据）时为 null */
+  cleanup: CleanupState | null;
   error: string | null;
 }
 
@@ -480,10 +502,13 @@ export interface BeeLiteApi {
   onBackupTask(cb: (s: BackupTaskSnapshot) => void): () => void;
   /** 只读：未启用时只读备份设置；已启用时扫描已登记的备份位置，不读取 WTF */
   backupState(flavorId: number, root: string): Promise<BackupState>;
-  /** 主进程弹出文件夹选择框并在其中新建备份位置后启用；用户取消选择时返回 null，不做任何改动 */
-  backupConfigure(flavorId: number, root: string): Promise<BackupState | null>;
-  /** 关闭该目录的备份：只改设置，不删除已有备份 */
-  backupDisable(flavorId: number, root: string): Promise<BackupState>;
+  /**
+   * 主进程弹出文件夹选择框并在其中新建备份位置后启用；用户取消选择时返回 null，不做任何改动。
+   * 返回即表示设置已保存；保存前的失败一律报错
+   */
+  backupConfigure(flavorId: number, root: string): Promise<BackupConfigResult | null>;
+  /** 关闭该目录的备份：只改设置，不删除已有备份；返回即表示设置已保存（或本来就未启用） */
+  backupDisable(flavorId: number, root: string): Promise<BackupConfigResult>;
   /**
    * 只读：列出当前目录 WTF/Account 下的账号、服务器与角色（只看目录名称与元数据，不读取文件内容）。
    * 只在已启用且用户点击“读取账号与角色”时调用；结果只在内存中，不能当作备份授权

@@ -59,7 +59,7 @@ await h.settings.bind(F, A);
 const picked = path.join(base, 'pick');
 await mkdir(picked);
 h.stub.pick = picked;
-assert.equal((await h.api.backupConfigure(F, A)).status, 'ready');
+assert.equal((await h.api.backupConfigure(F, A)).state.status, 'ready');
 h.stub.pick = null;
 
 // 配置加载停住，直到测试放行

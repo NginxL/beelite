@@ -96,16 +96,23 @@ export function renderHistory(t: Target): HTMLElement {
     mount(box, note, h('div', { class: 'state-box' }, spinner(), h('div', { text: '正在读取操作记录…' })));
     return box;
   }
+  // 同一目标再次读取失败：保留上次的记录供查看，并说明它可能已过时
+  const stale = errorKey === key && error
+    ? h('div', { class: 'banner banner-warn' },
+      h('span', { text: `刷新操作记录失败，显示的是上次结果：${error}` }),
+      h('button', { class: 'btn btn-sm', disabled: loading, on: { click: () => void loadHistory(t) } }, loading ? '读取中' : '重试'),
+    )
+    : null;
   const entries = view?.entries ?? [];
   if (entries.length === 0) {
-    mount(box, note, h('div', { class: 'state-box' },
+    mount(box, note, stale, h('div', { class: 'state-box' },
       h('div', { class: 'empty-hex' }),
       h('div', { class: 'state-title', text: '还没有操作记录' }),
       h('div', { class: 'state-msg', text: '安装、更新、卸载、恢复、暂停更新等操作会记录在这里。' }),
     ));
     return box;
   }
-  mount(box, note, h('div', { class: 'row-list' }, entries.map(entryRow)));
+  mount(box, note, stale, h('div', { class: 'row-list' }, entries.map(entryRow)));
   return box;
 }
 
