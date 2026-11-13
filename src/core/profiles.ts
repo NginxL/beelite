@@ -22,8 +22,11 @@ function settingsError(file: string, reason: string): UserError {
   return new UserError(`无法读取艾泽魔方设置文件（${file}）：${reason}。为避免覆盖已有的目录绑定，已暂停读取和修改绑定；请修复该文件或恢复备份后点击重试。`, 'settings');
 }
 
-/** 严格校验设置内容：任何不合法之处都报错，不丢弃条目（否则保存时会悄悄删掉它们） */
-function parseSettings(text: string, file: string): Settings {
+/**
+ * 严格校验设置内容：任何不合法之处都报错，不丢弃条目（否则保存时会悄悄删掉它们）。
+ * 诊断报告复用它做有界读取后的校验；错误说明含文件路径，诊断只取“是否失败”，不使用 message。
+ */
+export function parseSettings(text: string, file: string): Settings {
   let raw: unknown;
   try {
     raw = JSON.parse(text);

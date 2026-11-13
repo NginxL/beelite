@@ -88,6 +88,14 @@ const api: BeeLiteApi = {
   backupVerify: (flavorId, root, snapshotId) => invoke('backup:verify', flavorId, root, snapshotId),
   backupCancel: (taskId, flavorId, root) => invoke('backup:cancel', taskId, flavorId, root),
   backupReveal: (flavorId, root, snapshotId) => invoke('backup:reveal', flavorId, root, snapshotId),
+  // WTF 恢复：只传游戏版本、期望目录、备份编号、凭证、恢复编号与固定确认；取消沿用 backupCancel
+  backupRestorePreview: (flavorId, root, snapshotId) => invoke('restore:preview', flavorId, root, snapshotId),
+  backupRestoreApply: (token, ack) => invoke('restore:apply', token, ack),
+  backupRestorePending: () => invoke('restore:pending'),
+  backupRestoreResolve: (txid, ack) => invoke('restore:resolve', txid, ack),
+  // 诊断报告：只传游戏版本与模式、凭证；窗口身份与保存位置都由主进程决定
+  diagnosticPreview: (req) => invoke('diagnostic:preview', req),
+  diagnosticSave: (token) => invoke('diagnostic:save', token),
 };
 
 contextBridge.exposeInMainWorld('beelite', api);

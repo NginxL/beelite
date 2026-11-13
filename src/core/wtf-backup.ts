@@ -32,7 +32,7 @@ import type {
   CatalogLimits,
 } from '../shared/backup-types';
 import { MAX_BACKUP_SCOPE_CHARACTERS as MAX_SCOPE_CHARACTERS } from '../shared/backup-types';
-import { errorMessage, UserError } from './errors';
+import { errorMessage, SimulatedCrash, UserError } from './errors';
 import { writeAll } from './fsio';
 import { syncDir } from './layout';
 import { foldKey, isSafeSegment } from './paths';
@@ -60,8 +60,8 @@ export const DEFAULT_CATALOG_LIMITS: Readonly<CatalogLimits> = Object.freeze({
 });
 
 /** 固定目录名与角色识别文件名：按 foldKey 唯一匹配 */
-const ACCOUNT_KEY = foldKey('Account');
-const SAVED_VARIABLES_KEY = foldKey('SavedVariables');
+export const ACCOUNT_KEY = foldKey('Account');
+export const SAVED_VARIABLES_KEY = foldKey('SavedVariables');
 const CHARACTER_MARKER_KEYS: ReadonlySet<string> = new Set(['AddOns.txt', 'bindings-cache.wtf', 'config-cache.wtf'].map(foldKey));
 
 export const CONTAINER_PREFIX = 'AzerCube WTF Backup-';
@@ -72,6 +72,8 @@ export const PARTIAL_PREFIX = '.partial-';
 export const SNAPSHOT_ID_RE = /^\d{8}-\d{6}-[0-9a-f]{8}$/;
 const CONTAINER_ID_RE = /^[0-9a-f]{16}$/;
 const FORMAT = 'azercube-wtf-backup';
+/** 备份位置中标记、清单与占用标记的格式名 */
+export const BACKUP_FORMAT = FORMAT;
 /** 访达浏览时可能自行生成；未列入清单的这类普通文件不视为改动，但计入占用（链接、特殊文件、多硬链接照常拒绝） */
 const IGNORED_FILE = '.DS_Store';
 const MAX_SETTINGS_BYTES = 1 * MiB;
@@ -79,13 +81,13 @@ const MAX_MARKER_BYTES = 64 * 1024;
 const MAX_LOCK_BYTES = 4096;
 const MAX_TARGETS = 64;
 /** 快照目录除 WTF 内容外允许的额外条目（WTF 目录、清单与访达文件） */
-const SNAPSHOT_EXTRA_ENTRIES = 64;
+export const SNAPSHOT_EXTRA_ENTRIES = 64;
 /** 备份位置顶层的固定条目预算（标记、占用标记、访达文件与少量异常项） */
 const CONTAINER_FIXED_ENTRIES = 64;
 const CHUNK = 1 * MiB;
 const PROGRESS_INTERVAL_MS = 200;
-const READ_FLAGS = constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK;
-const CREATE_FLAGS = constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW;
+export const READ_FLAGS = constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK;
+export const CREATE_FLAGS =constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW;
 
 export type BackupStep =
   | 'source-enumerate'
@@ -128,15 +130,15 @@ type StepFn = (name: BackupStep, detail?: string) => Promise<void>;
 
 // ---------- 通用工具 ----------
 
-function errCode(err: unknown): string | undefined {
+export function errCode(err: unknown): string | undefined {
   return (err as NodeJS.ErrnoException | null)?.code;
 }
 
-function idOf(st: BigIntStats): string {
+export function idOf(st: BigIntStats): string {
   return `${st.dev}:${st.ino}`;
 }
 
-function sameStat(a: BigIntStats, b: BigIntStats): boolean {
+export function sameStat(a: BigIntStats, b: BigIntStats): boolean {
   return a.dev === b.dev && a.ino === b.ino && a.size === b.size && a.mtimeNs === b.mtimeNs && a.ctimeNs === b.ctimeNs;
 }
 
@@ -170,7 +172,7 @@ function newTaskId(): string {
   return `${Date.now().toString(36)}-${randomBytes(4).toString('hex')}`;
 }
 
-function newSnapshotId(now: Date): string {
+export function newSnapshotId(now: Date): string {
   const p = (n: number) => String(n).padStart(2, '0');
   const date = `${now.getUTCFullYear()}${p(now.getUTCMonth() + 1)}${p(now.getUTCDate())}`;
   const time = `${p(now.getUTCHours())}${p(now.getUTCMinutes())}${p(now.getUTCSeconds())}`;
@@ -195,7 +197,7 @@ function resolveCatalogLimits(over: Partial<CatalogLimits> | undefined): Catalog
 
 // ---------- 备份范围 ----------
 
-const ALL_SCOPE: BackupScope = Object.freeze({ kind: 'all' as const });
+export const ALL_SCOPE: BackupScope = Object.freeze({ kind: 'all' as const });
 
 function scopeError(reason: string): UserError {
   return new UserError(`备份范围无效（${reason}），请重新读取账号与角色后再试`, 'backup-scope');
@@ -278,7 +280,7 @@ function cancelledError(): UserError {
   return new UserError('备份任务已取消', 'backup-cancelled');
 }
 
-function isCancelled(err: unknown): boolean {
+export function isCancelled(err: unknown): boolean {
   return err instanceof UserError && err.code === 'backup-cancelled';
 }
 
@@ -286,7 +288,7 @@ function isScanLimit(err: unknown): boolean {
   return err instanceof UserError && err.code === 'backup-scan-limit';
 }
 
-function throwIfAborted(signal: AbortSignal | undefined): void {
+export function throwIfAborted(signal: AbortSignal | undefined): void {
   if (signal?.aborted) throw cancelledError();
 }
 
@@ -307,7 +309,7 @@ function limitError(what: string, limit: number, unit: 'bytes' | 'count'): UserE
   return new UserError(`超出${what}上限（${shown}），本次备份未完成。艾泽魔方不会自动删除旧备份，请在访达中整理或另选位置`, 'backup-limit');
 }
 
-function withNotes(err: unknown, notes: string[]): unknown {
+export function withNotes(err: unknown, notes: string[]): unknown {
   if (notes.length === 0) return err;
   const code = err instanceof UserError ? err.code : 'backup-failed';
   return new UserError(`${errorMessage(err)}。${notes.join('。')}`, code);
@@ -317,7 +319,7 @@ function withNotes(err: unknown, notes: string[]): unknown {
  * 读取小型元数据文件：不跟随符号链接，拒绝非普通文件与多硬链接文件；打开后分块读取，超过上限立即停止（不信任打开前的大小）；
  * 读取前后 fstat 必须一致。不存在返回 null。
  */
-async function readMeta(p: string, max: number, label: string, signal?: AbortSignal): Promise<{ data: Buffer; st: BigIntStats } | null> {
+export async function readMeta(p: string, max: number, label: string, signal?: AbortSignal): Promise<{ data: Buffer; st: BigIntStats } | null> {
   let fh: FileHandle;
   try {
     fh = await open(p, READ_FLAGS);
@@ -354,7 +356,7 @@ async function readBounded(p: string, max: number, label: string, signal?: Abort
 }
 
 /** 删除文件，但仅当它仍是指定身份的普通文件 */
-async function unlinkIfSame(p: string, id: string): Promise<boolean> {
+export async function unlinkIfSame(p: string, id: string): Promise<boolean> {
   try {
     const st = await lstat(p, { bigint: true });
     if (!st.isFile() || idOf(st) !== id) return false;
@@ -392,7 +394,7 @@ async function writeNewFile(p: string, data: Uint8Array, onCreated?: (id: string
 }
 
 /** 规范路径自身及各级父目录的身份（由近及远）；任何一级是链接或非目录即失败 */
-async function chainIds(real: string): Promise<string[]> {
+export async function chainIds(real: string): Promise<string[]> {
   const ids: string[] = [];
   let cur = real;
   for (;;) {
@@ -405,13 +407,13 @@ async function chainIds(real: string): Promise<string[]> {
   }
 }
 
-function sameChain(a: string[], b: string[]): boolean {
+export function sameChain(a: readonly string[], b: readonly string[]): boolean {
   return a.length === b.length && a.every((id, i) => id === b[i]);
 }
 
 // ---------- 有界目录枚举 ----------
 
-interface WalkEntry {
+export interface WalkEntry {
   /** 相对 base，以 / 分隔 */
   rel: string;
   kind: 'dir' | 'file';
@@ -420,7 +422,7 @@ interface WalkEntry {
   pass?: boolean;
 }
 
-interface WalkOptions {
+export interface WalkOptions {
   maxEntries: number;
   maxDepth: number;
   /** 普通文件 nlink > 1 时失败（目录不检查） */
@@ -439,7 +441,7 @@ function scanLimitError(): UserError {
  * 逐条读取目录（opendir），读到即计入预算；拒绝符号链接、特殊文件、跨卷目录、不安全名称与同目录内的大小写 / Unicode 冲突。
  * 父目录总是先于其子项出现在结果中。
  */
-async function walkTree(base: string, o: WalkOptions): Promise<WalkEntry[]> {
+export async function walkTree(base: string, o: WalkOptions): Promise<WalkEntry[]> {
   const baseSt = await lstat(base, { bigint: true });
   if (baseSt.isSymbolicLink() || !baseSt.isDirectory()) throw unsupported(o.label, '.', '不是普通文件夹');
   const out: WalkEntry[] = [];
@@ -501,7 +503,7 @@ function sumFileBytes(entries: WalkEntry[]): number {
  * 两次枚举是否完全一致（集合、类型、每项身份 / 大小 / 时间）；返回第一处不同的相对路径。
  * 途经目录只比较身份与类型：其下未选兄弟的增删会改变目录时间，但不属于所选范围的变化。
  */
-function walkDiff(a: WalkEntry[], b: WalkEntry[]): string | null {
+export function walkDiff(a: readonly WalkEntry[], b: readonly WalkEntry[]): string | null {
   const prev = new Map(a.map((e) => [e.rel, e]));
   for (const e of b) {
     const p = prev.get(e.rel);
@@ -693,7 +695,7 @@ async function walkScopedSource(wtf: string, scope: BackupScope, o: WalkOptions)
 }
 
 /** 读取并计算校验值；超过 limit 字节立即以 onOver 的错误停止 */
-async function hashHandle(fh: FileHandle, limit: number, onOver: () => UserError, signal: AbortSignal | undefined, onChunk?: (chunk: Buffer) => Promise<void> | void): Promise<{ hex: string; bytes: number }> {
+export async function hashHandle(fh: FileHandle, limit: number, onOver: () => UserError, signal: AbortSignal | undefined, onChunk?: (chunk: Buffer) => Promise<void> | void): Promise<{ hex: string; bytes: number }> {
   const hash = createHash('sha256');
   const buf = Buffer.allocUnsafe(CHUNK);
   let bytes = 0;
@@ -737,7 +739,7 @@ async function openSourceFile(abs: string, rel: string, expect: BigIntStats): Pr
  * 按清单读取已写出的备份文件：必须是单一硬链接的普通文件，大小与清单一致，
  * 身份 / 时间与枚举时（expect）一致，读完后 fstat 仍一致
  */
-async function hashStoredFile(abs: string, rel: string, size: number, expect: BigIntStats, signal: AbortSignal | undefined, onBytes?: (n: number) => void): Promise<string> {
+export async function hashStoredFile(abs: string, rel: string, size: number, expect: BigIntStats, signal: AbortSignal | undefined, onBytes?: (n: number) => void): Promise<string> {
   const mismatch = (what: string) => new UserError(`「${rel}」${what}`, 'backup-mismatch');
   let fh: FileHandle;
   try {
@@ -765,7 +767,9 @@ async function hashStoredFile(abs: string, rel: string, size: number, expect: Bi
 
 // ---------- 清单 ----------
 
-interface ManifestEntry {
+export type { SnapshotManifest };
+
+export interface ManifestEntry {
   path: string;
   type: 'dir' | 'file';
   size?: number;
@@ -788,6 +792,9 @@ interface SnapshotManifest {
   entries: ManifestEntry[];
   /** schema 1 视为 all */
   scope: BackupScope;
+  /** 恢复前自动生成的完整备份：用途与所属恢复编号（可选；旧版本读取时忽略） */
+  purpose?: 'pre-restore';
+  restoreTx?: string;
 }
 
 /** 写入格式：完整 WTF 仍写 schema 1（不含 scope，0.2.0 可读），缩小范围写 schema 2 并带 scope */
@@ -804,7 +811,7 @@ function badManifest(reason: string): UserError {
  * schema 2 的范围约束：每个条目都落在范围允许的区域内，且账号、所选服务器、所选角色目录与角色识别文件都存在。
  * 固定目录名 Account / SavedVariables / 识别文件按 foldKey 匹配；所选名称逐字节相等。返回第一处问题。
  */
-function scopeEntriesProblem(scope: BackupScope, entries: ManifestEntry[]): string | null {
+export function scopeEntriesProblem(scope: BackupScope, entries: readonly ManifestEntry[]): string | null {
   if (scope.kind === 'all') return null;
   const realms = new Set(scope.kind === 'characters' ? scope.characters.map((c) => c.realm) : []);
   const pairs = new Set(scope.kind === 'characters' ? scope.characters.map((c) => `${c.realm}/${c.character}`) : []);
@@ -848,7 +855,7 @@ function scopeEntriesProblem(scope: BackupScope, entries: ManifestEntry[]): stri
   return null;
 }
 
-function parseManifest(buf: Buffer, expectedId: string, limits: BackupLimits): SnapshotManifest {
+export function parseManifest(buf: Buffer, expectedId: string, limits: BackupLimits): SnapshotManifest {
   let raw: unknown;
   try {
     raw = JSON.parse(buf.toString('utf8'));
@@ -904,7 +911,13 @@ function parseManifest(buf: Buffer, expectedId: string, limits: BackupLimits): S
   if (files !== raw.fileCount || dirs !== raw.dirCount || total !== raw.totalBytes || total > limits.maxSnapshotBytes) throw badManifest('统计与条目不符');
   const problem = scopeEntriesProblem(scope, entries);
   if (problem) throw badManifest(`条目与范围不符：${problem}`);
-  return { format: FORMAT, kind: 'snapshot', schema: raw.schema === 2 ? 2 : 1, snapshotId: expectedId, createdAt: raw.createdAt, appVersion: raw.appVersion, flavorId: raw.flavorId, fileCount: files, dirCount: dirs, totalBytes: total, entries, scope };
+  const out: SnapshotManifest = { format: FORMAT, kind: 'snapshot', schema: raw.schema === 2 ? 2 : 1, snapshotId: expectedId, createdAt: raw.createdAt, appVersion: raw.appVersion, flavorId: raw.flavorId, fileCount: files, dirCount: dirs, totalBytes: total, entries, scope };
+  // 恢复前备份的用途标记只在格式完全正确时采用（不合法时按普通备份显示，不影响其余校验）
+  if (raw.purpose === 'pre-restore' && typeof raw.restoreTx === 'string' && /^[0-9a-f]{16}$/.test(raw.restoreTx)) {
+    out.purpose = 'pre-restore';
+    out.restoreTx = raw.restoreTx;
+  }
+  return out;
 }
 
 /** 枚举结果与清单比较：集合（大小写 / Unicode 无关）、类型、大小；返回第一处差异 */
@@ -928,7 +941,7 @@ function compareStructure(walked: WalkEntry[], entries: ManifestEntry[], ignoreF
 }
 
 /** 快照目录顶层只允许 WTF 目录、清单与（可选）访达文件；返回第一处不符 */
-function topLevelProblem(entries: WalkEntry[], allowFinderFile: boolean): string | null {
+export function topLevelProblem(entries: WalkEntry[], allowFinderFile: boolean): string | null {
   const top = entries.filter((e) => !e.rel.includes('/'));
   const extra = top.find(
     (e) => !(e.rel === 'WTF' && e.kind === 'dir') && !(e.rel === MANIFEST_NAME && e.kind === 'file') && !(allowFinderFile && e.rel === IGNORED_FILE && e.kind === 'file'),
@@ -996,7 +1009,7 @@ function parseConfig(buf: Buffer, file: string): BackupConfig {
 
 // ---------- 占用标记 ----------
 
-interface HeldLock {
+export interface HeldLock {
   path: string;
   id: string;
   token: string;
@@ -1018,9 +1031,11 @@ function settingsBusy(p: string): UserError {
 }
 
 /** 排他创建占用标记；已存在一律保留并报错，不判断也不回收旧标记。onCreated 同 writeNewFile */
-async function acquireLock(p: string, info: Record<string, unknown>, busy: (p: string) => UserError, onCreated?: (id: string) => void): Promise<HeldLock> {
-  const token = randomBytes(16).toString('hex');
-  const data = Buffer.from(JSON.stringify({ format: FORMAT, kind: 'lock', token, createdAt: Date.now(), ...info }));
+async function acquireLock(
+  p: string, info: Record<string, unknown>, busy: (p: string) => UserError, onCreated?: (id: string) => void, fixed?: { token: string; createdAt: number },
+): Promise<HeldLock> {
+  const token = fixed?.token ?? randomBytes(16).toString('hex');
+  const data = Buffer.from(JSON.stringify({ format: FORMAT, kind: 'lock', token, createdAt: fixed?.createdAt ?? Date.now(), ...info }));
   try {
     const id = await writeNewFile(p, data, onCreated);
     return { path: p, id, token };
@@ -1132,7 +1147,7 @@ class ConfigStore {
  * 记录本次在 .partial 目录中创建的每个条目及其身份。清理时先复核容器各级身份，
  * 每次删除前复核临时根与各级相对父目录仍是本次创建的目录（不经由被替换的父路径）；发现变化即停止并保留现场。不递归删除。
  */
-class PartialTracker {
+export class PartialTracker {
   private readonly created: { rel: string; kind: 'dir' | 'file'; id: string }[] = [];
   private readonly dirIds = new Map<string, string>();
 
@@ -1144,6 +1159,11 @@ class PartialTracker {
 
   abs(rel: string): string {
     return rel ? path.join(this.base, ...rel.split('/')) : this.base;
+  }
+
+  /** 本次创建的每个条目（相对临时根，根为 ''）在创建时记录的身份（只读副本） */
+  createdIds(): Map<string, string> {
+    return new Map(this.created.map((c) => [c.rel, c.id]));
   }
 
   async mkdir(rel: string): Promise<void> {
@@ -1247,7 +1267,9 @@ function blankSnapshot(id: string, status: BackupSnapshotStatus, reason: string,
 }
 
 function manifestSnapshot(m: SnapshotManifest, actualBytes: number, status: BackupSnapshotStatus, reason: string | null, lastVerify: BackupVerifyRecord | null): BackupSnapshotInfo {
-  return { id: m.snapshotId, createdAt: m.createdAt, appVersion: m.appVersion, flavorId: m.flavorId, fileCount: m.fileCount, dirCount: m.dirCount, totalBytes: m.totalBytes, scope: m.scope, actualBytes, status, reason, lastVerify };
+  const info: BackupSnapshotInfo = { id: m.snapshotId, createdAt: m.createdAt, appVersion: m.appVersion, flavorId: m.flavorId, fileCount: m.fileCount, dirCount: m.dirCount, totalBytes: m.totalBytes, scope: m.scope, actualBytes, status, reason, lastVerify };
+  if (m.purpose) info.purpose = m.purpose;
+  return info;
 }
 
 /** 取消与扫描预算耗尽必须向上传递，不能被当作某一项的普通错误 */
@@ -1635,14 +1657,14 @@ async function scanCatalog(wtf: string, limits: CatalogLimits): Promise<{ accoun
 
 // ---------- 服务 ----------
 
-interface ActiveTask {
+export interface ActiveTask {
   info: BackupTaskInfo;
   controller: AbortController;
   done: Promise<void>;
   finish: () => void;
 }
 
-interface ContainerCtx {
+export interface ContainerCtx {
   path: string;
   chain: string[];
 }
@@ -1653,6 +1675,74 @@ interface SourceCtx {
   rootChain: string[];
   wtfId: string;
 }
+
+/** 内部复制选项（普通备份不传）：恢复前备份固定范围 all、使用预先登记的编号并严格同步 */
+export interface CopyOptions {
+  scope?: BackupScope;
+  id?: string;
+  /** 所属恢复编号：清单写入 purpose = pre-restore */
+  restoreTx?: string;
+  /** 给出时，发布前严格同步每一级目录、发布后严格同步备份位置（失败即报错） */
+  syncDirStrict?: (dir: string) => Promise<void>;
+  /** 给出时记录本次写入的受控清单（见 CopyLedger），失败时不使用旧的按身份清理 */
+  ledger?: CopyLedger;
+  /**
+   * 与 ledger 一起给出：复制失败（模拟崩溃除外）时调用，按受控清单核对并清理本次的临时目录；返回保留说明（null 表示已清理）。
+   * 没有给出时，临时目录原样保留
+   */
+  cleanupPartial?: (p: { base: string; entries: ManifestEntry[]; parentChain: string[]; baseId: string; createdIds: ReadonlyMap<string, string> }) => Promise<string | null>;
+}
+
+/**
+ * 恢复前备份写入临时目录时的受控清单（相对临时目录）：每个本次创建的目录，以及每个文件已完整写入的字节数与这些字节的校验值。
+ * 只在本次的写入成功之后更新；外部改动、写入中途失败或未登记的条目都会使清理核对不通过而保留
+ */
+export interface CopyLedger {
+  rootId: string | null;
+  entries: Map<string, ManifestEntry>;
+}
+
+/** 一次复制的结果：发布后的目录、清单、源的固定枚举（相对 WTF）与发布时固定的目录遍历（相对备份目录） */
+export interface CopyOutcome {
+  info: BackupSnapshotInfo;
+  dir: string;
+  manifest: SnapshotManifest;
+  source: WalkEntry[];
+  pinned: WalkEntry[];
+}
+
+/**
+ * 恢复服务使用的内部接口（不经 IPC）：与备份 / 校验 / 设置修改共用同一个任务占位与备份位置的检查。
+ * 只由 WtfBackupService.restoreBridge() 生成
+ */
+export interface RestoreBridge {
+  readonly limits: BackupLimits;
+  readonly appVersion: string;
+  begin(kind: BackupTaskKind, flavorId: number, root: string, snapshotId: string | null, scope: BackupScope | null): ActiveTask;
+  end(task: ActiveTask): void;
+  phase(task: ActiveTask, phase: BackupTaskInfo['phase']): void;
+  /** 进入不可取消的阶段：之后取消请求不被受理，退出等待任务结束 */
+  critical(task: ActiveTask): void;
+  progress(): void;
+  configGeneration(): number;
+  isClosed(): boolean;
+  checkTarget(flavorId: number, expected: string): Promise<string>;
+  enabledRecord(flavorId: number, root: string): Promise<TargetRecord>;
+  openContainer(rec: TargetRecord, signal?: AbortSignal): Promise<ContainerCtx>;
+  recheckContainer(ctr: ContainerCtx, rec: TargetRecord, signal?: AbortSignal): Promise<void>;
+  assertLocation(target: string, currentRoot: string, existing: boolean): Promise<void>;
+  /** 备份位置的份数 / 占用与阻塞原因（含本实例持有的占用标记与临时目录的识别） */
+  usage(container: string, flavorId: number, signal?: AbortSignal): Promise<{ usage: BackupUsage; block: string | null }>;
+  /** 以给定的令牌与时间排他创建备份位置的占用标记，并登记为本实例持有（扫描时不列为异常） */
+  acquireLock(container: string, fixed: { token: string; createdAt: number }, info: Record<string, unknown>): Promise<HeldLock>;
+  /** 本实例不再持有该备份位置的占用（标记的删除由调用方按自己的规则完成） */
+  forgetLock(container: string): void;
+  /** 在已持有的占用下复制并发布一份备份（失败时只清理本次登记的临时目录） */
+  copy(task: ActiveTask, rec: TargetRecord, ctr: ContainerCtx, lock: HeldLock, opts: CopyOptions): Promise<CopyOutcome>;
+  listBoundRoots(): Promise<string[]>;
+}
+
+export type { TargetRecord };
 
 function flavorArg(v: unknown): number {
   if (typeof v !== 'number' || !Number.isInteger(v) || v < 0 || v > 1e7) throw new UserError('游戏版本参数无效');
@@ -1687,6 +1777,8 @@ export class WtfBackupService {
   private acquiring: { container: string; id: string | null; identified: Promise<void> } | null = null;
   /** 本次运行期间的校验结果（备份位置 + 编号）；不持久化 */
   private readonly verified = new Map<string, BackupVerifyRecord>();
+  /** 备份设置的修改代次（启用 / 关闭受理即递增） */
+  private configGen = 0;
 
   constructor(private readonly opts: WtfBackupOptions) {
     this.limits = resolveLimits(opts.limits);
@@ -1725,7 +1817,7 @@ export class WtfBackupService {
       finish = () => resolve();
     });
     const task: ActiveTask = {
-      info: { id: newTaskId(), kind, flavorId, root, snapshotId, scope, phase: 'preparing', filesDone: 0, filesTotal: 0, bytesDone: 0, bytesTotal: 0, cancelling: false, startedAt: Date.now() },
+      info: { id: newTaskId(), kind, flavorId, root, snapshotId, scope, phase: 'preparing', filesDone: 0, filesTotal: 0, bytesDone: 0, bytesTotal: 0, cancelling: false, cancellable: true, startedAt: Date.now() },
       controller: new AbortController(),
       done,
       finish,
@@ -1746,9 +1838,10 @@ export class WtfBackupService {
     this.emit(true);
   }
 
-  /** 设置修改与任务互斥；同步占位 */
+  /** 设置修改与任务互斥；同步占位。受理时即递增设置代次（之后即使保存后的读取失败，基于旧设置的恢复预览也已作废） */
   private async exclusiveConfig<T>(fn: () => Promise<T>): Promise<T> {
     if (this.closed || this.active || this.configuring) throw this.busyError();
+    this.configGen++;
     const p = fn();
     this.configuring = p;
     this.emit(true);
@@ -2142,28 +2235,14 @@ export class WtfBackupService {
     await this.assertLocation(ctr.path, root, true);
     throwIfAborted(signal);
     const lock = await this.acquireTaskLock(ctr.path, { taskKind: 'run', taskId: info.id, appVersion: this.opts.appVersion });
-    const box: { partial: PartialTracker | null } = { partial: null };
     let snapshot: BackupSnapshotInfo | null = null;
     let failure: unknown = null;
     try {
-      snapshot = await this.copySnapshot(task, rec, ctr, lock, (p) => {
-        box.partial = p;
-        if (this.held) this.held.partial = path.basename(p.base);
-      });
+      snapshot = (await this.copyWithCleanup(task, rec, ctr, lock)).info;
     } catch (err) {
       failure = err ?? new Error('备份未完成');
     }
     const notes: string[] = [];
-    const tracker = box.partial;
-    if (failure && tracker) {
-      this.phase(task, 'cleanup');
-      try {
-        const left = await tracker.cleanup();
-        if (left) notes.push(left);
-      } catch (err) {
-        notes.push(`清理临时目录时出错（${errorMessage(err)}），已保留：${tracker.base}`);
-      }
-    }
     const lockNote = await this.release(lock);
     this.held = null;
     if (lockNote) notes.push(lockNote);
@@ -2171,7 +2250,48 @@ export class WtfBackupService {
     return { taskId: info.id, snapshot, warnings: notes };
   }
 
-  private async copySnapshot(task: ActiveTask, rec: TargetRecord, ctr: ContainerCtx, lock: HeldLock, onPartial: (p: PartialTracker) => void): Promise<BackupSnapshotInfo> {
+  /** copySnapshot，失败时只清理本次登记的临时目录（说明附在错误中） */
+  private async copyWithCleanup(task: ActiveTask, rec: TargetRecord, ctr: ContainerCtx, lock: HeldLock, opts?: CopyOptions): Promise<CopyOutcome> {
+    const box: { partial: PartialTracker | null } = { partial: null };
+    try {
+      return await this.copySnapshot(task, rec, ctr, lock, (p) => {
+        box.partial = p;
+        if (this.held) this.held.partial = path.basename(p.base);
+      }, opts);
+    } catch (err) {
+      const failure = err ?? new Error('备份未完成');
+      const notes: string[] = [];
+      const tracker = box.partial;
+      if (opts?.ledger) {
+        // 恢复前备份：模拟崩溃不做任何清理；其他失败只按受控清单核对清理，无法证明时整个临时目录保留
+        if (err instanceof SimulatedCrash) throw err;
+        if (tracker) {
+          this.phase(task, 'cleanup');
+          const kept = `恢复前备份的临时目录无法确认只含本次写入的内容，已保留：${tracker.base}`;
+          const rootId = opts.ledger.rootId;
+          const left = rootId && opts.cleanupPartial
+            ? await opts.cleanupPartial({
+              base: tracker.base, entries: [...opts.ledger.entries.values()], parentChain: [...ctr.chain], baseId: rootId, createdIds: tracker.createdIds(),
+            }).catch((e: unknown) => `${kept}（${errorMessage(e)}）`)
+            : (await lstat(tracker.base).then(() => kept, () => null));
+          if (left) notes.push(left);
+        }
+        throw withNotes(failure, notes);
+      }
+      if (tracker) {
+        this.phase(task, 'cleanup');
+        try {
+          const left = await tracker.cleanup();
+          if (left) notes.push(left);
+        } catch (e) {
+          notes.push(`清理临时目录时出错（${errorMessage(e)}），已保留：${tracker.base}`);
+        }
+      }
+      throw withNotes(failure, notes);
+    }
+  }
+
+  private async copySnapshot(task: ActiveTask, rec: TargetRecord, ctr: ContainerCtx, lock: HeldLock, onPartial: (p: PartialTracker) => void, opts?: CopyOptions): Promise<CopyOutcome> {
     const { info } = task;
     const signal = task.controller.signal;
     const limits = this.limits;
@@ -2188,7 +2308,7 @@ export class WtfBackupService {
     await this.step('source-enumerate');
     const walkOpts: WalkOptions = { maxEntries: limits.maxEntries, maxDepth: limits.maxDepth, rejectHardlinks: true, signal, label: 'WTF' };
     // 首次枚举与两次源复核共用同一个冻结范围，每次都从 WTF 重新按名称定位
-    const scope = info.scope ?? ALL_SCOPE;
+    const scope = opts?.scope ?? info.scope ?? ALL_SCOPE;
     const walkSource = () => walkScopedSource(src.wtf, scope, walkOpts);
     const entries = await walkSource();
     const files = entries.filter((e) => e.kind === 'file');
@@ -2201,20 +2321,28 @@ export class WtfBackupService {
 
     // 3. 复制到本次专属的临时目录，边读边算校验值，按实际字节计入上限
     const createdAt = Date.now();
-    const id = newSnapshotId(new Date(createdAt));
+    const id = opts?.id ?? newSnapshotId(new Date(createdAt));
+    if (!SNAPSHOT_ID_RE.test(id)) throw new UserError('备份编号无效', 'backup-container');
     const partial = new PartialTracker(path.join(ctr.path, PARTIAL_PREFIX + id), ctr.path, ctr.chain);
     onPartial(partial);
+    // 恢复前备份：记录本次写入的受控清单（目录、每个文件已写入的字节数与这些字节的校验值），失败时只按它核对清理
+    const ledger = opts?.ledger;
     await partial.mkdir('');
-    await partial.mkdir('WTF');
+    if (ledger) ledger.rootId = idOf(await lstat(partial.base, { bigint: true }));
+    const mkdirTracked = async (rel: string) => {
+      await partial.mkdir(rel);
+      ledger?.entries.set(rel, { path: rel, type: 'dir' });
+    };
+    await mkdirTracked('WTF');
     const hashes = new Map<string, string>();
     for (const e of entries) {
       throwIfAborted(signal);
       if (e.kind === 'dir') {
-        await partial.mkdir(`WTF/${e.rel}`);
+        await mkdirTracked(`WTF/${e.rel}`);
         continue;
       }
       await this.step('copy-file', e.rel);
-      hashes.set(e.rel, await this.copyFile(task, src.wtf, e, partial, budget));
+      hashes.set(e.rel, await this.copyFile(task, src.wtf, e, partial, budget, ledger));
       info.filesDone++;
       this.emit(false);
     }
@@ -2254,11 +2382,13 @@ export class WtfBackupService {
       totalBytes: statBytes,
       entries: manifestEntries,
       scope,
+      ...(opts?.restoreTx ? { purpose: 'pre-restore' as const, restoreTx: opts.restoreTx } : {}),
     };
     const text = Buffer.from(serializeManifest(manifest), 'utf8');
     if (text.byteLength > limits.maxManifestBytes) throw limitError('备份清单大小', limits.maxManifestBytes, 'bytes');
     await this.step('manifest-write');
     await partial.writeFile(MANIFEST_NAME, text);
+    ledger?.entries.set(MANIFEST_NAME, { path: MANIFEST_NAME, type: 'file', size: text.byteLength, sha256: createHash('sha256').update(text).digest('hex') });
     await syncDir(partial.abs('WTF'));
     await syncDir(partial.base);
 
@@ -2290,10 +2420,17 @@ export class WtfBackupService {
     const actualBytes = statBytes + text.byteLength;
     const record: BackupVerifyRecord = { at: Date.now(), ok: true, reason: null };
     throwIfAborted(signal);
+    // 恢复前备份：发布前严格同步临时目录中的每一级目录（失败即停止，不发布）
+    const strict = opts?.syncDirStrict;
+    if (strict) {
+      for (const e of [...finalTarget].reverse()) if (e.kind === 'dir') await strict(partial.abs(e.rel));
+      await strict(partial.base);
+    }
     await rename(partial.base, finalPath);
-    await syncDir(ctr.path);
+    if (strict) await strict(ctr.path);
+    else await syncDir(ctr.path);
     this.verified.set(this.verifyKey(ctr.path, id), record);
-    return manifestSnapshot(manifest, actualBytes, 'structure-ok', null, record);
+    return { info: manifestSnapshot(manifest, actualBytes, 'structure-ok', null, record), dir: finalPath, manifest, source: entries, pinned: finalTarget };
   }
 
   /** 发布前复核备份位置：无外来项或异常，历史备份结构一致，实际份数与占用（含本次临时目录）不超限 */
@@ -2359,17 +2496,27 @@ export class WtfBackupService {
   }
 
   /** 复制单个文件：源 O_NOFOLLOW|O_NONBLOCK 打开并核对身份，目标排他新建 0600；前后 fstat 一致才算完成 */
-  private async copyFile(task: ActiveTask, srcBase: string, e: WalkEntry, partial: PartialTracker, budget: number): Promise<string> {
+  private async copyFile(task: ActiveTask, srcBase: string, e: WalkEntry, partial: PartialTracker, budget: number, ledger?: CopyLedger): Promise<string> {
     const { info } = task;
     const signal = task.controller.signal;
     const fh = await openSourceFile(path.join(srcBase, ...e.rel.split('/')), e.rel, e.st);
     try {
-      const out = await partial.createFile(`WTF/${e.rel}`);
+      const rel = `WTF/${e.rel}`;
+      const out = await partial.createFile(rel);
+      // 受控清单：创建后为 0 字节；每次完整写入一个数据块之后更新字节数与这些字节的校验值（写入中途失败时清单不更新，清理核对会因此保留该文件）
+      const written = createHash('sha256');
+      let writtenBytes = 0;
+      ledger?.entries.set(rel, { path: rel, type: 'file', size: 0, sha256: written.copy().digest('hex') });
       const r = await (async () => {
         try {
           const h = await hashHandle(fh, this.limits.maxFileBytes, () => limitError(`单个文件（「${e.rel}」）`, this.limits.maxFileBytes, 'bytes'), signal, async (chunk) => {
             if (info.bytesDone + chunk.byteLength > budget) throw limitError('本次备份可用空间', budget, 'bytes');
             await writeAll(out, chunk);
+            if (ledger) {
+              written.update(chunk);
+              writtenBytes += chunk.byteLength;
+              ledger.entries.set(rel, { path: rel, type: 'file', size: writtenBytes, sha256: written.copy().digest('hex') });
+            }
             info.bytesDone += chunk.byteLength;
             this.emit(false);
           });
@@ -2518,10 +2665,71 @@ export class WtfBackupService {
 
   // ---------- 取消、查看位置、退出 ----------
 
-  /** 只有 taskId、flavor、任务受理时的目录都与活动任务一致才取消；不检查当前绑定 */
+  // ---------- 恢复服务的内部接口 ----------
+
+  /** 恢复服务使用的内部接口（见 RestoreBridge）；与备份 / 校验 / 设置修改共用同一个任务占位 */
+  restoreBridge(): RestoreBridge {
+    return {
+      limits: this.limits,
+      appVersion: this.opts.appVersion,
+      begin: (kind, f, root, snapshotId, scope) => this.begin(kind, f, root, snapshotId, scope),
+      end: (task) => this.end(task),
+      phase: (task, phase) => this.phase(task, phase),
+      critical: (task) => {
+        task.info.cancellable = false;
+        this.emit(true);
+      },
+      progress: () => this.emit(false),
+      configGeneration: () => this.configGen,
+      isClosed: () => this.closed,
+      checkTarget: (f, expected) => this.checkTarget(f, expected),
+      enabledRecord: (f, root) => this.enabledRecord(f, root),
+      openContainer: (rec, signal) => this.openContainer(rec, signal),
+      recheckContainer: (ctr, rec, signal) => this.recheckContainer(ctr, rec, signal),
+      assertLocation: (target, root, existing) => this.assertLocation(target, root, existing),
+      usage: async (container, flavorId, signal) => {
+        const scan = await scanContainer(container, this.scanCtx(container, flavorId, signal));
+        return { usage: scan.usage, block: blockingReason(scan, this.limits, container)?.message ?? null };
+      },
+      acquireLock: async (container, fixed, info) => {
+        let settle!: () => void;
+        const identified = new Promise<void>((r) => (settle = r));
+        const a = { container, id: null as string | null, identified };
+        this.acquiring = a;
+        try {
+          const lock = await acquireLock(path.join(container, LOCK_NAME), info, locationBusy, (id) => {
+            a.id = id;
+            settle();
+          }, fixed);
+          this.held = { container, lockId: lock.id, partial: null };
+          return lock;
+        } finally {
+          if (this.acquiring === a) this.acquiring = null;
+          settle();
+        }
+      },
+      forgetLock: (container) => {
+        if (this.held?.container === container) this.held = null;
+      },
+      copy: (task, rec, ctr, lock, opts) => this.copyWithCleanup(task, rec, ctr, lock, opts),
+      listBoundRoots: () => this.opts.listBoundRoots(),
+    };
+  }
+
+  /**
+   * 诊断导出用的受保护位置：备份设置中登记过的全部备份位置（含已关闭的记录）。只读有界读取备份设置；
+   * 文件不存在时为空；存在但无法读取或不合法时抛错（不能当作没有）
+   */
+  async registeredProtectionPaths(): Promise<string[]> {
+    const cfg = await this.config.load();
+    return [...new Set(cfg.targets.map((t) => t.containerPath))];
+  }
+
+  /** 只有 taskId、flavor、任务受理时的目录都与活动任务一致、且任务可以取消时才取消；不检查当前绑定 */
   cancel(taskId: string, flavorId: number, expectedRoot: string): boolean {
     const t = this.active;
     if (!t || t.info.id !== taskId || t.info.flavorId !== flavorId || t.info.root !== expectedRoot) return false;
+    if (!t.info.cancellable) return false;
     if (!t.info.cancelling) {
       t.info.cancelling = true;
       t.controller.abort();
@@ -2545,12 +2753,12 @@ export class WtfBackupService {
     return p;
   }
 
-  /** 退出时调用：拒绝新任务，取消进行中的任务，并等待任务与设置修改全部收尾 */
+  /** 退出时调用：拒绝新任务，取消进行中的任务（不可取消的阶段只等待），并等待任务与设置修改全部收尾 */
   async shutdown(): Promise<void> {
     this.closed = true;
     const t = this.active;
     if (t) {
-      if (!t.info.cancelling) {
+      if (!t.info.cancelling && t.info.cancellable) {
         t.info.cancelling = true;
         t.controller.abort();
         this.emit(true);

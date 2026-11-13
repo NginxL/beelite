@@ -64,13 +64,20 @@ export class MutationGate {
 
 /**
  * 会写入游戏目录、设置、更新策略、操作记录或 WTF 备份位置的 IPC 通道；整个回调在闸门内执行（退出与客户端更新等待它们收尾）。
- * 备份的重新校验也会写占用标记，因此同样计入；取消备份不入闸
+ * 备份的重新校验也会写占用标记，因此同样计入；取消备份不入闸。
+ * WTF 恢复的预览 / 执行 / 处理与诊断报告的生成 / 保存（含系统保存框、写入与失败收尾）同样计入；只读查看未完成的恢复不入闸。
+ * 注意：闸门只用于退出与客户端更新的等待，不是互斥；绑定与恢复的互斥由恢复服务的绑定占位负责
  */
 export const MUTATING_CHANNELS: ReadonlySet<string> = new Set([
   'backup:configure',
   'backup:disable',
   'backup:run',
   'backup:verify',
+  'restore:preview',
+  'restore:apply',
+  'restore:resolve',
+  'diagnostic:preview',
+  'diagnostic:save',
   'policy:set',
   'history:retry',
   'profile:bind',

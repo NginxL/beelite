@@ -4,19 +4,21 @@ import { initActivityNotice } from './activity-notice.js';
 import { applyBackupTask, backupNavBadge, initBackup, setBackupPageOpen, syncBackupTask } from './backup.js';
 import { initClientUpdate } from './client-update.js';
 import { initDetail } from './detail.js';
+import { initDiagnostics, type DiagTarget } from './diagnostics.js';
 import { initDiscover, focusSearch } from './discover.js';
 import type { AddonWatchSnapshot } from '../shared/types';
 import { byId, h, mount, spinner, toast } from './dom.js';
 import { errMsg } from './format.js';
 import { initLocal, showManagedTab } from './local.js';
+import { initRestore, refreshPending, restoreNavBadge } from './restore.js';
 import { handleTask, syncTasks } from './tasks.js';
 import {
   api, applyActivity, applyHistoryStatus, applyTask, applyWatch, bindDirectory, flavorName, isBusy, on, onActivityAccepted, pendingByFlavor, setFlavor, state, syncActivity,
   syncHistoryStatus, syncWatch, unbindDirectory,
 } from './state.js';
 
-type Page = 'discover' | 'local' | 'backup';
-const PAGES: readonly Page[] = ['discover', 'local', 'backup'];
+type Page = 'discover' | 'local' | 'backup' | 'diagnostics';
+const PAGES: readonly Page[] = ['discover', 'local', 'backup', 'diagnostics'];
 
 const flavorSelect = byId<HTMLSelectElement>('flavor-select');
 const dirPath = byId('dir-path');
@@ -31,7 +33,7 @@ let noticeSeen: number | null = null;
 /** 当前显示的页面；配置加载完成后不强制切回发现插件 */
 let currentPage: Page = 'discover';
 
-/** 三个页面互斥显示；配置备份页的打开 / 离开交给 backup 模块（重复点击已打开的页面不会重新读取） */
+/** 页面互斥显示；配置备份页的打开 / 离开交给 backup 模块（重复点击已打开的页面不会重新读取）；诊断报告页打开时不生成任何内容 */
 function showPage(page: Page): void {
   currentPage = page;
   for (const btn of document.querySelectorAll<HTMLButtonElement>('.nav-item')) {
@@ -43,12 +45,12 @@ function showPage(page: Page): void {
 }
 
 function pageOf(v: string | undefined): Page {
-  return v === 'local' || v === 'backup' ? v : 'discover';
+  return v === 'local' || v === 'backup' || v === 'diagnostics' ? v : 'discover';
 }
 
-/** 侧栏「配置备份」的进行中标记：来自主进程的全局任务（可能属于其他游戏版本或目录） */
+/** 侧栏「配置备份」的标记：主进程的全局任务（可能属于其他游戏版本或目录）进行中，或有需要处理的未完成恢复 */
 function renderBackupBadge(): void {
-  const text = backupNavBadge() ?? '';
+  const text = backupNavBadge() ?? restoreNavBadge() ?? '';
   if (backupBadge.textContent !== text) backupBadge.textContent = text;
   backupBadge.classList.toggle('hidden', !text);
 }
@@ -154,6 +156,40 @@ function onWatch(s: AddonWatchSnapshot): void {
   }
 }
 
+/**
+ * 诊断报告的目标：当前显示的游戏版本与它的绑定目录。配置尚未加载或无法加载时没有游戏版本，只生成应用摘要。
+ * label 只用于页面显示（可含目录），不会进入报告或任何请求；key 只用于比较目标是否变化
+ */
+function diagnosticTarget(): DiagTarget {
+  if (!state.config) return { flavorId: null, key: 'none', label: '未选择游戏版本（只含应用摘要）' };
+  const id = state.flavorId;
+  const name = `「${flavorName(id)}」`;
+  const local = state.local && state.local.flavorId === id ? state.local : null;
+  if (!local) return { flavorId: id, key: `${id}\n?`, label: `${name}${state.localError ? '（目录读取失败）' : '（正在读取目录）'}` };
+  const root = local.profile.root;
+  return { flavorId: id, key: `${id}\n${root ?? ''}`, label: root ? `${name}${root}` : `${name}（未绑定目录）` };
+}
+
+/** 诊断报告页：页面标题 + 独立模块（只通过这些 ports 访问主进程与当前目标）；整个界面期间只建立一次 */
+function initDiagnosticsPage(): void {
+  const page = byId('page-diagnostics');
+  const body = h('div', { class: 'diagnostics-page-body' });
+  mount(page, h('div', { class: 'backup-page-head' }, h('span', { class: 'page-title', text: '诊断报告' })), body);
+  initDiagnostics(body, {
+    preview: (req) => api().diagnosticPreview(req),
+    save: (token) => api().diagnosticSave(token),
+    getTarget: diagnosticTarget,
+    onTargetChange: (listener) => {
+      const offLocal = on('local', listener);
+      const offFlavor = on('flavor', listener);
+      return () => {
+        offLocal();
+        offFlavor();
+      };
+    },
+  });
+}
+
 function bindUi(): void {
   for (const btn of document.querySelectorAll<HTMLButtonElement>('.nav-item')) {
     btn.addEventListener('click', () => showPage(pageOf(btn.dataset.page)));
@@ -229,6 +265,11 @@ function boot(): void {
   initBackup(byId('page-backup'));
   window.beelite.onBackupTask((s) => void applyBackupTask(s));
   void syncBackupTask();
+  // 未完成的 WTF 恢复：任意页面顶部可见（不依赖当前绑定、配置或备份是否启用）；启动时只读查询，不自动处理
+  initRestore(byId('restore-warning'));
+  void refreshPending();
+  // 诊断报告页不依赖插件数据源配置（配置无法加载时也能生成应用摘要）；打开页面不生成
+  initDiagnosticsPage();
   // 客户端更新入口不依赖插件数据源配置，先于配置加载初始化
   initClientUpdate();
   bindUi();

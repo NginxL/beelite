@@ -6,6 +6,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>艾泽魔方 · AzerCube</title>
   <link rel="stylesheet" href="./styles.css">
+  <link rel="stylesheet" href="./diagnostics.css">
   <script type="module" src="./renderer/main.js"></script>
 </head>
 <body>
@@ -22,6 +23,7 @@
         <button class="nav-item active" data-page="discover"><span class="nav-icon nav-icon-discover"></span>发现插件</button>
         <button class="nav-item" data-page="local"><span class="nav-icon nav-icon-local"></span>我的插件<span id="update-badge" class="badge hidden">0</span></button>
         <button class="nav-item" data-page="backup"><span class="nav-icon nav-icon-backup"></span>配置备份<span id="backup-badge" class="badge badge-soft hidden"></span></button>
+        <button class="nav-item" data-page="diagnostics"><span class="nav-icon nav-icon-diagnostics"></span>诊断报告</button>
       </nav>
       <div class="sidebar-foot" id="client-update"></div>
     </aside>
@@ -41,10 +43,12 @@
       </header>
       <div id="config-warning" class="warn-bar hidden"></div>
       <div id="activity-warning" class="warn-bar hidden" role="alert"></div>
+      <div id="restore-warning" class="warn-bar hidden" role="alert"></div>
       <div id="update-notice" class="update-notice hidden" role="status"></div>
       <section id="page-discover" class="page"></section>
       <section id="page-local" class="page hidden"></section>
       <section id="page-backup" class="page hidden"></section>
+      <section id="page-diagnostics" class="page hidden"></section>
     </main>
   </div>
   <div id="drawer-root"></div>

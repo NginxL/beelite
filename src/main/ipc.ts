@@ -1,10 +1,10 @@
 // IPC 处理：校验发送方与每个参数，界面只传 flavorId / 插件编号 / 目录名等标量，路径全部由主进程解析。
-import { app, dialog, ipcMain, shell, type BrowserWindow, type IpcMainInvokeEvent } from 'electron';
+import { app, dialog, ipcMain, shell, type BrowserWindow, type IpcMainInvokeEvent, type WebContents } from 'electron';
 import { stat } from 'node:fs/promises';
 import path from 'node:path';
 import type {
-  ActivityReservation, ActivitySnapshot, AddonWatchSnapshot, AppConfig, BackupOutcome, BackupConfigResult, BackupScope, BackupTaskSnapshot, ClientUpdateState, ExpectedRecord, FlavorInfo, HealthReport, HistoryKind, HistoryStatusView,
-  HistoryVersion, InstalledRecord, LocalState, OpResult, ProfileInfo, SearchQuery, SortOrder, TaskEvent, TaskPhase,
+  ActivityReservation, ActivitySnapshot, AddonWatchSnapshot, AppConfig, BackupOutcome, BackupConfigResult, BackupScope, BackupTaskSnapshot, ClientUpdateState, DiagPreviewResult, DiagSaveResult, ExpectedRecord, FlavorInfo, HealthReport,
+  HistoryKind, HistoryStatusView, HistoryVersion, InstalledRecord, LocalState, OpResult, ProfileInfo, RestoreAck, RestoreResolveAck, SearchQuery, SortOrder, TaskEvent, TaskPhase,
 } from '../shared/types';
 import { ActivityRegistry } from '../core/activity';
 import { AddonUpdateWatch, type WatchClock } from '../core/addon-watch';
@@ -13,6 +13,7 @@ import { FILE_ID_RE } from '../core/file-id';
 import { DEFAULT_FLAVOR_ID, FLAVORS, getFlavor, interfaceFromVersion } from '../core/flavors';
 import { runUpdateAll } from '../core/batch';
 import { BUILD_RE, type ClientUpdater } from '../core/client-update';
+import { DiagnosticsService, type DiagnosticsOptions, type DiagOwner } from '../core/diagnostics';
 import { guardHandler, type MutationGate } from '../core/gate';
 import type { HistoryOutcome, HistoryStart, HistoryStore } from '../core/history';
 import { AddonManager, type InstallExpect, type InstallResult, type ManagerOptions } from '../core/manager';
@@ -22,6 +23,8 @@ import { inspectPickedRoot, SettingsStore } from '../core/profiles';
 import { NewBeeBoxProvider } from '../core/provider';
 import { ID_RE, type ProjectRecord } from '../core/store';
 import { parseBackupScope, SNAPSHOT_ID_RE, WtfBackupService, type WtfBackupOptions } from '../core/wtf-backup';
+import { TXID_RE } from '../core/wtf-restore-registry';
+import { WtfRestoreService, type WtfRestoreServiceOptions } from '../core/wtf-restore-service';
 
 const ORDERS: readonly SortOrder[] = ['ranking', 'update', 'total_download', 'favourite'];
 const FINAL_PHASES: ReadonlySet<TaskPhase> = new Set(['done', 'failed', 'cancelled']);
@@ -72,6 +75,48 @@ function backupTaskIdArg(v: unknown): string {
 function backupScopeArg(v: unknown): BackupScope {
   if (v === undefined || v === null) throw new UserError('备份范围参数缺失', 'backup-scope');
   return parseBackupScope(v);
+}
+/** 只含给定自有键的普通对象（不接受数组、类实例或多余的键） */
+function exactObject(v: unknown, keys: readonly string[]): v is Record<string, unknown> {
+  if (typeof v !== 'object' || v === null || Array.isArray(v)) return false;
+  const proto = Object.getPrototypeOf(v);
+  if (proto !== Object.prototype && proto !== null) return false;
+  const own = Reflect.ownKeys(v);
+  return own.length === keys.length && keys.every((k) => own.includes(k));
+}
+/** 恢复预览的凭证：只限制类型与长度，由核心精确比对 */
+function restoreTokenArg(v: unknown): string {
+  if (typeof v !== 'string' || v.length === 0 || v.length > 64) throw new UserError('恢复凭证无效，请重新预览', 'restore-token');
+  return v;
+}
+/** 执行恢复的确认：只接受 { gameClosed: true, overwrite: true }，交给核心的是新建的对象 */
+function restoreAckArg(v: unknown): RestoreAck {
+  if (!exactObject(v, ['gameClosed', 'overwrite']) || v.gameClosed !== true || v.overwrite !== true) {
+    throw new UserError('请先确认已完全退出游戏，并同意替换范围内的配置', 'restore-ack');
+  }
+  return { gameClosed: true, overwrite: true };
+}
+/** 未完成恢复的编号：只接受登记生成的格式 */
+function txidArg(v: unknown): string {
+  if (typeof v !== 'string' || !TXID_RE.test(v)) throw new UserError('恢复编号无效', 'restore-unknown');
+  return v;
+}
+/** 处理未完成恢复的确认：只接受 { gameClosed: true } */
+function resolveAckArg(v: unknown): RestoreResolveAck {
+  if (!exactObject(v, ['gameClosed']) || v.gameClosed !== true) throw new UserError('请重新确认已完全退出游戏', 'restore-ack');
+  return { gameClosed: true };
+}
+/** 诊断预览请求：只含 flavorId（已支持的版本或 null）与 mode；不合法时为 null（按 invalid-request 返回） */
+function diagRequestArg(v: unknown): { flavorId: number | null; mode: 'reuse' | 'replace' } | null {
+  if (!exactObject(v, ['flavorId', 'mode'])) return null;
+  const f = v.flavorId;
+  let flavorId: number | null;
+  if (f === null) flavorId = null;
+  else if (typeof f === 'number' && Number.isInteger(f) && getFlavor(f)) flavorId = f;
+  else return null;
+  const mode = v.mode === 'reuse' ? 'reuse' : v.mode === 'replace' ? 'replace' : null;
+  if (mode === null) return null;
+  return { flavorId, mode };
 }
 /** 更新 / 重装时界面看到的安装记录 */
 function expectedArg(v: unknown): ExpectedRecord {
@@ -141,9 +186,38 @@ export interface ServiceDeps {
   clock?: WatchClock;
   /** WTF 配置备份的设置与目录解析（由 backupOptions 生成；测试注入临时目录、上限与阶段钩子） */
   backup: BackupServiceOptions;
+  /** WTF 恢复的登记文件（由 restoreOptions 生成；测试注入临时目录与事务钩子） */
+  restore: WtfRestoreServiceOptions;
+  /** 诊断报告的可信路径与版本（由 diagnosticsOptions 生成；测试注入临时目录） */
+  diagnostics: DiagnosticsDeps;
 }
 
 export type BackupServiceOptions = Omit<WtfBackupOptions, 'onChange'>;
+
+/** 诊断报告的依赖：全部由主进程给出，界面不能影响 */
+export interface DiagnosticsDeps {
+  /** userData/settings.json（与 SettingsStore 相同的文件） */
+  settingsFile: string;
+  /** 应用数据目录（受保护，诊断报告不能保存在其中） */
+  userData: string;
+  appVersion: string;
+  /** 当前应用 bundle 等可信的应用目录（规范的绝对路径，受保护）；测试注入临时目录，绝不指向真实应用 */
+  appPaths: readonly string[];
+  platform?: string;
+  limits?: DiagnosticsOptions['limits'];
+  hooks?: DiagnosticsOptions['hooks'];
+  now?: () => number;
+}
+
+/** WTF 恢复的依赖：恢复登记 userData/wtf-restore-registry.json */
+export function restoreOptions(userData: string): WtfRestoreServiceOptions {
+  return { registryFile: path.join(userData, 'wtf-restore-registry.json') };
+}
+
+/** 诊断报告的依赖：设置文件与 SettingsStore 相同；appPaths 只由 main 从可信位置给出 */
+export function diagnosticsOptions(userData: string, appVersion: string, appPaths: readonly string[]): DiagnosticsDeps {
+  return { settingsFile: path.join(userData, 'settings.json'), userData, appVersion, appPaths: [...appPaths] };
+}
 
 /**
  * WTF 备份服务的依赖：独立设置文件 userData/wtf-backup-settings.json；受保护的应用数据目录只是本应用的 userData；
@@ -184,9 +258,23 @@ export class AppService {
   readonly backup: WtfBackupService;
   /** 最近一次推送的备份任务快照；只来自内存中的任务状态，不扫描备份位置 */
   private backupTask: BackupTaskSnapshot = { rev: 0, task: null };
+  /** WTF 恢复：与备份共用同一个任务占位（任务快照与取消沿用备份的通道）；绑定写入前取得它的短占位 */
+  readonly restore: WtfRestoreService;
+  /** 诊断报告（只读采集；保存只经主进程的系统保存框） */
+  readonly diagnostics: DiagnosticsService;
+  /**
+   * 诊断保护集合的变更代次与进行中的写入段数：绑定 / 解绑的实际写入、备份启用 / 关闭、恢复执行 / 处理在开始与结束（含失败）时都递增代次；
+   * 写入段进行中时保护列表不可用（读取抛错）。只用于诊断保存的核对，不是互斥
+   */
+  private protectionEpoch = 0;
+  private protectionWriters = 0;
+  /** 已登记关闭回调的窗口与它的诊断所属者（主进程私有标识，不复用） */
+  private readonly diagOwners = new WeakMap<WebContents, string>();
+  private diagOwnerSeq = 0;
 
   constructor(private readonly deps: ServiceDeps) {
     this.backup = new WtfBackupService({ ...deps.backup, onChange: () => this.pushBackupTask() });
+    this.restore = new WtfRestoreService(this.backup, deps.restore);
     this.manager = new AddonManager({
       source: deps.provider,
       download: deps.download,
@@ -209,6 +297,129 @@ export class AppService {
     // 策略的读取结果变化（包括重新读取后出错或恢复）：立即发布按新策略计算的快照
     deps.policy.onChange(() => this.watch.policyChanged());
     deps.history.onStatus((s) => this.pushHistory(s));
+    const d = deps.diagnostics;
+    this.diagnostics = new DiagnosticsService({
+      appVersion: d.appVersion,
+      platform: d.platform,
+      settingsFile: d.settingsFile,
+      historyFile: deps.history.file,
+      historyInstance: deps.history.instance,
+      // 只投影内存状态，不读取、不重试、不写入
+      historyStatus: () => {
+        const s = deps.history.status();
+        return { unsaved: s.unsaved, dropped: s.dropped, failing: s.loadError !== null || s.saveError !== null };
+      },
+      // 目录由诊断核心从有界读取的设置中给出：直接进入同目录队列，不经过 targetRoot / SettingsStore，也不联网
+      health: (flavorId, root) => this.healthAt(flavorId, root),
+      protectedExtras: () => this.protectedExtras(),
+      epoch: () => this.protectionEpoch,
+      now: d.now,
+      limits: d.limits,
+      hooks: d.hooks,
+    });
+  }
+
+  /** 同步进入改变保护集合的写入段：递增代次与写入段数；返回只生效一次的结束函数（再次递增代次） */
+  private beginProtectionMutation(): () => void {
+    this.protectionEpoch++;
+    this.protectionWriters++;
+    let ended = false;
+    return () => {
+      if (ended) return;
+      ended = true;
+      this.protectionWriters--;
+      this.protectionEpoch++;
+    };
+  }
+
+  /** 在保护集合写入段内执行 fn（同步进入；无论成败都在 finally 中结束） */
+  private async protectionMutation<T>(fn: () => Promise<T>): Promise<T> {
+    const end = this.beginProtectionMutation();
+    try {
+      return await fn();
+    } finally {
+      end();
+    }
+  }
+
+  /**
+   * 绑定的实际写入：同步进入保护写入段并取得恢复服务的绑定短占位（涉及的目录正在恢复时同步拒绝；取得与释放都使旧的恢复预览作废），
+   * 与 write 的 Promise 之间没有 await；写入结束（无论成败）后释放。原生对话框不在占位内
+   */
+  private async bindingWrite<T>(flavorId: number, roots: readonly (string | null)[], write: () => Promise<T>): Promise<T> {
+    const end = this.beginProtectionMutation();
+    try {
+      const release = this.restore.beginBindingMutation({ flavorId, roots });
+      try {
+        return await write();
+      } finally {
+        release();
+      }
+    } finally {
+      end();
+    }
+  }
+
+  /**
+   * 诊断保存的受保护位置（不含设置中的绑定，那部分由诊断核心自己读取）：userData、应用目录、全部登记的备份位置（含已关闭的）、
+   * 恢复登记中的原目录与备份位置。值原样交给诊断核心校验；写入段进行中、任一来源失败或读取期间保护配置变化时 throw
+   */
+  private async protectedExtras(): Promise<string[]> {
+    if (this.protectionWriters !== 0) throw new Error('保护配置正在修改');
+    const e0 = this.protectionEpoch;
+    const [backups, restores] = await Promise.all([this.backup.registeredProtectionPaths(), this.restore.pendingProtectionPaths()]);
+    if (this.protectionWriters !== 0 || this.protectionEpoch !== e0) throw new Error('保护配置在读取期间发生变化');
+    return [this.deps.diagnostics.userData, ...this.deps.diagnostics.appPaths, ...backups, ...restores];
+  }
+
+  /**
+   * 诊断预览的所属者：已通过发送方校验的窗口的主进程私有标识；首次使用时登记关闭回调（关闭即丢弃它的预览）。
+   * 窗口已关闭时为 null，不再建立所属者
+   */
+  private diagOwner(sender: WebContents): DiagOwner | null {
+    if (sender.isDestroyed()) return null;
+    let owner = this.diagOwners.get(sender);
+    if (owner === undefined) {
+      const id = `w${++this.diagOwnerSeq}`;
+      owner = id;
+      this.diagOwners.set(sender, id);
+      sender.once('destroyed', () => this.diagnostics.dropOwner(id));
+    }
+    return owner;
+  }
+
+  /** 诊断报告的保存位置：只来自主进程的系统保存框（取消为 null）；发起的窗口已关闭时不再弹框 */
+  private async pickDiagnosticPath(sender: WebContents): Promise<string | null> {
+    if (sender.isDestroyed()) throw new Error('窗口已关闭');
+    const d = new Date();
+    const pad = (n: number) => String(n).padStart(2, '0');
+    const stamp = `${d.getFullYear()}${pad(d.getMonth() + 1)}${pad(d.getDate())}-${pad(d.getHours())}${pad(d.getMinutes())}${pad(d.getSeconds())}`;
+    const opts: Electron.SaveDialogOptions = {
+      title: '保存诊断报告',
+      message: '只会新建文件，不会覆盖已有文件；如果提示文件已存在，请换一个新的文件名。不能保存到游戏目录、应用数据或备份位置中',
+      defaultPath: `AzerCube-诊断报告-${stamp}.json`,
+      filters: [{ name: 'JSON', extensions: ['json'] }],
+      buttonLabel: '保存',
+      properties: ['createDirectory'],
+    };
+    const win = this.deps.getWindow();
+    const r = win && !win.isDestroyed() && win.webContents === sender ? await dialog.showSaveDialog(win, opts) : await dialog.showSaveDialog(opts);
+    return r.canceled || !r.filePath ? null : r.filePath;
+  }
+
+  private async diagnosticPreview(sender: WebContents, req: unknown): Promise<DiagPreviewResult> {
+    const owner = this.diagOwner(sender);
+    if (owner === null) return { status: 'rejected', code: 'owner-gone' };
+    const r = diagRequestArg(req);
+    if (!r) return { status: 'rejected', code: 'invalid-request' };
+    return this.diagnostics.preview({ ...r, owner });
+  }
+
+  /** 只接收凭证：所属者在弹框之前固定，保存位置只来自系统保存框，内容只取冻结的预览 */
+  private async diagnosticSave(sender: WebContents, token: unknown): Promise<DiagSaveResult> {
+    const owner = this.diagOwner(sender);
+    if (owner === null) return { status: 'rejected', code: 'owner-gone', previewKept: false };
+    return this.diagnostics.save(typeof token === 'string' ? token : null, owner, () => this.pickDiagnosticPath(sender));
   }
 
   private pushHistory(s: HistoryStatusView): void {
@@ -308,7 +519,9 @@ export class AppService {
     };
     const picked = win ? await dialog.showOpenDialog(win, opts) : await dialog.showOpenDialog(opts);
     if (picked.canceled || !picked.filePaths[0]) return null;
-    return this.backup.configure(flavorId, expected, picked.filePaths[0]);
+    // 选择框之后才进入保护集合写入段（新的备份位置在核心写入设置时登记）
+    const parent = picked.filePaths[0];
+    return this.protectionMutation(() => this.backup.configure(flavorId, expected, parent));
   }
 
   /**
@@ -423,16 +636,29 @@ export class AppService {
       type: (insp.warnings.length ? 'warning' : 'question') as 'warning' | 'question',
       title: '确认游戏目录',
       message: `将「${flavor.name}」绑定到以下插件目录？`,
-      detail: [`插件目录：${addons}`, ...insp.warnings, '艾泽魔方只会在你执行安装、更新、卸载等操作时写入该目录，不会改动 WTF 设置。'].join('\n\n'),
+      detail: [
+        `插件目录：${addons}`,
+        ...insp.warnings,
+        '插件的安装、更新、卸载仅写入所选游戏目录的 Interface。只有你在「配置备份」中明确确认恢复某份备份时，艾泽魔方才会改写 WTF 以及游戏目录中同级的恢复工作目录（.azercube-wtf-restore）。',
+      ].join('\n\n'),
       buttons: ['绑定', '取消'],
       defaultId: 0,
       cancelId: 1,
     };
     const ok = win ? await dialog.showMessageBox(win, msgOpts) : await dialog.showMessageBox(msgOpts);
     if (ok.response !== 0) return null;
-    const profile = await this.deps.settings.bind(flavorId, insp.root);
+    // 对话框之后重新读取旧绑定：写入只在它未变时进行（expectCurrent），占位覆盖旧目录与新目录，之间没有其他 await
+    const old = (await this.deps.settings.profile(flavorId)).root;
+    const profile = await this.bindingWrite(flavorId, [old, insp.root], () => this.deps.settings.bind(flavorId, insp.root, old));
     await this.manager.recover(insp.root).catch(() => undefined);
     return profile;
+  }
+
+  /** 解除绑定：当前绑定必须仍是界面期望的目录；实际写入在绑定短占位内 */
+  private async unbind(flavorId: number, expected: string): Promise<ProfileInfo> {
+    const current = (await this.deps.settings.profile(flavorId)).root;
+    if (current !== expected) throw new UserError('游戏目录绑定已变更，未做任何改动，请刷新后重试', 'target');
+    return this.bindingWrite(flavorId, [current], () => this.deps.settings.bind(flavorId, null, current));
   }
 
   /**
@@ -440,7 +666,11 @@ export class AppService {
    * 不恢复事务、不清理、不刷新本地状态。同一目录已有进行中的检查时直接复用它的结果
    */
   async healthCheck(flavorId: number, expected: string): Promise<HealthReport> {
-    const root = await this.targetRoot(flavorId, expected);
+    return this.healthAt(flavorId, await this.targetRoot(flavorId, expected));
+  }
+
+  /** 已解析目录的健康检查（同目录复用进行中的检查；适配参考值只取已加载的配置缓存，不联网） */
+  private healthAt(flavorId: number, root: string): Promise<HealthReport> {
     const key = `${flavorId}\n${root}`;
     const running = this.healthRuns.get(key);
     if (running) return running;
@@ -641,14 +871,15 @@ export class AppService {
   }
 
   register(): void {
-    const handle = (channel: string, fn: (...args: unknown[]) => Promise<unknown>) => {
+    /** 回调另外收到已通过发送方校验的 WebContents（只用于确定诊断报告的所属窗口） */
+    const handleFrom = (channel: string, fn: (sender: WebContents, ...args: unknown[]) => Promise<unknown>) => {
       // 写通道在调用 fn 之前同步进入闸门，整个回调结束后才释放
       const guarded = guardHandler(this.deps.gate, channel, fn);
       ipcMain.handle(channel, async (e: IpcMainInvokeEvent, ...args: unknown[]) => {
         this.assertSender(e);
         const outcome: { failed: boolean; result?: unknown } = { failed: true };
         try {
-          outcome.result = await guarded(...args);
+          outcome.result = await guarded(e.sender, ...args);
           outcome.failed = false;
           return outcome.result;
         } catch (err) {
@@ -658,6 +889,7 @@ export class AppService {
         }
       });
     };
+    const handle = (channel: string, fn: (...args: unknown[]) => Promise<unknown>) => handleFrom(channel, (_sender, ...args) => fn(...args));
     // 客户端更新：固定操作；更新与已读提醒只接收界面看到的构建号，用于比对
     handle('client:state', async () => this.clientState());
     handle('client:check', async () => this.clientUpdater?.check() ?? this.clientState());
@@ -690,7 +922,7 @@ export class AppService {
     handle('profile:list', async () => Promise.all(FLAVORS.map((f) => this.deps.settings.profile(f.id))));
     handle('profile:bind', (f) => this.bind(flavorArg(f)));
     // 以下作用于某个游戏目录的操作：flavorId 是界面当前显示的版本，root 是界面记录的期望目录（只做比对）
-    handle('profile:unbind', (f, root) => this.deps.settings.bind(flavorArg(f), null, expectedRootArg(root)));
+    handle('profile:unbind', (f, root) => this.unbind(flavorArg(f), expectedRootArg(root)));
     handle('local:state', (f) => this.localState(flavorArg(f)));
     handle('addon:check', async (f, root) => {
       const flavorId = flavorArg(f);
@@ -789,7 +1021,11 @@ export class AppService {
     handle('backup:taskState', async () => this.backupTaskSnapshot());
     handle('backup:state', async (f, root) => this.backup.state(flavorArg(f), expectedRootArg(root)));
     handle('backup:configure', (f, root) => this.configureBackup(flavorArg(f), expectedRootArg(root)));
-    handle('backup:disable', async (f, root) => this.backup.disable(flavorArg(f), expectedRootArg(root)));
+    handle('backup:disable', async (f, root) => {
+      const flavorId = flavorArg(f);
+      const target = expectedRootArg(root);
+      return this.protectionMutation(() => this.backup.disable(flavorId, target));
+    });
     // 账号与角色列表：只读目录名称与元数据（核心要求已启用），不入闸、不写设置与备份位置
     handle('backup:catalog', async (f, root) => this.backup.catalog(flavorArg(f), expectedRootArg(root)));
     // 范围在受理前校验：无效或缺失时直接拒绝，不开始任务
@@ -808,6 +1044,29 @@ export class AppService {
     // 取消按任务受理时的原值匹配，不要求与当前绑定相同；只影响编号、版本与目录都一致的那个任务
     handle('backup:cancel', async (id, f, root) => this.backup.cancel(backupTaskIdArg(id), flavorArg(f), expectedRootArg(root)));
     handle('backup:reveal', async (f, root, id) => this.revealBackup(flavorArg(f), expectedRootArg(root), id === null ? null : snapshotIdArg(id)));
+    // WTF 恢复：预览 / 执行 / 处理在闸门内（整个 Promise 含事务收尾）；准备阶段的取消沿用 backup:cancel。
+    // 执行与处理会改变恢复登记（诊断保护集合），在保护写入段内；只读查看不入闸、不处理、不依赖当前绑定或备份是否启用
+    handle('restore:preview', async (f, root, id) => {
+      const flavorId = flavorArg(f);
+      const target = expectedRootArg(root);
+      const snapshotId = snapshotIdArg(id);
+      return this.backupOutcome(() => this.restore.restorePreview(flavorId, target, snapshotId));
+    });
+    handle('restore:apply', async (t, a) => {
+      const token = restoreTokenArg(t);
+      const ack = restoreAckArg(a);
+      return this.backupOutcome(() => this.protectionMutation(() => this.restore.restoreApply(token, ack)));
+    });
+    handle('restore:pending', async () => this.restore.restorePending());
+    // 只接收恢复编号与新的确认：目录取自登记，不比对当前绑定
+    handle('restore:resolve', async (t, a) => {
+      const txid = txidArg(t);
+      const ack = resolveAckArg(a);
+      return this.backupOutcome(() => this.protectionMutation(() => this.restore.restoreResolve(txid, ack)));
+    });
+    // 诊断报告：所属者由已校验的发送方确定；生成与保存（含系统保存框、写入与收尾）都在闸门内
+    handleFrom('diagnostic:preview', (sender, req) => this.diagnosticPreview(sender, req));
+    handleFrom('diagnostic:save', (sender, token) => this.diagnosticSave(sender, token));
   }
 
   /** 只接受主窗口中本地页面发出的调用 */

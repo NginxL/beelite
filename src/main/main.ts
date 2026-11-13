@@ -12,7 +12,7 @@ import { NewBeeBoxProvider } from '../core/provider';
 import { FLAVORS } from '../core/flavors';
 import { recoverBoundRoots } from '../core/startup';
 import { loadSparkleBridge } from './client-update';
-import { APP_ORIGIN, AppService, backupOptions } from './ipc';
+import { APP_ORIGIN, AppService, backupOptions, diagnosticsOptions, restoreOptions } from './ipc';
 
 const WEB_ROOT = path.join(__dirname, '..', '..', 'web');
 const PRELOAD = path.join(__dirname, '..', 'preload', 'preload.js');
@@ -151,6 +151,17 @@ async function applyTestBindings(settings: SettingsStore): Promise<void> {
   }
 }
 
+/**
+ * 诊断报告不能保存进去的应用目录：当前运行的 .app bundle（取自主进程的可执行文件路径，…/X.app/Contents/MacOS/X；
+ * 不在 .app 中运行时取可执行文件所在目录）与应用代码目录。只来自主进程，不受界面影响
+ */
+function trustedAppPaths(): string[] {
+  const exe = path.resolve(process.execPath);
+  const bundle = path.resolve(exe, '..', '..', '..');
+  const out = new Set<string>([bundle.endsWith('.app') ? bundle : path.dirname(exe), path.resolve(app.getAppPath())]);
+  return [...out];
+}
+
 async function start(): Promise<void> {
   app.setName(APP_DISPLAY_NAME);
   // 关于面板显式使用品牌名（Info.plist 的 CFBundleName 仍是内部身份 BeeLite）
@@ -173,11 +184,13 @@ async function start(): Promise<void> {
     history,
     policy,
     backup: backupOptions(settings, userData, app.getVersion()),
+    restore: restoreOptions(userData),
+    diagnostics: diagnosticsOptions(userData, app.getVersion(), trustedAppPaths()),
   });
   service.register();
-  // 退出（手动或更新安装引起）：先让备份服务拒绝新任务并中止进行中的备份 / 校验（同一次 before-quit 中、在等待之前），
-  // 再由退出保护冻结并等待已受理的写操作（插件写操作与备份的启用、关闭、备份、校验，含句柄关闭、临时内容与占用标记收尾）全部结束。
-  // 两个监听都在任何 await 之前注册，启动恢复期间的退出同样受保护
+  // 退出（手动或更新安装引起）：先让备份服务拒绝新任务并中止进行中的备份 / 校验与 WTF 恢复的准备阶段（同一次 before-quit 中、在等待之前；
+  // 恢复的替换与处理不可中止，只等待），再由退出保护冻结并等待已受理的写操作（插件写操作、备份、WTF 恢复、诊断报告的系统保存框与写入收尾）全部结束。
+  // 两个监听都在任何 await 之前注册，启动恢复期间的退出同样受保护。未完成的 WTF 恢复在启动时不查看也不处理，只由界面只读查看、用户确认后处理
   app.on('before-quit', () => void service.backup.shutdown().catch(() => undefined));
   app.on('before-quit', createQuitGuard(gate, () => app.quit()));
   // 退出时停止插件更新检查：中止进行中的请求，迟到的结果不发布

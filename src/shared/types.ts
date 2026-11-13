@@ -2,6 +2,21 @@
 
 import type { BackupCatalog, BackupConfigResult, BackupRunResult, BackupScope, BackupState, BackupTaskInfo, BackupVerifyResult } from './backup-types';
 import type { HealthReport } from './health-types';
+import type { DiagPreviewResult, DiagSaveResult } from './diagnostic-types';
+import type { RestoreAck, RestorePendingView, RestorePreview, RestoreResolveAck, RestoreResolveResult, RestoreRunResult } from './restore-types';
+
+/** 本地 WTF 恢复的数据类型 */
+export type {
+  RestoreAck, RestoreApplyResult, RestoreBaseline, RestoreDiffCounts, RestoreDiffSamples, RestoreOrigin, RestorePendingItem, RestorePendingState, RestorePendingView,
+  RestorePreview, RestoreReceiptView, RestoreResolveAck, RestoreResolveResult, RestoreRunResult, RestoreSettledOutcome,
+} from './restore-types';
+/** 诊断报告的数据类型 */
+export type {
+  DiagAddon, DiagCleanup, DiagFailure, DiagHealthIssue, DiagLimits, DiagnosticReport, DiagOmitted, DiagPlatform, DiagPreviewCode, DiagPreviewResult, DiagReason,
+  DiagSaveFailCode, DiagSaveRejectCode, DiagSaveResult, DiagSection, DiagSectionState, DiagTokenCode,
+} from './diagnostic-types';
+/** 处理一项未完成恢复的结果（带任务编号） */
+export type RestoreResolveRunResult = RestoreResolveResult & { taskId: string };
 
 /** 只读插件健康检查的结果类型 */
 export type { HealthIssue, HealthIssueKind, HealthReport, HealthSeverity, HealthStatus, HealthUnavailableReason } from './health-types';
@@ -525,4 +540,34 @@ export interface BeeLiteApi {
   backupCancel(taskId: string, flavorId: number, root: string): Promise<boolean>;
   /** 在访达中显示已登记的备份位置（snapshotId 为 null）或其中一份备份 */
   backupReveal(flavorId: number, root: string, snapshotId: string | null): Promise<void>;
+  // WTF 恢复：界面只传游戏版本、期望目录（只做比对）、备份编号、凭证、恢复编号与固定的确认；范围与路径全部由主进程决定
+  /**
+   * 预览恢复（只读，读取并核对源备份与当前完整 WTF）：result.token 为 null 时不能执行，原因见 result.blockers。
+   * 准备期间可用 backupCancel 取消（任务见 onBackupTask），以 cancelled 返回；其他失败（目录正在修改绑定、有未完成的恢复、
+   * 备份不可用、绑定已变更等）报错，说明文字即原因
+   */
+  backupRestorePreview(flavorId: number, root: string, snapshotId: string): Promise<BackupOutcome<RestorePreview>>;
+  /**
+   * 执行恢复：token 一次有效（报错后也需要重新预览）；ack 必须是 { gameClosed: true, overwrite: true }。
+   * 进入替换前可用 backupCancel 取消（cancelled，WTF 未改动）；之后不可取消，result.outcome 给出 committed / rolled-back / unconfirmed / blocked
+   */
+  backupRestoreApply(token: string, ack: RestoreAck): Promise<BackupOutcome<RestoreRunResult>>;
+  /**
+   * 全局只读查看未完成的恢复（不要求当前绑定或备份已启用，不处理、不清理）。registryError 非空时 items 为空不代表没有；
+   * scanErrors / boundRootsError 表示检查范围不完整
+   */
+  backupRestorePending(): Promise<RestorePendingView>;
+  /**
+   * 处理一项登记的未完成恢复：只传恢复编号与新的 { gameClosed: true }；目录取自登记（原目录已解绑或换绑时也处理原目录）。
+   * 处理期间不可取消（为与其他恢复接口一致仍以 BackupOutcome 返回）
+   */
+  backupRestoreResolve(txid: string, ack: RestoreResolveAck): Promise<BackupOutcome<RestoreResolveRunResult>>;
+  // 诊断报告：只读应用元数据、插件清单、操作记录与健康检查，不读取 WTF、不联网；窗口身份由主进程确定
+  /**
+   * 生成（replace）或重新打开本窗口已有的（reuse）预览；flavorId 为 null 时只生成应用摘要。
+   * ready 返回冻结的 JSON 与凭证；rejected 只带固定原因码，原有预览保持不变
+   */
+  diagnosticPreview(req: { flavorId: number | null; mode: 'reuse' | 'replace' }): Promise<DiagPreviewResult>;
+  /** 主进程弹出系统保存框，把凭证对应的冻结 JSON 原样保存为新文件（不覆盖已有文件）；取消与失败均不清除预览（见 previewKept） */
+  diagnosticSave(token: string): Promise<DiagSaveResult>;
 }

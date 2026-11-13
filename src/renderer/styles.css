@@ -80,6 +80,7 @@ button, input, select { font: inherit; color: inherit; }
 .nav-icon-discover { border-radius: 50%; clip-path: circle(50%); }
 .nav-icon-local { clip-path: polygon(25% 3%, 75% 3%, 100% 50%, 75% 97%, 25% 97%, 0 50%); }
 .nav-icon-backup { border-radius: 3px; clip-path: polygon(evenodd, 0 12%, 100% 12%, 100% 100%, 0 100%, 0 12%, 18% 32%, 82% 32%, 82% 46%, 18% 46%, 18% 32%); }
+.nav-icon-diagnostics { clip-path: polygon(0 48%, 24% 48%, 38% 12%, 56% 84%, 68% 40%, 100% 40%, 100% 58%, 78% 58%, 60% 100%, 42% 46%, 34% 66%, 0 66%); }
 .badge {
   margin-left: auto; min-width: 20px; padding: 0 6px;
   border-radius: 10px; background: var(--accent); color: #1a1400;
@@ -128,6 +129,10 @@ select:focus { border-color: var(--accent); }
 }
 /* 无法取得后台插件操作状态：原因与重试 */
 #activity-warning:not(.hidden) { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; }
+/* 未完成的 WTF 恢复：任意页面可见，查看与处理入口 */
+#restore-warning:not(.hidden) { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; }
+.restore-warning-text { flex: 1 1 auto; min-width: 0; overflow-wrap: anywhere; user-select: text; }
+.restore-warning-error { background: var(--danger-soft); color: #f4a3a1; border-bottom-color: rgba(239, 83, 80, .35); }
 .update-notice {
   flex: none; display: flex; align-items: center; flex-wrap: wrap; gap: 8px; padding: 7px 24px;
   background: var(--accent-soft); color: var(--accent);
@@ -544,6 +549,50 @@ select:focus { border-color: var(--accent); }
 }
 .modal-notes-note { margin-top: 6px; font-size: 12px; color: var(--muted); }
 .modal-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 20px; }
+/* 恢复对话框：标题、任务行与按钮固定，中间内容独立滚动（1000×660、125% 缩放下按钮仍在可见范围内） */
+.restore-modal {
+  width: 760px; max-width: calc(100vw - 32px); max-height: calc(100vh - 32px);
+  display: flex; flex-direction: column; padding: 18px 20px 14px;
+}
+.restore-modal:focus { outline: none; }
+.restore-modal .modal-title { flex: none; overflow-wrap: anywhere; }
+.restore-body {
+  flex: 1 1 auto; min-height: 0; overflow-y: auto; overscroll-behavior: contain; padding-right: 6px;
+  display: flex; flex-direction: column; gap: 8px; font-size: 13px; line-height: 1.6; user-select: text;
+}
+.restore-body:focus { outline: none; }
+.restore-body > * { flex: none; min-width: 0; margin-bottom: 0; overflow-wrap: anywhere; }
+.restore-intro { display: flex; flex-direction: column; gap: 4px; line-height: 1.55; }
+.restore-strong { font-weight: 600; }
+.restore-shared { border-width: 2px; }
+.restore-kv { display: grid; grid-template-columns: max-content minmax(0, 1fr); gap: 4px 12px; margin: 0; }
+.restore-kv dt { color: var(--muted); }
+.restore-kv dd { margin: 0; min-width: 0; word-break: break-all; }
+.restore-section-title { font-weight: 600; margin-top: 4px; }
+.restore-counts { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(128px, 100%), 1fr)); gap: 6px; }
+.restore-count { padding: 6px 10px; border-radius: var(--radius-sm); background: var(--panel-2); min-width: 0; }
+.restore-count-n { font-weight: 600; font-variant-numeric: tabular-nums; }
+.restore-count-k { font-size: 12px; color: var(--muted); }
+.restore-count-del .restore-count-n { color: #f08482; }
+.restore-samples {
+  margin: 4px 0 0; padding: 6px 10px 6px 26px; max-height: 132px; overflow-y: auto;
+  background: var(--panel-2); border-radius: var(--radius-sm); font-size: 12px; color: var(--muted); word-break: break-all;
+}
+.restore-acks { display: flex; flex-direction: column; gap: 8px; padding: 10px 12px; border: 1px solid rgba(239, 83, 80, .35); border-radius: var(--radius-sm); }
+.restore-task { flex: none; display: flex; align-items: center; gap: 8px; margin-top: 10px; font-size: 12px; color: var(--muted); font-variant-numeric: tabular-nums; }
+.restore-task-text { flex: 1 1 auto; min-width: 0; overflow-wrap: anywhere; }
+.restore-task .btn { flex: none; }
+.restore-actions { flex: none; flex-wrap: wrap; margin-top: 12px; }
+.restore-list { display: flex; flex-direction: column; gap: 8px; }
+.restore-item { align-items: stretch; }
+.restore-item-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; margin-top: 4px; }
+.restore-reason {
+  padding: 6px 10px; border-radius: var(--radius-sm); background: var(--panel-2);
+  font-family: ui-monospace, "SF Mono", Menlo, monospace; font-size: 12px; white-space: pre-wrap; word-break: break-all; user-select: text;
+}
+.restore-receipts { max-height: 140px; }
+/* 诊断报告页：独立模块的容器（模块自身的样式在 diagnostics.css） */
+.diagnostics-page-body { flex: 1; min-height: 0; min-width: 0; display: flex; flex-direction: column; }
 @keyframes fade-in { from { opacity: 0; } to { opacity: 1; } }
 
 :focus-visible { outline: 2px solid rgba(245, 179, 1, .6); outline-offset: 2px; }

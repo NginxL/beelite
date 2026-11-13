@@ -1,6 +1,7 @@
 // 左侧导航（0.2.1）：编译后的 main.js 启动整套渲染层 → 真实 preload → 真实 AppService（假 electron）→ 临时目录。
-// 三个页面互斥显示；配置加载完成前即可进入配置备份页，加载完成后不强制回到发现插件、不抢焦点；
+// 四个页面（0.3.0 起含诊断报告）互斥显示；配置加载完成前即可进入配置备份页，加载完成后不强制回到发现插件、不抢焦点；
 // 进入配置备份页只读取一次状态，重复点击不重读；我的插件只有五个标签页；其他页面时备份进行中只更新侧栏徽标，不读取备份状态。
+// 启动时对未完成的恢复只读查询一次（不处理）；没有未完成的恢复时侧栏不显示待处理；打开诊断报告页不生成报告。
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { createRequire } from 'node:module';
@@ -31,7 +32,7 @@ FakeElement.prototype.focus = function focus() {
   focused = this;
 };
 // index.html 中的侧栏导航与页面容器
-const PAGES = ['discover', 'local', 'backup'];
+const PAGES = ['discover', 'local', 'backup', 'diagnostics'];
 const navs = PAGES.map((p) => {
   const b = new FakeElement('button');
   b.className = p === 'discover' ? 'nav-item active' : 'nav-item';
@@ -40,7 +41,7 @@ const navs = PAGES.map((p) => {
 });
 globalThis.document.querySelectorAll = (sel) => (sel === '.nav-item' ? navs : []);
 globalThis.document.getElementById('flavor-select').options = [];
-for (const id of ['page-local', 'page-backup', 'backup-badge']) globalThis.document.getElementById(id).classList.add('hidden');
+for (const id of ['page-local', 'page-backup', 'page-diagnostics', 'backup-badge', 'restore-warning']) globalThis.document.getElementById(id).classList.add('hidden');
 const page = (p) => globalThis.document.getElementById(`page-${p}`);
 const visible = () => PAGES.filter((p) => !page(p).classList.contains('hidden'));
 const badge = globalThis.document.getElementById('backup-badge');
@@ -70,6 +71,7 @@ H.ipcCalls.length = 0;
 const web = path.join(here, '..', 'dist', 'web', 'renderer');
 const S = await import(path.join(web, 'state.js'));
 const B = await import(path.join(web, 'backup.js'));
+const R = await import(path.join(web, 'restore.js'));
 await import(path.join(web, 'main.js'));
 
 const calls = (channel) => H.ipcCalls.filter((c) => c.channel === channel).length;
@@ -79,7 +81,7 @@ test.after(async () => {
   await cleanup(base);
 });
 
-test('配置加载前进入配置备份页；加载完成后仍停留在该页、不抢焦点；重复点击不重读；三个页面互斥；我的插件只有五个标签页；其他页面时只更新侧栏徽标', async () => {
+test('配置加载前进入配置备份页；加载完成后仍停留在该页、不抢焦点；重复点击不重读；四个页面互斥；我的插件只有五个标签页；其他页面时只更新侧栏徽标；启动只读查询未完成的恢复；诊断页打开不生成', async () => {
   assert.deepEqual(visible(), ['discover']);
   navs[2].click();
   assert.deepEqual(visible(), ['backup']);
@@ -87,6 +89,15 @@ test('配置加载前进入配置备份页；加载完成后仍停留在该页�
   assert.match(page('backup').textContent, /配置备份/);
   assert.match(page('backup').textContent, /正在读取游戏目录/);
   assert.equal(calls('backup:state'), 0, '还没有目标：不读取');
+
+  // 未完成的恢复：配置加载前就只读查询一次，不处理；查询失败时给出原因（而不是之后徽标超时）
+  await until(() => !R.restorePending().loading && (R.restorePending().view || R.restorePending().error), '启动时的未完成恢复查询');
+  const rp = R.restorePending();
+  assert.equal(rp.error, null, `启动查询失败：${rp.error}`);
+  assert.equal(R.restoreNavBadge(), null, `没有未完成的恢复时不显示待处理：${JSON.stringify(rp.view)}`);
+  assert.ok(globalThis.document.getElementById('restore-warning').classList.contains('hidden'));
+  assert.equal(calls('restore:pending'), 1);
+  assert.equal(calls('restore:resolve'), 0, '启动不处理未完成的恢复');
 
   focused = null;
   releaseConfig({ flavors: [{ id: F, name: '无限', versions: ['1.60.1'], interfaceNumber: 16001, online: true }], categories: [], defaultFlavorId: F, configError: null });
@@ -118,6 +129,14 @@ test('配置加载前进入配置备份页；加载完成后仍停留在该页�
   await until(() => badge.classList.contains('hidden'), '徽标隐藏');
   await settle();
   assert.equal(calls('backup:state'), 1, '页面隐藏时任务开始与结束都不读取');
+
+  // 诊断报告页：互斥显示，打开不生成报告
+  navs[3].click();
+  assert.deepEqual(visible(), ['diagnostics']);
+  assert.match(page('diagnostics').textContent, /诊断报告/);
+  await settle();
+  assert.equal(calls('diagnostic:preview'), 0, '打开页面不生成');
+  assert.equal(calls('backup:state'), 1, '离开配置备份页不读取');
 
   focused = null;
   navs[0].click();

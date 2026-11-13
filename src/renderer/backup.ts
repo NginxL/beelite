@@ -15,11 +15,14 @@
 // - 任务卡片、结果与备份列表中的范围来自主进程（task.scope / snapshot.scope），不使用页面当前的选择。
 // - 备份 / 校验的结果按发起时的目标给出，带原目标说明，常驻显示到用户关闭（警告不会随刷新消失）。
 // - 所有路径、名称、清单信息与错误说明都按纯文本显示（textContent），列表有界、可滚动。
+// - 恢复（restore.ts）：每份合法备份有「预览恢复…」，点击才读取备份与当前完整 WTF；恢复的结果与全局的未完成恢复由 restore.ts 维护，
+//   这里只显示结果。任务快照的每次采用（含同一任务的进度）都通知恢复对话框，让它就地更新进度与取消按钮。
 
 import type { BackupAnomalyKind, BackupCatalog, BackupConfigResult, BackupPhase, BackupScope, BackupSnapshotInfo, BackupState, BackupTaskInfo, BackupTaskSnapshot } from '../shared/types';
 import { MAX_BACKUP_SCOPE_CHARACTERS } from '../shared/backup-types.js';
 import { confirmDialog, h, mount, spinner, toast, type Child } from './dom.js';
 import { errMsg, formatDateTime } from './format.js';
+import { clearRestoreNotice, notRestorable, openRestorePreview, restoreBlockReason, restoreNotice, restoreOriginText, type RestoreNotice } from './restore.js';
 import { api, currentTarget, emit, flavorName, isBusy, on, state, stillTarget, targetKey, type Target } from './state.js';
 
 const BUSY = {
@@ -29,7 +32,7 @@ const BUSY = {
   verify: 'backup:verify',
 } as const;
 
-const BUSY_TITLE = '有备份或校验正在进行，完成后再操作';
+const BUSY_TITLE = '有备份、校验或恢复正在进行，完成后再操作';
 
 // ---------- 页面结构 ----------
 
@@ -57,6 +60,13 @@ interface TaskView {
 /** 任务槽中的任务卡片；页面隐藏时为 null */
 let taskView: TaskView | null = null;
 
+/** 每次采用新的任务快照后的通知（恢复对话框据此就地更新进度） */
+const taskListeners = new Set<() => void>();
+
+export function onBackupTaskChange(fn: () => void): void {
+  taskListeners.add(fn);
+}
+
 /** 主进程中进行中的备份 / 校验任务（任意目录） */
 export function backupTask(): BackupTaskInfo | null {
   return snap?.task ?? null;
@@ -83,6 +93,13 @@ export function applyBackupTask(s: BackupTaskSnapshot): boolean {
     emit('backup');
   } else if (next && taskView?.id === next.id) {
     updateTaskView(taskView, next);
+  }
+  for (const fn of taskListeners) {
+    try {
+      fn();
+    } catch (err) {
+      console.error(err);
+    }
   }
   return true;
 }
@@ -185,8 +202,13 @@ export function refreshBackup(t: Target): void {
 }
 
 function refreshIfShowing(task: BackupTaskInfo): void {
+  refreshBackupIfShowing(task);
+}
+
+/** 页面打开且当前目标正是 origin 时重新读取备份状态（恢复或处理结束后；不读取插件本地状态） */
+export function refreshBackupIfShowing(origin: Target): void {
   const t = currentTarget();
-  if (pageOpen && t && t.flavorId === task.flavorId && t.root === task.root) refreshBackup(t);
+  if (pageOpen && t && t.flavorId === origin.flavorId && t.root === origin.root) refreshBackup(t);
 }
 
 async function load(t: Target): Promise<void> {
@@ -596,12 +618,18 @@ export async function verifyBackup(t: Target, snapshotId: string): Promise<void>
   });
 }
 
-/** 按任务受理时的原值取消（可能不是当前显示的目录） */
-export async function cancelBackupTask(task: BackupTaskInfo): Promise<void> {
+/**
+ * 按任务受理时的原值取消（可能不是当前显示的目录）。返回请求本身的结果，不代表任务已经取消：
+ * requested：主进程已受理取消请求（结果以任务的返回为准）；ended：主进程没有找到这个任务（已结束）；failed：请求失败，可以重试
+ */
+export async function cancelBackupTask(task: BackupTaskInfo): Promise<'requested' | 'ended' | 'failed'> {
   try {
-    if (!(await api().backupCancel(task.id, task.flavorId, task.root))) toast('该任务已经结束，没有取消', 'info');
+    if (await api().backupCancel(task.id, task.flavorId, task.root)) return 'requested';
+    toast('该任务已经结束，没有取消', 'info');
+    return 'ended';
   } catch (err) {
     toast(errMsg(err), 'error');
+    return 'failed';
   }
 }
 
@@ -619,7 +647,7 @@ const GB = 1024 ** 3;
 const MB = 1024 ** 2;
 
 /** 按文件大小（字节）统计的占用 */
-function bytesText(n: number): string {
+export function bytesText(n: number): string {
   if (n >= GB) return `${+(n / GB).toFixed(2)} GB`;
   if (n >= MB) return `${+(n / MB).toFixed(2)} MB`;
   if (n >= 1024) return `${+(n / 1024).toFixed(1)} KB`;
@@ -633,7 +661,23 @@ const PHASE_TEXT: Record<BackupPhase, string> = {
   publishing: '正在核对并保存',
   verifying: '正在校验内容',
   cleanup: '正在清理未完成的内容',
+  'safety-copy': '正在备份恢复前的 WTF',
+  staging: '正在准备恢复的内容',
+  swapping: '正在替换（不可取消）',
 };
+
+/** 任务当前阶段的说明（不含取消状态） */
+export function phaseText(task: BackupTaskInfo): string {
+  return PHASE_TEXT[task.phase] ?? '进行中';
+}
+
+function taskName(task: BackupTaskInfo): string {
+  if (task.kind === 'run') return '正在备份';
+  if (task.kind === 'verify') return `正在校验 ${task.snapshotId ?? ''}`;
+  if (task.kind === 'restore-preview') return `正在预览恢复 ${task.snapshotId ?? ''}`;
+  if (task.kind === 'restore') return `正在恢复 ${task.snapshotId ?? ''}`;
+  return '正在处理未完成的恢复';
+}
 
 const ANOMALY_TEXT: Record<BackupAnomalyKind, string> = {
   incomplete: '未完成的备份',
@@ -661,7 +705,7 @@ const INTRO = [
   '启用后，点击“创建备份”时会把当前游戏目录中的 WTF 文件夹（或你选择的账号、角色部分）复制到你选择的位置。WTF 里保存着账号、角色与插件的设置，可能包含账号名等个人信息。',
   '备份保存到你选择的文件夹，艾泽魔方不会主动上传；如果选择的是 iCloud 等云盘同步的文件夹，副本可能会被云盘同步。不会自动备份，也不会自动删除旧备份。',
   '建议先退出游戏再备份：备份期间游戏写入设置会导致本次备份失败；备份是逐个文件复制并核对的副本，不是瞬间快照。',
-  '艾泽魔方不提供一键还原。需要时请在访达中打开备份，自行复制所需文件。',
+  '启用后可以把某一份备份恢复到当前游戏目录：点击备份旁的“预览恢复…”才会读取这份备份与当前完整 WTF，先显示会新增、覆盖与删除的内容；确认已退出游戏并勾选两项确认后，点击“执行恢复”才会改动 WTF。恢复按备份记录的原范围进行，当前有 WTF 时，执行前会先把完整 WTF 另存为一份恢复前备份。',
 ];
 
 /** 主体重绘时把焦点还给同一个控件（按稳定的键对应）；只恢复原本就在本页面中的焦点，不从其他地方抢走 */
@@ -740,6 +784,8 @@ function bodyParts(t: Target | null): Child[] {
     ));
   }
   if (notice) parts.push(noticeBox(notice, t));
+  const rn = restoreNotice();
+  if (rn) parts.push(restoreNoticeBox(rn, t));
   if (!t) {
     parts.push(noTargetBox());
     return parts;
@@ -800,6 +846,24 @@ function noticeBox(n: Notice, t: Target | null): HTMLElement {
   );
 }
 
+/** 最近一次恢复或处理未完成恢复的结果（来自主进程返回的 outcome，带原目录；换目录不丢失） */
+function restoreNoticeBox(n: RestoreNotice, t: Target | null): HTMLElement {
+  const cls = n.kind === 'error' ? 'banner banner-error' : n.kind === 'warn' ? 'banner banner-warn' : 'banner backup-notice';
+  const other = !t || t.flavorId !== n.origin.flavorId || t.root !== n.origin.root;
+  return h('div', { class: `${cls} backup-result` },
+    h('div', { class: 'backup-result-title', text: n.title }),
+    h('div', { class: 'backup-meta', text: `${formatDateTime(n.at)} · ${other ? `原目录（不是当前显示的目录）：${restoreOriginText(n.origin)}` : restoreOriginText(n.origin)}` }),
+    n.lines.length ? h('div', { class: 'backup-lines' }, n.lines.map((l) => h('div', { text: l }))) : null,
+    fk('restore-notice-close', h('button', { class: 'btn btn-sm', on: { click: clearRestoreNotice } }, '知道了')),
+  );
+}
+
+/** 把焦点还给本页面中的某个控件（恢复对话框关闭时；控件已不存在或已禁用时不移动） */
+function focusControl(key: string): void {
+  const el = focusEls.get(key) as (HTMLElement & { disabled?: boolean }) | undefined;
+  if (el && !el.disabled) el.focus({ preventScroll: true });
+}
+
 function buildTaskView(task: BackupTaskInfo): TaskView {
   const id = task.id;
   const v: TaskView = {
@@ -842,16 +906,17 @@ function updateTaskView(v: TaskView, task: BackupTaskInfo): void {
   const origin: Target = { flavorId: task.flavorId, root: task.root };
   const now = currentTarget();
   const other = !now || targetKey(now) !== targetKey(origin);
-  setText(v.name, task.kind === 'run' ? '正在备份' : `正在校验 ${task.snapshotId ?? ''}`);
+  setText(v.name, taskName(task));
   setText(v.phase, task.cancelling ? '正在取消…' : PHASE_TEXT[task.phase]);
   setText(v.progress, task.filesTotal > 0 || task.bytesTotal > 0
     ? `${task.filesDone} / ${task.filesTotal} 个文件 · ${bytesText(task.bytesDone)} / ${bytesText(task.bytesTotal)}`
     : '');
-  setText(v.scope, task.kind === 'run' ? `范围：${scopeText(task.scope)}` : '');
+  setText(v.scope, task.kind === 'run' || task.scope ? `范围：${scopeText(task.scope)}` : '');
   if (v.scope.title !== scopeTitle(task.scope)) v.scope.title = scopeTitle(task.scope);
   setText(v.origin, `${other ? '原目录（不是当前显示的目录）：' : ''}${originText(origin)}`);
-  if (v.cancel.disabled !== task.cancelling) v.cancel.disabled = task.cancelling;
-  setText(v.cancel, task.cancelling ? '正在取消' : '取消');
+  const noCancel = task.cancelling || task.cancellable === false;
+  if (v.cancel.disabled !== noCancel) v.cancel.disabled = noCancel;
+  setText(v.cancel, task.cancelling ? '正在取消' : task.cancellable === false ? '不可取消' : '取消');
 }
 
 function disabledParts(t: Target, s: BackupState): HTMLElement[] {
@@ -922,7 +987,7 @@ function enabledParts(t: Target, s: BackupState): HTMLElement[] {
   if (draft) out.push(h('div', { class: draft.scope ? 'backup-summary' : 'backup-summary backup-summary-missing', text: draft.text }));
   if (ready) {
     out.push(s.snapshots.length
-      ? h('div', { class: 'row-list backup-list' }, s.snapshots.map((x) => snapshotRow(t, x, active, stale)))
+      ? h('div', { class: 'row-list backup-list' }, s.snapshots.map((x) => snapshotRow(t, s, x, active, stale)))
       : h('div', { class: 'state-box small', text: '还没有备份。选择范围后点击“创建备份”。' }));
   }
   out.push(limitsBox(s));
@@ -1055,14 +1120,20 @@ function snapshotStatus(x: BackupSnapshotInfo): { cls: string; text: string; det
   return { cls: 'tag tag-muted', text: '结构检查通过，尚未校验内容', detail: null };
 }
 
-/** stale：状态未成功刷新时暂停重新校验（旧列表可能已过时）；在访达中显示由主进程按登记路径核对，保持可用 */
-function snapshotRow(t: Target, x: BackupSnapshotInfo, active: boolean, stale: string | null): HTMLElement {
+/**
+ * stale：状态未成功刷新时暂停重新校验与预览恢复（旧列表可能已过时）；在访达中显示由主进程按登记路径核对，保持可用。
+ * 「预览恢复…」只出现在结构检查通过、范围可确认、没有校验失败记录的备份上；有未完成的恢复或无法确认时禁用（主进程另有同样的检查）
+ */
+function snapshotRow(t: Target, s: BackupState, x: BackupSnapshotInfo, active: boolean, stale: string | null): HTMLElement {
   const st = snapshotStatus(x);
+  const restorable = notRestorable(x) === null;
+  const restoreWhy = active ? BUSY_TITLE : stale ?? (s.error ? s.error : restoreBlockReason(t));
   return h('div', { class: 'row backup-row' },
     h('div', { class: 'row-main' },
       h('div', { class: 'row-title' },
         h('span', { class: 'row-name mono', text: x.id }),
         h('span', { class: st.cls, text: st.text }),
+        x.purpose === 'pre-restore' ? h('span', { class: 'tag tag-muted', text: '恢复前自动备份' }) : null,
       ),
       h('div', { class: 'row-meta' },
         x.createdAt ? h('span', { text: `创建于 ${formatDateTime(x.createdAt)}` }) : null,
@@ -1080,6 +1151,12 @@ function snapshotRow(t: Target, x: BackupSnapshotInfo, active: boolean, stale: s
         on: { click: () => void verifyBackup(t, x.id) },
       },
         isBusy(BUSY.verify) && snap?.task?.snapshotId === x.id ? [spinner(true), '校验中'] : '重新校验')),
+      restorable ? fk(`restore:${x.id}`, h('button', {
+        class: 'btn btn-sm',
+        disabled: !!restoreWhy,
+        title: restoreWhy ?? '读取这份备份与当前完整 WTF，显示恢复会新增、覆盖与删除的内容；预览不改动任何文件',
+        on: { click: () => openRestorePreview(t, x, { usage: s.usage, limits: s.limits }, () => focusControl(`restore:${x.id}`)) },
+      }, '预览恢复…')) : null,
       fk(`reveal:${x.id}`, h('button', { class: 'btn btn-sm', on: { click: () => void reveal(t, x.id) } }, '在访达中显示')),
     ),
   );

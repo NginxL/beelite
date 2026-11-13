@@ -267,7 +267,10 @@ test('我的插件只有五个标签页；进入配置备份页才读取状态�
     assert.doesNotMatch(text, /只保存在这台电脑/);
     assert.match(text, /建议先退出游戏/);
     assert.match(text, /不是瞬间快照/);
-    assert.match(text, /不提供一键还原/);
+    // 0.3.0 起提供应用内恢复：说明只在点击“预览恢复…”时才读取，执行需要确认
+    assert.doesNotMatch(text, /不提供一键还原/);
+    assert.match(text, /点击备份旁的“预览恢复…”才会读取这份备份与当前完整 WTF/);
+    assert.match(text, /勾选两项确认后，点击“执行恢复”才会改动 WTF/);
     assert.match(text, /启用后可以选择备份全部 WTF、指定账号或指定角色/);
     assert.ok(!radio('account'), '未启用时没有范围选择');
     assert.ok(!button('恢复') && !button('还原'), '没有恢复入口');

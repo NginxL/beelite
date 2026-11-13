@@ -63,9 +63,11 @@ export interface CatalogLimits {
   maxWarnings: number;
 }
 
-export type BackupTaskKind = 'run' | 'verify';
+/** restore-preview：读取并核对备份与当前 WTF；restore：执行恢复；restore-resolve：处理未完成的恢复 */
+export type BackupTaskKind = 'run' | 'verify' | 'restore-preview' | 'restore' | 'restore-resolve';
 
-export type BackupPhase = 'preparing' | 'copying' | 'rechecking' | 'publishing' | 'verifying' | 'cleanup';
+/** safety-copy：生成恢复前的完整备份；staging：准备恢复后的候选内容；swapping：替换与提交（不可取消） */
+export type BackupPhase = 'preparing' | 'copying' | 'rechecking' | 'publishing' | 'verifying' | 'cleanup' | 'safety-copy' | 'staging' | 'swapping';
 
 /** 主进程中唯一的备份 / 校验任务；界面重新载入后据此恢复进度与取消按钮 */
 export interface BackupTaskInfo {
@@ -84,6 +86,8 @@ export interface BackupTaskInfo {
   bytesDone: number;
   bytesTotal: number;
   cancelling: boolean;
+  /** false：任务处于不可取消的阶段（恢复的替换、提交与安全回滚），取消请求不会被受理，退出会等待它结束 */
+  cancellable: boolean;
   startedAt: number;
 }
 
@@ -116,6 +120,8 @@ export interface BackupSnapshotInfo {
   reason: string | null;
   /** 本次运行期间最近一次重新校验的结果；只存内存，不代表之后备份未被改动 */
   lastVerify: BackupVerifyRecord | null;
+  /** pre-restore：恢复之前自动生成的完整 WTF 备份（清单可选字段，旧版本会忽略） */
+  purpose?: 'pre-restore';
 }
 
 /**
