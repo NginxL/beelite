@@ -7,6 +7,7 @@
 //   进度与取消按钮是对话框中固定的节点，只就地更新（任务快照按 rev 采用，见 backup.ts）。
 // - 执行与处理的结果按主进程返回的 outcome 显示并注明原目录，常驻到用户关闭；换目录、关闭对话框都不丢失。
 // - 未完成的恢复：启动时只读查询，不自动处理；任意页面顶部都能看到并打开处理对话框（不依赖当前绑定、页面或备份是否启用）。
+//   主进程中的恢复 / 处理任务结束时（按任务快照，包括界面重新载入前开始的任务）重新查询；按目录判断能否恢复，与主进程一致。
 //   处理只提交 txid 与重新确认的“已退出游戏”；完成后只重新查询未完成的恢复与配置备份状态，
 //   不读取插件本地状态（localState / refreshLocal 可能恢复插件事务）。
 // - receipts 是登记中已结束事务的最终记录；本次执行 / 处理的结果是调用的返回值，两者分开显示。
@@ -75,6 +76,23 @@ export async function refreshPending(): Promise<void> {
   }
 }
 
+/** 最近一次采用的任务快照中的任务；undefined 表示还没有采用过任何快照 */
+let lastTask: { id: string; kind: BackupTaskKind } | null | undefined;
+
+/**
+ * 每次采用任务快照：第一次采用时查询一次（启动查询可能早于快照，期间进行中的恢复可能已经结束）；之后只在恢复或处理任务结束
+ * （编号变化）时查询，与发起它的界面是否还在无关（重新载入后同样刷新）。同一任务的进度、预览与备份 / 校验的结束都不查询；
+ * 查询中再次请求只补查一轮。然后就地更新对话框的任务行
+ */
+function onTaskSnapshot(): void {
+  const t = backupTask();
+  const prev = lastTask;
+  lastTask = t ? { id: t.id, kind: t.kind } : null;
+  const ended = !!prev && prev.id !== t?.id && (prev.kind === 'restore' || prev.kind === 'restore-resolve');
+  if (prev === undefined || ended) void refreshPending();
+  updateTask();
+}
+
 /**
  * 需要提醒的情况；null 表示最近一次查询成功且确认没有未完成的恢复。
  * 查询失败优先：即使上次查询的结果为空也提醒（此时所有恢复都被禁止，必须能看到原因并重试）
@@ -110,13 +128,13 @@ export function restoreNavBadge(): string | null {
 
 /**
  * 不能为这个目标预览或执行恢复的原因（界面提示；主进程另有同样的检查）：
- * 尚未确认没有未完成的恢复、恢复登记无法读取，或这个目录有未完成的恢复
+ * 尚未确认没有未完成的恢复、恢复登记无法读取，或这个目录有未完成的恢复（与主进程相同，只按目录判断，不论属于哪个游戏版本）
  */
 export function restoreBlockReason(t: Target): string | null {
   if (!pending) return pendingError ? `无法确认是否有未完成的恢复：${pendingError}` : '正在检查是否有未完成的恢复…';
   if (pendingError) return '未完成恢复的状态未能刷新，请先在顶部的提示中重试';
   if (pending.registryError) return '恢复登记无法读取，已停止所有恢复';
-  if (pending.items.some((i) => i.root === t.root && (i.flavorId === null || i.flavorId === t.flavorId))) return '这个目录有未完成的恢复，请先在顶部的提示中查看并处理';
+  if (pending.items.some((i) => i.root === t.root)) return '这个目录有未完成的恢复，请先在顶部的提示中查看并处理';
   return null;
 }
 
@@ -1023,6 +1041,7 @@ export function initRestore(banner: HTMLElement): void {
   on('backup', () => {
     if (view) renderView();
   });
-  onBackupTaskChange(updateTask);
+  // 恢复 / 处理任务结束时重新查询未完成的恢复（见 onTaskSnapshot）
+  onBackupTaskChange(onTaskSnapshot);
   renderBanner();
 }

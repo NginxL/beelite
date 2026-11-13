@@ -49,8 +49,13 @@ export function parseSettings(text: string, file: string): Settings {
 /**
  * 不缓存：每次都从磁盘读取并校验。只有文件不存在才视为首次运行的空配置；
  * 读取失败或内容不合法时一律报错，写入前也会先复核，保证不会覆盖用户原有的配置文件。
+ * bind 在本实例内串行（整个 读取 → 核对 → 修改 → 保存 过程），不同游戏版本的绑定修改不会互相覆盖；
+ * 应用中只有一个实例，设置文件只经由 bind 修改。直接调用 save 不经过这个队列，调用方自行避免并发
  */
 export class SettingsStore {
+  /** bind 的串行队列：前一次无论成败都不影响下一次 */
+  private queue: Promise<unknown> = Promise.resolve();
+
   constructor(private readonly file: string) {}
 
   async load(): Promise<Settings> {
@@ -72,16 +77,20 @@ export class SettingsStore {
   }
 
   async profile(flavorId: number): Promise<ProfileInfo> {
-    const s = await this.load();
-    const root = s.bindings[String(flavorId)] ?? null;
-    return { flavorId, root, addonsPath: root ? path.join(root, 'Interface', 'AddOns') : null };
+    return profileOf(await this.load(), flavorId);
   }
 
   /**
    * 绑定或解除绑定。expectCurrent 给出时，只有该版本当前绑定的目录（未绑定为 null）与之相同才写入，
-   * 用来防止界面确认期间绑定已被改变。
+   * 用来防止界面确认期间绑定已被改变。与其他 bind 串行；返回刚保存的结果（不再读取，保存成功就不会报失败）
    */
-  async bind(flavorId: number, root: string | null, expectCurrent?: string | null): Promise<ProfileInfo> {
+  bind(flavorId: number, root: string | null, expectCurrent?: string | null): Promise<ProfileInfo> {
+    const run = this.queue.then(() => this.doBind(flavorId, root, expectCurrent));
+    this.queue = run.catch(() => undefined);
+    return run;
+  }
+
+  private async doBind(flavorId: number, root: string | null, expectCurrent?: string | null): Promise<ProfileInfo> {
     const s = await this.load();
     if (expectCurrent !== undefined && (s.bindings[String(flavorId)] ?? null) !== expectCurrent) {
       throw new UserError('游戏目录绑定已变更，未做任何改动，请刷新后重试', 'target');
@@ -93,8 +102,13 @@ export class SettingsStore {
     }
     else delete s.bindings[String(flavorId)];
     await this.save(s);
-    return this.profile(flavorId);
+    return profileOf(s, flavorId);
   }
+}
+
+function profileOf(s: Settings, flavorId: number): ProfileInfo {
+  const root = s.bindings[String(flavorId)] ?? null;
+  return { flavorId, root, addonsPath: root ? path.join(root, 'Interface', 'AddOns') : null };
 }
 
 export interface RootInspection {

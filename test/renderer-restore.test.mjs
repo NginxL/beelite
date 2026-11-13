@@ -394,3 +394,103 @@ test('取消请求失败期间任务进入不可取消阶段：按最新快照�
   btn('关闭').click();
   R.clearRestoreNotice();
 });
+
+// ---------- 0.3.1 ----------
+
+const pendingItem = (txid, root, flavorId = F) => ({
+  txid, flavorId, root, containerPath: '/demo/backups/AzerCube-WTF', state: 'blocked', outcome: null, reason: '演示', createdAt: 1,
+  sourceSnapshotId: SNAP.id, safetySnapshotId: null, scope: { kind: 'all' },
+});
+
+test('按目录判断（与主进程一致）：同一目录属于其他游戏版本或版本未知的未完成恢复都阻止预览，其他目录不受影响', async () => {
+  handlers.backupRestorePending = async () => ({
+    ...emptyPending(),
+    items: [
+      pendingItem('tx-other-flavor', A, 6),
+      { ...pendingItem(null, B, null), state: 'unregistered', containerPath: null, sourceSnapshotId: null, scope: null },
+    ],
+  });
+  await R.refreshPending();
+  assert.ok(R.restoreBlockReason({ flavorId: F, root: A }), '同一目录、另一游戏版本的未完成恢复');
+  assert.ok(R.restoreBlockReason({ flavorId: F, root: B }), '同一目录、游戏版本未知');
+  assert.equal(R.restoreBlockReason({ flavorId: F, root: '/demo/E' }), null, '其他目录不受影响');
+  setTarget(A);
+  const before = called('backupRestorePreview').length;
+  R.openRestorePreview({ flavorId: F, root: A }, SNAP, { usage: null, limits: null }, () => undefined);
+  assert.equal(openModals(dom).length, 0);
+  assert.equal(called('backupRestorePreview').length, before, '不发出注定被主进程拒绝的预览');
+});
+
+test('恢复 / 处理任务结束时重新查询（不依赖发起它的对话框）；开始、进度、过时快照、预览与备份 / 校验的结束都不查询；查询中只补查一轮', async () => {
+  const n = () => called('backupRestorePending').length;
+  handlers.backupRestorePending = async () => ({ ...emptyPending(), items: [pendingItem('tx-a', A), pendingItem('tx-b', B)] });
+  await R.refreshPending();
+  assert.ok(R.restoreBlockReason({ flavorId: F, root: A }));
+  assert.ok(R.restoreBlockReason({ flavorId: F, root: B }));
+
+  // 后台恢复（目录 A）：开始与同一任务的进度不查询，过时的快照不采用
+  const n0 = n();
+  const task = taskOf({ id: 'bg-restore', kind: 'restore', phase: 'staging' });
+  B_.applyBackupTask({ rev: 400, task });
+  B_.applyBackupTask({ rev: 401, task: { ...task, filesDone: 1 } });
+  B_.applyBackupTask({ rev: 402, task: { ...task, filesDone: 2, phase: 'swapping', cancellable: false } });
+  assert.equal(B_.applyBackupTask({ rev: 401, task: null }), false);
+  await tick();
+  assert.equal(n(), n0, '开始与进度不查询');
+
+  // 结束：查询一次；结果只反映主进程（目录 B 的未完成恢复仍阻止）
+  const dq = deferred();
+  handlers.backupRestorePending = () => dq.promise;
+  B_.applyBackupTask({ rev: 403, task: null });
+  assert.equal(n(), n0 + 1, '恢复结束后查询一次');
+  B_.applyBackupTask({ rev: 404, task: null });
+  assert.equal(n(), n0 + 1, '空闲快照不查询');
+  dq.resolve({ ...emptyPending(), items: [pendingItem('tx-b', B)] });
+  await tick();
+  await tick();
+  assert.equal(n(), n0 + 1);
+  assert.equal(R.restoreBlockReason({ flavorId: F, root: A }), null, '目录 A 的恢复已结束');
+  assert.ok(R.restoreBlockReason({ flavorId: F, root: B }), '目录 B 的未完成恢复仍阻止');
+
+  // 预览、备份与校验的结束不查询
+  let rev = 410;
+  for (const kind of ['restore-preview', 'run', 'verify']) {
+    B_.applyBackupTask({ rev: rev++, task: taskOf({ id: `bg-${kind}`, kind }) });
+    B_.applyBackupTask({ rev: rev++, task: null });
+  }
+  await tick();
+  assert.equal(n(), n0 + 1, '其他任务的结束不查询');
+
+  // 查询进行中，处理任务（目录 B）结束：只补查一轮，最终采用补查的结果
+  const dq2 = deferred();
+  handlers.backupRestorePending = () => dq2.promise;
+  const manual = R.refreshPending();
+  assert.equal(n(), n0 + 2);
+  const resolveTask = taskOf({ id: 'bg-resolve', kind: 'restore-resolve', root: B, phase: 'swapping', cancellable: false });
+  B_.applyBackupTask({ rev: rev++, task: resolveTask });
+  B_.applyBackupTask({ rev: rev++, task: null });
+  assert.equal(n(), n0 + 2, '查询中不重复发出');
+  handlers.backupRestorePending = async () => emptyPending();
+  dq2.resolve({ ...emptyPending(), items: [pendingItem('tx-b', B)] });
+  await manual;
+  await tick();
+  await tick();
+  assert.equal(n(), n0 + 3, '补查一轮');
+  assert.equal(R.restoreBlockReason({ flavorId: F, root: B }), null);
+  assert.ok(banner.classList.contains('hidden'));
+
+  // 结束后的查询失败：错误可见，仍阻止恢复
+  B_.applyBackupTask({ rev: rev++, task: taskOf({ id: 'bg-restore-2', kind: 'restore' }) });
+  handlers.backupRestorePending = async () => {
+    throw new Error('演示：结束后查询失败');
+  };
+  B_.applyBackupTask({ rev: rev++, task: null });
+  await tick();
+  await tick();
+  assert.equal(n(), n0 + 4);
+  assert.match(banner.textContent, /未能刷新：演示：结束后查询失败/);
+  assert.ok(R.restoreBlockReason({ flavorId: F, root: A }));
+  handlers.backupRestorePending = async () => emptyPending();
+  await R.refreshPending();
+  assert.equal(R.restoreBlockReason({ flavorId: F, root: A }), null);
+});

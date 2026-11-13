@@ -164,6 +164,150 @@ test('设置：解绑时当前绑定与期望不同则拒绝，文件不变', as
   }
 });
 
+// ---------- 0.3.1：bind 串行 ----------
+
+/** 挂起第一次保存（进入时 reached 完成，release 后继续）；之后的保存照常 */
+function holdFirstSave(s: SettingsStore): { reached: Promise<void>; release: () => void } {
+  const real = s.save.bind(s);
+  let release!: () => void;
+  let entered!: () => void;
+  const held = new Promise<void>((r) => (release = r));
+  const reached = new Promise<void>((r) => (entered = r));
+  let first = true;
+  s.save = async (next) => {
+    if (first) {
+      first = false;
+      entered();
+      await held;
+    }
+    return real(next);
+  };
+  return { reached, release };
+}
+
+const bindingsOf = async (file: string) => (JSON.parse(await readFile(file, 'utf8')) as { bindings: Record<string, string> }).bindings;
+
+test('设置：不同游戏版本的 bind 整段串行，前一次保存较慢时后一次不会先读取，两次修改都保留；未知字段保留', async () => {
+  const { base, file } = await setup();
+  try {
+    await writeFile(file, JSON.stringify({ schema: 1, bindings: { 9: '/x/a', 2: '/x/b' }, lastFlavorId: 9, future: { keep: true } }));
+    const s = new SettingsStore(file);
+    const hold = holdFirstSave(s);
+    const a = s.bind(9, null, '/x/a');
+    await hold.reached;
+    let bDone = false;
+    const b = s.bind(2, null, '/x/b').finally(() => (bDone = true));
+    await new Promise((r) => setTimeout(r, 30));
+    assert.equal(bDone, false, '前一次 bind 结束之前，后一次不开始');
+    assert.deepEqual(await bindingsOf(file), { 9: '/x/a', 2: '/x/b' });
+    hold.release();
+    assert.deepEqual(await a, { flavorId: 9, root: null, addonsPath: null });
+    assert.deepEqual(await b, { flavorId: 2, root: null, addonsPath: null });
+    const after = JSON.parse(await readFile(file, 'utf8'));
+    assert.deepEqual(after.bindings, {}, '先保存的解绑没有被后一次写回');
+    assert.deepEqual(after.future, { keep: true });
+    assert.equal(after.lastFlavorId, 9);
+  } finally {
+    await cleanup(base);
+  }
+});
+
+test('设置：排队中的 bind 按前一次保存后的内容核对 expectCurrent 与重复目录', async () => {
+  const { base, file } = await setup();
+  try {
+    await writeFile(file, JSON.stringify({ schema: 1, bindings: { 9: '/x/a' }, lastFlavorId: null }));
+    const s = new SettingsStore(file);
+    const hold = holdFirstSave(s);
+    const first = s.bind(9, '/x/new', '/x/a');
+    await hold.reached;
+    // 同一版本：排队时期望的旧目录已被前一次改掉
+    const stale = s.bind(9, null, '/x/a');
+    // 另一版本：要绑定的目录刚被前一次绑定给版本 9
+    const dup = s.bind(2, '/x/new', null);
+    hold.release();
+    assert.equal((await first).root, '/x/new');
+    await assert.rejects(stale, (err: unknown) => err instanceof Error && 'code' in err && err.code === 'target');
+    await assert.rejects(dup, /同一目录不能用于两个游戏版本/);
+    assert.deepEqual(await bindingsOf(file), { 9: '/x/new' });
+  } finally {
+    await cleanup(base);
+  }
+});
+
+test('设置：前一次 bind 失败不影响排队中的下一次', async () => {
+  const { base, file } = await setup();
+  try {
+    await writeFile(file, JSON.stringify({ schema: 1, bindings: { 9: '/x/a' }, lastFlavorId: null }));
+    const s = new SettingsStore(file);
+    const real = s.save.bind(s);
+    let fail = true;
+    s.save = async (next) => {
+      await new Promise((r) => setTimeout(r, 10));
+      if (fail) {
+        fail = false;
+        throw new Error('注入的写入失败');
+      }
+      return real(next);
+    };
+    const bad = s.bind(9, null, '/x/a');
+    const next = s.bind(2, '/x/b', null);
+    await assert.rejects(bad, /注入的写入失败/);
+    assert.equal((await next).root, '/x/b');
+    assert.deepEqual(await bindingsOf(file), { 9: '/x/a', 2: '/x/b' });
+    // 之后的 bind 照常
+    assert.equal((await s.bind(9, null, '/x/a')).root, null);
+    assert.deepEqual(await bindingsOf(file), { 2: '/x/b' });
+  } finally {
+    await cleanup(base);
+  }
+});
+
+test('设置：保存成功后 bind 返回保存的结果，之后的读取失败不把已写入的修改报成失败', async () => {
+  const { base, file } = await setup();
+  try {
+    await writeFile(file, JSON.stringify({ schema: 1, bindings: { 9: '/x/a' }, lastFlavorId: null }));
+    const s = new SettingsStore(file);
+    const realSave = s.save.bind(s);
+    const realLoad = s.load.bind(s);
+    let saved = false;
+    s.save = async (next) => {
+      await realSave(next);
+      saved = true;
+    };
+    s.load = async () => {
+      if (saved) throw new Error('保存之后的读取失败');
+      return realLoad();
+    };
+    assert.deepEqual(await s.bind(2, '/x/b'), { flavorId: 2, root: '/x/b', addonsPath: path.join('/x/b', 'Interface', 'AddOns') });
+    assert.deepEqual(await bindingsOf(file), { 9: '/x/a', 2: '/x/b' });
+  } finally {
+    await cleanup(base);
+  }
+});
+
+test('设置（IPC）：界面重新载入后解绑另一版本（0.3.0 复现）：前一次较慢的解绑不会把刚解除的绑定写回', async () => {
+  const { base, file } = await setup();
+  try {
+    const a = await makeGameRoot(path.join(base, 'a'));
+    const b = await makeGameRoot(path.join(base, 'b'));
+    await writeFile(file, JSON.stringify({ schema: 1, bindings: { 9: a, 2: b }, lastFlavorId: 9 }));
+    const h = createHarness({ settingsFile: file, source: new FakeSource() });
+    const hold = holdFirstSave(h.settings);
+    // 旧界面解绑版本 9，写入挂起；重新载入后的新界面没有 busy 标记，解绑版本 2（不同目录，绑定占位互不冲突）
+    const first = h.api.unbindProfile(9, a);
+    await hold.reached;
+    const second = h.api.unbindProfile(2, b);
+    hold.release();
+    assert.equal((await first).root, null);
+    assert.equal((await second).root, null);
+    assert.deepEqual(await bindingsOf(file), {}, '两次解绑都保留');
+    assert.equal(h.gate.activeCount, 0);
+    h.service.watch.stop();
+  } finally {
+    await cleanup(base);
+  }
+});
+
 test('设置：IPC 层读取本地状态时报错且可重试；选择目录前即拒绝；解绑不改动文件', async () => {
   const { base, file } = await setup();
   try {

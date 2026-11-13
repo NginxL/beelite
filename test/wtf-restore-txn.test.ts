@@ -805,6 +805,155 @@ test('目标占用的删除未能确认写入磁盘：登记保留为待处理�
   }
 });
 
+// ---------- 0.3.1：新建事务目录之后的同步失败 ----------
+
+const eio = () => Object.assign(new Error('injected'), { code: 'EIO' });
+const isFsync = (err: unknown) => err instanceof UserError && err.code.startsWith('restore-fsync');
+type TxFault = 'control' | 'appData';
+
+/** 本次新建、还没有 journal 的事务目录（prepare 中 mkdir 之后、journal(preparing) 之前）；没有时为 null */
+async function freshTx(f: Setup): Promise<string | null> {
+  const [n] = await txDirs(f);
+  if (!n) return null;
+  const tx = path.join(f.control, n);
+  return (await stat(path.join(tx, 'journal.json')).then(() => true, () => false)) ? null : tx;
+}
+
+/** 按状态判断故障点：control 为新事务目录之后同步工作目录；appData 为事务目录身份写入登记之后同步登记所在目录 */
+async function atNewTx(f: Setup, mode: TxFault, dir: string): Promise<string | null> {
+  if (dir !== (mode === 'control' ? f.control : path.dirname(f.registryFile))) return null;
+  const tx = await freshTx(f);
+  if (!tx) return null;
+  if (mode === 'appData') {
+    const reg = JSON.parse(await readFile(f.registryFile, 'utf8')) as { entries: { txdirId: string | null }[] };
+    if (!reg.entries[0]?.txdirId) return null;
+  }
+  return tx;
+}
+
+async function regEntries(f: Setup): Promise<{ txid: string; txdirId: string | null; outcome: string | null }[]> {
+  return (JSON.parse(await readFile(f.registryFile, 'utf8')) as { entries: { txid: string; txdirId: string | null; outcome: string | null }[] }).entries;
+}
+
+for (const mode of ['control', 'appData'] as const) {
+  test(`新建事务目录之后的同步单次失败（${mode}）：按身份删除本次的空目录并结清登记，不留未登记目录，之后可以再次恢复`, async () => {
+    const f = await setup();
+    try {
+      const snapBefore = await readTree(f.snapDir);
+      const save = strictIo.syncDir;
+      let created: string | null = null;
+      strictIo.syncDir = async (dir) => {
+        const tx = created === null ? await atNewTx(f, mode, dir) : null;
+        if (tx) {
+          created = idOf(await lstat(tx, { bigint: true }));
+          throw eio();
+        }
+        return save(dir);
+      };
+      await assert.rejects(f.apply().finally(() => {
+        strictIo.syncDir = save;
+      }), isFsync);
+      assert.ok(created, '故障已触发');
+      assert.deepEqual(await readTree(f.wtf), await readTreeOf(CURRENT));
+      assert.deepEqual(await readTree(f.snapDir), snapBefore);
+      const view = await f.txn.pending([f.root]);
+      assert.deepEqual(view.items, [], '没有未登记的工作目录，也没有遗留的登记');
+      assert.equal(view.receipts.at(-1)?.outcome, 'not-applied');
+      assert.deepEqual(await txDirs(f), []);
+      assert.equal((await f.apply()).outcome, 'committed');
+    } finally {
+      await f.done();
+    }
+  });
+
+  for (const instance of ['same', 'new'] as const) {
+    test(`新建事务目录之后的同步持续失败（${mode}，${instance === 'same' ? '同一实例' : '新实例'}处理）：登记保留目录身份，故障消除后处理完成`, async () => {
+      const f = await setup();
+      try {
+        const save = strictIo.syncDir;
+        let created: string | null = null;
+        const failing = mode === 'control' ? f.control : path.dirname(f.registryFile);
+        strictIo.syncDir = async (dir) => {
+          if (created === null) {
+            const tx = await atNewTx(f, mode, dir);
+            if (tx) created = idOf(await lstat(tx, { bigint: true }));
+          }
+          if (created !== null && dir === failing) throw eio();
+          return save(dir);
+        };
+        await assert.rejects(f.apply().finally(() => {
+          strictIo.syncDir = save;
+        }), isFsync);
+        assert.ok(created, '故障已触发');
+        assert.deepEqual(await readTree(f.wtf), await readTreeOf(CURRENT));
+        const [entry] = await regEntries(f);
+        assert.ok(entry, '登记保留');
+        assert.equal(entry.txdirId, created, '登记中是本次创建的事务目录的身份');
+        // control：结果已登记、只差工作目录的同步；appData：登记无法写入，停在 preparing（事务目录身份已在之前写入）
+        assert.equal(entry.outcome, mode === 'control' ? 'not-applied' : null);
+        const items = (await f.txn.pending([f.root])).items;
+        assert.equal(items.length, 1);
+        assert.notEqual(items[0].state, 'unregistered');
+        let txn = f.txn;
+        if (instance === 'new') {
+          await orphanLock(f);
+          txn = f.make();
+        }
+        const r = await txn.resolve({ flavorId: 9, root: f.root, txid: entry.txid, ack: RACK }, f.resolvePorts);
+        assert.equal(r.outcome, 'cleared', r.message);
+        assert.deepEqual((await txn.pending([f.root])).items, []);
+        assert.deepEqual(await txDirs(f), []);
+        assert.deepEqual(await readTree(f.wtf), await readTreeOf(CURRENT));
+        assert.equal((await f.apply(txn)).outcome, 'committed');
+      } finally {
+        await f.done();
+      }
+    });
+  }
+}
+
+for (const kind of ['dir', 'file'] as const) {
+  test(`新建事务目录之后被外部替换为${kind === 'dir' ? '另一个目录' : '文件'}：不删除、不结束登记，处理时保留现场`, async () => {
+    const f = await setup();
+    try {
+      const save = strictIo.syncDir;
+      const moved = path.join(f.base, 'moved-tx');
+      let txPath: string | null = null;
+      strictIo.syncDir = async (dir) => {
+        const tx = txPath === null ? await atNewTx(f, 'control', dir) : null;
+        if (tx) {
+          txPath = tx;
+          await rename(tx, moved);
+          if (kind === 'dir') await writeTree(tx, { 'unknown.txt': 'outsider' });
+          else await writeFile(tx, 'outsider');
+          throw eio();
+        }
+        return save(dir);
+      };
+      await assert.rejects(f.apply().finally(() => {
+        strictIo.syncDir = save;
+      }), isFsync);
+      assert.ok(txPath, '故障已触发');
+      const tx = txPath as string;
+      const outsider = async () => (kind === 'dir' ? readTree(tx) : readFile(tx, 'utf8'));
+      const expected = kind === 'dir' ? { 'unknown.txt': 'outsider' } : 'outsider';
+      assert.deepEqual(await outsider(), expected);
+      assert.ok((await lstat(moved)).isDirectory(), '原事务目录保留');
+      const [entry] = await regEntries(f);
+      assert.ok(entry?.txdirId, '登记保留，带原事务目录的身份');
+      assert.equal(entry.txdirId, idOf(await lstat(moved, { bigint: true })));
+      const r = await f.txn.resolve({ flavorId: 9, root: f.root, txid: entry.txid, ack: RACK }, f.resolvePorts);
+      assert.equal(r.outcome, 'blocked', r.message);
+      assert.deepEqual(await outsider(), expected);
+      assert.ok((await lstat(moved)).isDirectory());
+      assert.equal((await f.txn.pending([f.root])).items.length, 1);
+      assert.deepEqual(await readTree(f.wtf), await readTreeOf(CURRENT));
+    } finally {
+      await f.done();
+    }
+  });
+}
+
 test('占用标记被复制到新 inode（字段与登记证明一致、持有进程已退出）：不重新取得，标记保留', async () => {
   const f = await setup();
   try {

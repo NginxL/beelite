@@ -6,7 +6,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { createRequire } from 'node:module';
-import { cp, mkdir, readdir, realpath } from 'node:fs/promises';
+import { cp, mkdir, readdir, realpath, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { installFakeDom } from './fake-dom.mjs';
@@ -172,6 +172,135 @@ test('重新载入后恢复进行中的备份：新页面先订阅再取快照�
     assert.ok(H.ipcCalls.filter((c) => c.channel === 'backup:state').every((c) => c.args[1] === other), '只读取当前目录的状态');
     assert.equal(H.ipcCalls.filter((c) => c.channel === 'backup:catalog').length, 0, '不读取账号与角色');
     assert.ok(!(await readdir(container)).some((n) => n.startsWith('.partial-')), '取消后临时内容已清理');
+  } finally {
+    await h.service.backup.shutdown();
+    await cleanup(base);
+  }
+});
+
+// ---------- 0.3.1：重新载入后未完成恢复的状态 ----------
+
+/**
+ * 载入一个全新的界面（含未完成恢复的提示条），与 main.ts 相同的顺序：订阅任务推送 → 获取任务快照（不等待）→ 初始化恢复 → 启动查询。
+ * wrap 可以替换页面看到的接口（模拟回复的先后）；ready 在任务快照与启动查询都结束后完成
+ */
+async function freshRestorePage(h, base, wrap = (api) => api) {
+  if (currentPage) currentPage.destroyed = true;
+  const page = pageApi(h.api);
+  currentPage = page;
+  h.stub.listeners.clear();
+  const pageDir = path.join(base, `renderer-${++seq}`);
+  const dir = path.join(pageDir, 'renderer');
+  await cp(web, dir, { recursive: true });
+  await cp(webShared, path.join(pageDir, 'shared'), { recursive: true });
+  for (const id of ['test-backup', 'toast-root', 'modal-root', 'restore-warning']) document.getElementById(id).replaceChildren();
+  const api = wrap(page.api);
+  globalThis.window.beelite = api;
+  const S = await import(path.join(dir, 'state.js'));
+  const B = await import(path.join(dir, 'backup.js'));
+  const R = await import(path.join(dir, 'restore.js'));
+  S.state.config = { flavors: [{ id: F, name: '无限', versions: ['1.60.1'], interfaceNumber: 16001, online: true }], categories: [], defaultFlavorId: F, configError: null };
+  S.state.flavorId = F;
+  B.initBackup(document.getElementById('test-backup'));
+  api.onBackupTask((s) => void B.applyBackupTask(s));
+  const synced = B.syncBackupTask();
+  const banner = document.getElementById('restore-warning');
+  R.initRestore(banner);
+  const started = R.refreshPending();
+  return { S, B, R, banner, synced, ready: Promise.all([synced, started]) };
+}
+
+const RESTORE_ACK = { gameClosed: true, overwrite: true };
+const pendingCalls = () => H.ipcCalls.filter((c) => c.channel === 'restore:pending').length;
+const settled = (p) => !!p.R.restorePending().view && !p.R.restorePending().loading;
+
+test('重新载入后主进程中的恢复结束（0.3.0 复现）：新页面按任务快照重新查询未完成的恢复，不依赖旧页面；进度不查询', async () => {
+  const base = await realpath(await tmpDir());
+  const userData = path.join(base, 'userData');
+  await mkdir(userData);
+  const pause = pauser();
+  const h = H.createHarness({ settingsFile: path.join(userData, 'settings.json'), source: new FakeSource(), restore: { hooks: { step: (n) => pause.step(n) }, freeBytes: async () => 1e12 } });
+  try {
+    const A = await makeGameRoot(path.join(base, 'A'));
+    const sv = path.join(A, 'WTF', 'Account', 'TEST', 'SavedVariables', 'Questie.lua');
+    await h.settings.bind(F, A);
+    const picked = path.join(base, 'pick');
+    await mkdir(picked);
+    h.stub.pick = picked;
+    await h.api.backupConfigure(F, A);
+    h.stub.pick = null;
+    const run0 = await h.api.backupRun(F, A, { kind: 'all' });
+    assert.equal(run0.status, 'completed');
+    const snapshotId = run0.result.snapshot.id;
+
+    /** 预览并开始执行恢复（经主进程），停在候选树完成之后 */
+    const startRestore = async (content) => {
+      await writeFile(sv, content);
+      const p = await h.api.backupRestorePreview(F, A, snapshotId);
+      assert.equal(p.status, 'completed');
+      assert.ok(p.result.token, p.result.blockers?.join('；'));
+      const at = pause.arm('staged');
+      const run = h.api.backupRestoreApply(p.result.token, RESTORE_ACK);
+      await at.reached;
+      return { run, release: at.release };
+    };
+
+    // 情形一：旧页面发起恢复后重新载入；新页面启动时看到进行中的恢复，主进程结束后自行刷新
+    await (await freshRestorePage(h, base)).ready;
+    const r1 = await startRestore('Questie = 1\n');
+    const p2 = await freshRestorePage(h, base);
+    await p2.ready;
+    await until(() => settled(p2) && p2.B.backupTask()?.kind === 'restore', '新页面看到进行中的恢复');
+    assert.equal(p2.R.restorePending().view.items.length, 1);
+    assert.ok(p2.R.restoreBlockReason({ flavorId: F, root: A }));
+    const calls0 = pendingCalls();
+    r1.release();
+    const out1 = await r1.run;
+    assert.equal(out1.status, 'completed');
+    assert.equal(out1.result.outcome, 'committed');
+    await until(() => p2.B.backupTask() === null && settled(p2) && p2.R.restorePending().view.items.length === 0, '新页面刷新未完成的恢复');
+    assert.equal(pendingCalls(), calls0 + 1, '只在任务结束时查询一次，进度与阶段变化不查询');
+    assert.equal(p2.R.restoreBlockReason({ flavorId: F, root: A }), null);
+    assert.ok(p2.banner.classList.contains('hidden'));
+
+    // 情形二：启动查询在恢复进行中读取、回复较慢；任务快照（已结束，task 为 null）先到，且没有收到推送。
+    // 第一次采用快照时补查一轮，过时的启动回复不会留下
+    const r2 = await startRestore('Questie = 2\n');
+    let computed;
+    const computedP = new Promise((r) => (computed = r));
+    let releaseReply;
+    const replyGate = new Promise((r) => (releaseReply = r));
+    let first = true;
+    const p3 = await freshRestorePage(h, base, (api) => new Proxy(api, {
+      get(target, key) {
+        if (key === 'onBackupTask') return () => () => undefined;
+        if (key === 'backupTaskState') return async () => {
+          await r2.run.catch(() => undefined);
+          return target.backupTaskState();
+        };
+        if (key === 'backupRestorePending') return async () => {
+          const v = await target.backupRestorePending();
+          if (first) {
+            first = false;
+            computed();
+            await replyGate;
+          }
+          return v;
+        };
+        return target[key];
+      },
+    }));
+    await computedP;
+    r2.release();
+    const out2 = await r2.run;
+    assert.equal(out2.result.outcome, 'committed');
+    await p3.synced;
+    assert.equal(p3.B.backupTask(), null);
+    releaseReply();
+    await p3.ready;
+    await until(() => settled(p3) && p3.R.restorePending().view.items.length === 0, '补查后没有未完成的恢复');
+    assert.equal(p3.R.restoreBlockReason({ flavorId: F, root: A }), null);
+    assert.equal((await h.api.backupRestorePending()).items.length, 0);
   } finally {
     await h.service.backup.shutdown();
     await cleanup(base);

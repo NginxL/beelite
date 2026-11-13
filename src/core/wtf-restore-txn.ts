@@ -503,10 +503,11 @@ export class WtfRestoreTxn {
     await mkdir(P.tx, { mode: 0o700 });
     const txSt = await lstat(P.tx, { bigint: true });
     if (txSt.isSymbolicLink() || !txSt.isDirectory() || txSt.dev !== dev) throw new UserError('恢复事务目录被替换，已停止', 'restore-unsafe');
-    await syncDirStrict(P.control, '恢复事务目录');
+    // 身份确认后立即固定，先登记再同步：之后任何一步失败，收尾都按这个身份识别本次创建的目录（登记未写成时由 settle 补写）
     const txdirId = idOf(txSt);
-    await this.reg((d) => d.update(t.txid, { txdirId }));
     t.txdirId = txdirId;
+    await this.reg((d) => d.update(t.txid, { txdirId }));
+    await syncDirStrict(P.control, '恢复事务目录');
     const txChain = this.txChainOf(t) as string[];
     await this.saveJournal(t, {});
     await this.step('preparing');
@@ -816,14 +817,24 @@ export class WtfRestoreTxn {
     const { P } = t;
     const pending: string[] = [];
     const warnings: string[] = [];
+    // 内存中已知的事务目录身份随结果一并登记（创建后登记未写成时，之后处理仍能按它识别）
+    const txdirId = t.txdirId;
     try {
-      await this.reg((d) => d.update(t.txid, { outcome }));
+      await this.reg((d) => d.update(t.txid, txdirId ? { outcome, txdirId } : { outcome }));
     } catch (err) {
       return { pending: [`结果未能写入登记：${errorMessage(err)}`], warnings };
     }
     const txChain = this.txChainOf(t);
-    if (txChain && t.txdirId && (await idOrNull(P.tx)) !== null) {
-      if ((await idOrNull(P.tx)) !== t.txdirId) pending.push(`恢复事务目录 ${P.tx} 被替换，已保留`);
+    // 事务目录存在但身份未知或无法检查：保留目录与登记，不结束
+    let txNow: string | null = null;
+    try {
+      txNow = await idOrNull(P.tx);
+    } catch (err) {
+      pending.push(`无法检查恢复事务目录 ${P.tx}（${errCode(err) ?? errorMessage(err)}），已保留`);
+    }
+    if (txNow !== null) {
+      if (!txChain || !txdirId) pending.push(`恢复事务目录 ${P.tx} 无法确认属于本次，已保留`);
+      else if (txNow !== txdirId) pending.push(`恢复事务目录 ${P.tx} 被替换，已保留`);
       else {
         const proof = t.journal.candidate;
         const l1 = await this.removeKnownFile(P.list, proof ? { id: proof.listId, sha: proof.listSha } : t.listProof, txChain);

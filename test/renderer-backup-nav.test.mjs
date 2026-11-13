@@ -1,7 +1,8 @@
 // 左侧导航（0.2.1）：编译后的 main.js 启动整套渲染层 → 真实 preload → 真实 AppService（假 electron）→ 临时目录。
 // 四个页面（0.3.0 起含诊断报告）互斥显示；配置加载完成前即可进入配置备份页，加载完成后不强制回到发现插件、不抢焦点；
 // 进入配置备份页只读取一次状态，重复点击不重读；我的插件只有五个标签页；其他页面时备份进行中只更新侧栏徽标，不读取备份状态。
-// 启动时对未完成的恢复只读查询一次（不处理）；没有未完成的恢复时侧栏不显示待处理；打开诊断报告页不生成报告。
+// 启动时对未完成的恢复只读查询（不处理）：启动查询加第一次任务快照的补查共两次（0.3.1 起），空闲快照与备份任务不再查询；
+// 没有未完成的恢复时侧栏不显示待处理；打开诊断报告页不生成报告。
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { createRequire } from 'node:module';
@@ -90,14 +91,20 @@ test('配置加载前进入配置备份页；加载完成后仍停留在该页�
   assert.match(page('backup').textContent, /正在读取游戏目录/);
   assert.equal(calls('backup:state'), 0, '还没有目标：不读取');
 
-  // 未完成的恢复：配置加载前就只读查询一次，不处理；查询失败时给出原因（而不是之后徽标超时）
-  await until(() => !R.restorePending().loading && (R.restorePending().view || R.restorePending().error), '启动时的未完成恢复查询');
+  // 未完成的恢复：配置加载前就只读查询，不处理；查询失败时给出原因（而不是之后徽标超时）。
+  // 0.3.1 起共两次：启动查询，加上第一次采用任务快照时的补查（启动查询还在进行时合并为它之后的一轮）；之后只在恢复或处理任务结束时查询
+  await until(() => calls('restore:pending') === 2 && !R.restorePending().loading && (R.restorePending().view || R.restorePending().error), '启动查询与首次快照的补查');
   const rp = R.restorePending();
   assert.equal(rp.error, null, `启动查询失败：${rp.error}`);
   assert.equal(R.restoreNavBadge(), null, `没有未完成的恢复时不显示待处理：${JSON.stringify(rp.view)}`);
   assert.ok(globalThis.document.getElementById('restore-warning').classList.contains('hidden'));
-  assert.equal(calls('restore:pending'), 1);
   assert.equal(calls('restore:resolve'), 0, '启动不处理未完成的恢复');
+  // 稳定上限：空闲的任务快照重复推送（每一次都已被采用并通知到恢复模块）不再查询
+  let accepted = 0;
+  B.onBackupTaskChange(() => accepted++);
+  for (let i = 0; i < 3; i++) h.service.pushBackupTask();
+  await until(() => accepted === 3, '三次空闲快照已采用');
+  assert.equal(calls('restore:pending'), 2, '空闲快照不查询未完成的恢复');
 
   focused = null;
   releaseConfig({ flavors: [{ id: F, name: '无限', versions: ['1.60.1'], interfaceNumber: 16001, online: true }], categories: [], defaultFlavorId: F, configError: null });
@@ -121,6 +128,7 @@ test('配置加载前进入配置备份页；加载完成后仍停留在该页�
   // 停在我的插件时备份进行中：侧栏徽标显示，不读取备份状态
   let release;
   paused = new Promise((r) => (release = r));
+  const acceptedBefore = accepted;
   const run = h.api.backupRun(F, A, { kind: 'all' });
   await until(() => badge.textContent === '进行中' && !badge.classList.contains('hidden'), '徽标显示');
   release();
@@ -129,6 +137,9 @@ test('配置加载前进入配置备份页；加载完成后仍停留在该页�
   await until(() => badge.classList.contains('hidden'), '徽标隐藏');
   await settle();
   assert.equal(calls('backup:state'), 1, '页面隐藏时任务开始与结束都不读取');
+  // 备份任务的开始、进度与结束快照（徽标隐藏说明结束快照已采用）都不查询未完成的恢复
+  assert.ok(accepted >= acceptedBefore + 2, '备份任务的快照已采用');
+  assert.equal(calls('restore:pending'), 2, '备份任务不查询未完成的恢复');
 
   // 诊断报告页：互斥显示，打开不生成报告
   navs[3].click();
